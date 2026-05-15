@@ -361,7 +361,10 @@ fi
 # Run the container with system-specific configuration
 docker run -it --rm \
     --name "$IMAGE_NAME" \
-    --network host \
+    --add-host host.docker.internal:$(hostname -I | awk '{print $1}') \
+    -p 5557:5557 \
+    -p 7410:7410/udp \
+    -p 7411:7411/udp \
     $GPU_SETTINGS \
     -v "$(cd .. && pwd):/workspace/g1_deploy:rw" \
     $TENSORRT_MOUNT \
@@ -461,5 +464,15 @@ docker run -it --rm \
         echo 'Ready for development! 🚀'
         echo ''
         
+        echo '🔄 Starting UDP relays for simulation...'
+        # Fallback: install socat automatically
+        command -v socat >/dev/null 2>&1 || { apt-get update && apt-get install -y socat; }
+        
+        # Start the background relays pointing to the injected host IP
+        socat UDP4-LISTEN:7412,bind=127.0.0.1,fork UDP4:host.docker.internal:7412 &
+        socat UDP4-LISTEN:7413,bind=127.0.0.1,fork UDP4:host.docker.internal:7413 &
+        echo '✅ Relays active on ports 7412 and 7413'
+
+
         exec bash
     "
