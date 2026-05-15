@@ -42,7 +42,7 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && \
     lsb-release \
     software-properties-common \
     tzdata \
-    iproute2 \
+    socat \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy install scripts
