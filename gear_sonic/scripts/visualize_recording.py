@@ -1,3 +1,13 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "matplotlib>=3.10.9",
+#     "numpy>=2.4.5",
+#     "pandas>=3.0.3",
+#     "pyarrow>=24.0.0",
+# ]
+# ///
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
