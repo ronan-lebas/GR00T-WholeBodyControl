@@ -17,10 +17,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ARCH="$(uname -m)"
 echo "[OK] Architecture: $ARCH"
 
-echo "[INFO] Installing system dependencies (espeak for voice feedback) …"
-if command -v apt-get &>/dev/null; then
-    sudo apt-get install -y espeak >/dev/null 2>&1 || echo "[WARN] Could not install espeak — voice feedback will be disabled"
-fi
+# echo "[INFO] Installing system dependencies (espeak for voice feedback) …"
+# if command -v apt-get &>/dev/null; then
+#     sudo apt-get install -y espeak >/dev/null 2>&1 || echo "[WARN] Could not install espeak — voice feedback will be disabled"
+# fi
 
 # ── 1. Ensure uv is installed and available ──────────────────────────────────
 if ! command -v uv &>/dev/null; then
