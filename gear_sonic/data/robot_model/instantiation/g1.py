@@ -29,7 +29,7 @@ def instantiate_g1_robot_model(
     Returns:
         RobotModel: Configured G1 robot model
     """
-    model_data_dir = Path(__file__).resolve().parent.parent / "model_data" / "g1"
+    model_data_dir = Path(__file__).resolve().parent.parent / "model_data" / "g1" / "with_dex3"
     robot_model_config = {
         "asset_path": str(model_data_dir),
         "urdf_path": str(model_data_dir / "g1_29dof_with_hand.urdf"),
