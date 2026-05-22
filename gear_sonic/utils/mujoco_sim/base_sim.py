@@ -45,7 +45,7 @@ class DefaultEnv:
         self.env_name = env_name
         self.robot = Robot(self.config)
         self.num_body_dof = self.robot.NUM_JOINTS
-        self.num_hand_dof = self.robot.NUM_HAND_JOINTS
+        self.num_hand_dof = self.robot.NUM_HAND_MOTORS
         self.sim_dt = self.config["SIMULATE_DT"]
         self.obs = None
         self.torques = np.zeros(self.num_body_dof + self.num_hand_dof * 2)
@@ -239,7 +239,8 @@ class DefaultEnv:
             if "left" in name and any(
                 [
                     part_name in name
-                    for part_name in ["thumb", "index", "middle", "ring", "pinky"]
+                    # for part_name in ["thumb", "index", "middle", "ring", "pinky"]
+                    for part_name in ["proximal", "metacarpal"]
                 ]
             ):
                 self.left_hand_index.append(i)
@@ -248,7 +249,8 @@ class DefaultEnv:
             if "right" in name and any(
                 [
                     part_name in name
-                    for part_name in ["thumb", "index", "middle", "ring", "pinky"]
+                    # for part_name in ["thumb", "index", "middle", "ring", "pinky"]
+                    for part_name in ["proximal", "metacarpal"]
                 ]
             ):
                 self.right_hand_index.append(i)
@@ -256,8 +258,9 @@ class DefaultEnv:
         # breakpoint()
 
         assert len(self.body_joint_index) == self.robot.NUM_JOINTS
-        assert len(self.left_hand_index) == self.robot.NUM_HAND_JOINTS
-        assert len(self.right_hand_index) == self.robot.NUM_HAND_JOINTS
+        # For hands with mimic joints: total joints >= actuated motors
+        assert len(self.left_hand_index) >= self.robot.NUM_HAND_MOTORS
+        assert len(self.right_hand_index) >= self.robot.NUM_HAND_MOTORS
 
         self.body_joint_index = np.array(self.body_joint_index)
         self.left_hand_index = np.array(self.left_hand_index)
@@ -389,16 +392,28 @@ class DefaultEnv:
         obs["body_q"] = self.mj_data.qpos[self.body_joint_index + 7 - 1]
         obs["body_dq"] = self.mj_data.qvel[self.body_joint_index + 6 - 1]
         obs["body_ddq"] = self.mj_data.qacc[self.body_joint_index + 6 - 1]
-        obs["body_tau_est"] = self.mj_data.actuator_force[self.body_joint_index - 1]
+
+
+        obs["body_tau_est"] = self.mj_data.qfrc_actuator[self.body_joint_index + self.qvel_offset - 1]
+
+
         if self.num_hand_dof > 0:
             obs["left_hand_q"] = self.mj_data.qpos[self.left_hand_index + self.qpos_offset - 1]
             obs["left_hand_dq"] = self.mj_data.qvel[self.left_hand_index + self.qvel_offset - 1]
             obs["left_hand_ddq"] = self.mj_data.qacc[self.left_hand_index + self.qvel_offset - 1]
-            obs["left_hand_tau_est"] = self.mj_data.actuator_force[self.left_hand_index - 1]
+
+
+            obs["left_hand_tau_est"] = self.mj_data.qfrc_actuator[self.left_hand_index + self.qvel_offset - 1]
+
+
             obs["right_hand_q"] = self.mj_data.qpos[self.right_hand_index + self.qpos_offset - 1]
             obs["right_hand_dq"] = self.mj_data.qvel[self.right_hand_index + self.qvel_offset - 1]
             obs["right_hand_ddq"] = self.mj_data.qacc[self.right_hand_index + self.qvel_offset - 1]
-            obs["right_hand_tau_est"] = self.mj_data.actuator_force[self.right_hand_index - 1]
+
+
+            obs["right_hand_tau_est"] = self.mj_data.qfrc_actuator[self.right_hand_index + self.qvel_offset - 1]
+
+
         obs["time"] = self.mj_data.time
         return obs
 
@@ -433,8 +448,10 @@ class DefaultEnv:
         # -1: actuator array is 0-based while joint indices from the model are 1-based
         self.torques[self.body_joint_index - 1] = body_torques
         if self.num_hand_dof > 0:
-            self.torques[self.left_hand_index - 1] = hand_torques[: self.num_hand_dof]
-            self.torques[self.right_hand_index - 1] = hand_torques[self.num_hand_dof :]
+            # Only assign to actuated hand joints (first num_hand_dof elements)
+            # Remaining elements are mimic joints controlled by the actuated ones
+            self.torques[self.left_hand_index[: self.num_hand_dof] - 1] = hand_torques[: self.num_hand_dof]
+            self.torques[self.right_hand_index[: self.num_hand_dof] - 1] = hand_torques[self.num_hand_dof :]
 
         self.torques = np.clip(self.torques, -self.torque_limit, self.torque_limit)
 

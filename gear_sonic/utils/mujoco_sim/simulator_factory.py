@@ -7,6 +7,7 @@ from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 
 from gear_sonic.utils.mujoco_sim.base_sim import BaseSimulator
 
+import traceback
 
 def init_channel(config: Dict[str, Any]) -> None:
     """
@@ -90,6 +91,7 @@ class SimulatorFactory:
                 print("+++++Simulator interrupted by user.")
             except Exception as e:
                 print(f"++++error in simulator: {e} ++++")
+                print(traceback.format_exc())
             finally:
                 print("++++closing simulator ++++")
                 simulator.close()
