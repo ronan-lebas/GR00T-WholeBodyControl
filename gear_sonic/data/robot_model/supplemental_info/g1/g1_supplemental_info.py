@@ -39,6 +39,7 @@ class G1SupplementalInfo(RobotSupplementalInfo):
         self,
         waist_location: WaistLocation = WaistLocation.LOWER_BODY,
         elbow_pose: ElbowPose = ElbowPose.LOW,
+        hand_type: str = "dex3",
     ):
         name = "G1_G1ThreeFinger"
 
@@ -80,27 +81,43 @@ class G1SupplementalInfo(RobotSupplementalInfo):
             "right_wrist_yaw_joint",
         ]
 
-        left_hand_actuated_joints = [
-            # Left hand
-            "left_hand_thumb_0_joint",
-            "left_hand_thumb_1_joint",
-            "left_hand_thumb_2_joint",
-            "left_hand_index_0_joint",
-            "left_hand_index_1_joint",
-            "left_hand_middle_0_joint",
-            "left_hand_middle_1_joint",
-        ]
-
-        right_hand_actuated_joints = [
-            # Right hand
-            "right_hand_thumb_0_joint",
-            "right_hand_thumb_1_joint",
-            "right_hand_thumb_2_joint",
-            "right_hand_index_0_joint",
-            "right_hand_index_1_joint",
-            "right_hand_middle_0_joint",
-            "right_hand_middle_1_joint",
-        ]
+        if hand_type == "brainco":
+            left_hand_actuated_joints = [
+                "left_thumb_metacarpal_joint", "left_thumb_proximal_joint", "left_thumb_distal_joint", "left_thumb_tip_joint",
+                "left_index_proximal_joint", "left_index_distal_joint", "left_index_tip_joint",
+                "left_middle_proximal_joint", "left_middle_distal_joint", "left_middle_tip_joint",
+                "left_ring_proximal_joint", "left_ring_distal_joint", "left_ring_tip_joint",
+                "left_pinky_proximal_joint", "left_pinky_distal_joint", "left_pinky_tip_joint",
+            ]
+            right_hand_actuated_joints = [
+                "right_thumb_metacarpal_joint", "right_thumb_proximal_joint", "right_thumb_distal_joint", "right_thumb_tip_joint",
+                "right_index_proximal_joint", "right_index_distal_joint", "right_index_tip_joint",
+                "right_middle_proximal_joint", "right_middle_distal_joint", "right_middle_tip_joint",
+                "right_ring_proximal_joint", "right_ring_distal_joint", "right_ring_tip_joint",
+                "right_pinky_proximal_joint", "right_pinky_distal_joint", "right_pinky_tip_joint",
+            ]
+        else:
+            left_hand_actuated_joints = [
+                # Left hand
+                "left_hand_thumb_0_joint",
+                "left_hand_thumb_1_joint",
+                "left_hand_thumb_2_joint",
+                "left_hand_index_0_joint",
+                "left_hand_index_1_joint",
+                "left_hand_middle_0_joint",
+                "left_hand_middle_1_joint",
+            ]
+    
+            right_hand_actuated_joints = [
+                # Right hand
+                "right_hand_thumb_0_joint",
+                "right_hand_thumb_1_joint",
+                "right_hand_thumb_2_joint",
+                "right_hand_index_0_joint",
+                "right_hand_index_1_joint",
+                "right_hand_middle_0_joint",
+                "right_hand_middle_1_joint",
+            ]
 
         # Define joint limits from URDF
         joint_limits = {
@@ -138,23 +155,63 @@ class G1SupplementalInfo(RobotSupplementalInfo):
             "right_wrist_roll_joint": [-1.972222054, 1.972222054],
             "right_wrist_pitch_joint": [-1.614429558, 1.614429558],
             "right_wrist_yaw_joint": [-1.614429558, 1.614429558],
-            # Left hand
-            "left_hand_thumb_0_joint": [-1.04719755, 1.04719755],
-            "left_hand_thumb_1_joint": [-0.72431163, 1.04719755],
-            "left_hand_thumb_2_joint": [0, 1.74532925],
-            "left_hand_index_0_joint": [-1.57079632, 0],
-            "left_hand_index_1_joint": [-1.74532925, 0],
-            "left_hand_middle_0_joint": [-1.57079632, 0],
-            "left_hand_middle_1_joint": [-1.74532925, 0],
-            # Right hand
-            "right_hand_thumb_0_joint": [-1.04719755, 1.04719755],
-            "right_hand_thumb_1_joint": [-0.72431163, 1.04719755],
-            "right_hand_thumb_2_joint": [0, 1.74532925],
-            "right_hand_index_0_joint": [-1.57079632, 0],
-            "right_hand_index_1_joint": [-1.74532925, 0],
-            "right_hand_middle_0_joint": [-1.57079632, 0],
-            "right_hand_middle_1_joint": [-1.74532925, 0],
         }
+
+        if hand_type == "brainco":
+            joint_limits.update({
+                "left_thumb_metacarpal_joint": [0.0, 1.5184],
+                "left_thumb_proximal_joint": [0.0, 1.0472],
+                "left_thumb_distal_joint": [0.0, 1.0472],
+                "left_thumb_tip_joint": [0.0, 0.0],
+                "left_index_proximal_joint": [0.0, 1.4661],
+                "left_index_distal_joint": [0.0, 1.693],
+                "left_index_tip_joint": [1.0, 1.0],
+                "left_middle_proximal_joint": [0.0, 1.4661],
+                "left_middle_distal_joint": [0.0, 1.693],
+                "left_middle_tip_joint": [1.0, 1.0],
+                "left_ring_proximal_joint": [0.0, 1.4661],
+                "left_ring_distal_joint": [0.0, 1.693],
+                "left_ring_tip_joint": [1.0, 1.0],
+                "left_pinky_proximal_joint": [0.0, 1.4661],
+                "left_pinky_distal_joint": [0.0, 1.693],
+                "left_pinky_tip_joint": [1.0, 1.0],
+                
+                "right_thumb_metacarpal_joint": [0.0, 1.5184],
+                "right_thumb_proximal_joint": [0.0, 1.0472],
+                "right_thumb_distal_joint": [0.0, 1.0472],
+                "right_thumb_tip_joint": [0.0, 0.0],
+                "right_index_proximal_joint": [0.0, 1.4661],
+                "right_index_distal_joint": [0.0, 1.693],
+                "right_index_tip_joint": [1.0, 1.0],
+                "right_middle_proximal_joint": [0.0, 1.4661],
+                "right_middle_distal_joint": [0.0, 1.693],
+                "right_middle_tip_joint": [1.0, 1.0],
+                "right_ring_proximal_joint": [0.0, 1.4661],
+                "right_ring_distal_joint": [0.0, 1.693],
+                "right_ring_tip_joint": [1.0, 1.0],
+                "right_pinky_proximal_joint": [0.0, 1.4661],
+                "right_pinky_distal_joint": [0.0, 1.693],
+                "right_pinky_tip_joint": [1.0, 1.0],
+            })
+        else:
+            joint_limits.update({
+                # Left hand
+                "left_hand_thumb_0_joint": [-1.04719755, 1.04719755],
+                "left_hand_thumb_1_joint": [-0.72431163, 1.04719755],
+                "left_hand_thumb_2_joint": [0, 1.74532925],
+                "left_hand_index_0_joint": [-1.57079632, 0],
+                "left_hand_index_1_joint": [-1.74532925, 0],
+                "left_hand_middle_0_joint": [-1.57079632, 0],
+                "left_hand_middle_1_joint": [-1.74532925, 0],
+                # Right hand
+                "right_hand_thumb_0_joint": [-1.04719755, 1.04719755],
+                "right_hand_thumb_1_joint": [-0.72431163, 1.04719755],
+                "right_hand_thumb_2_joint": [0, 1.74532925],
+                "right_hand_index_0_joint": [-1.57079632, 0],
+                "right_hand_index_1_joint": [-1.74532925, 0],
+                "right_hand_middle_0_joint": [-1.57079632, 0],
+                "right_hand_middle_1_joint": [-1.74532925, 0],
+            })
 
         # Define joint groups
         joint_groups = {
@@ -213,38 +270,55 @@ class G1SupplementalInfo(RobotSupplementalInfo):
                 "groups": [],
             },
             "arms": {"joints": [], "groups": ["left_arm", "right_arm"]},
-            # Hand groups
-            "left_hand": {
-                "joints": [
-                    "left_hand_index_0_joint",
-                    "left_hand_index_1_joint",
-                    "left_hand_middle_0_joint",
-                    "left_hand_middle_1_joint",
-                    "left_hand_thumb_0_joint",
-                    "left_hand_thumb_1_joint",
-                    "left_hand_thumb_2_joint",
-                ],
-                "groups": [],
-            },
-            "right_hand": {
-                "joints": [
-                    "right_hand_index_0_joint",
-                    "right_hand_index_1_joint",
-                    "right_hand_middle_0_joint",
-                    "right_hand_middle_1_joint",
-                    "right_hand_thumb_0_joint",
-                    "right_hand_thumb_1_joint",
-                    "right_hand_thumb_2_joint",
-                ],
-                "groups": [],
-            },
+        }
+
+        if hand_type == "brainco":
+            joint_groups.update({
+                "left_hand": {
+                    "joints": left_hand_actuated_joints,
+                    "groups": [],
+                },
+                "right_hand": {
+                    "joints": right_hand_actuated_joints,
+                    "groups": [],
+                },
+            })
+        else:
+            joint_groups.update({
+                "left_hand": {
+                    "joints": [
+                        "left_hand_index_0_joint",
+                        "left_hand_index_1_joint",
+                        "left_hand_middle_0_joint",
+                        "left_hand_middle_1_joint",
+                        "left_hand_thumb_0_joint",
+                        "left_hand_thumb_1_joint",
+                        "left_hand_thumb_2_joint",
+                    ],
+                    "groups": [],
+                },
+                "right_hand": {
+                    "joints": [
+                        "right_hand_index_0_joint",
+                        "right_hand_index_1_joint",
+                        "right_hand_middle_0_joint",
+                        "right_hand_middle_1_joint",
+                        "right_hand_thumb_0_joint",
+                        "right_hand_thumb_1_joint",
+                        "right_hand_thumb_2_joint",
+                    ],
+                    "groups": [],
+                },
+            })
+            
+        joint_groups.update({
             "hands": {"joints": [], "groups": ["left_hand", "right_hand"]},
             # Full body groups
             "lower_body": {"joints": [], "groups": ["waist", "legs"]},
             "upper_body_no_hands": {"joints": [], "groups": ["arms"]},
             "body": {"joints": [], "groups": ["lower_body", "upper_body_no_hands"]},
             "upper_body": {"joints": [], "groups": ["upper_body_no_hands", "hands"]},
-        }
+        })
 
         # Define joint name mapping from generic types to robot-specific names
         joint_name_mapping = {

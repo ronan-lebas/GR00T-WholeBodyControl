@@ -234,10 +234,26 @@ class DefaultEnv:
                 ]
             ):
                 self.body_joint_index.append(i)
-            elif "left_hand" in name:
+            # elif "left_hand" in name:
+            #     self.left_hand_index.append(i)
+            if "left" in name and any(
+                [
+                    part_name in name
+                    for part_name in ["thumb", "index", "middle", "ring", "pinky"]
+                ]
+            ):
                 self.left_hand_index.append(i)
-            elif "right_hand" in name:
+            # elif "right_hand" in name:
+            #     self.right_hand_index.append(i)
+            if "right" in name and any(
+                [
+                    part_name in name
+                    for part_name in ["thumb", "index", "middle", "ring", "pinky"]
+                ]
+            ):
                 self.right_hand_index.append(i)
+            # print(name)
+        # breakpoint()
 
         assert len(self.body_joint_index) == self.robot.NUM_JOINTS
         assert len(self.left_hand_index) == self.robot.NUM_HAND_JOINTS

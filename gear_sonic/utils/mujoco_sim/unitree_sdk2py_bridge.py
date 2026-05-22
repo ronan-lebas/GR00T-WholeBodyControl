@@ -233,7 +233,7 @@ class UnitreeSdk2Bridge:
                 self.new_right_hand_cmd = False
 
         return (
-            np.concatenate([body_q[:-7], left_hand_q, body_q[-7:], right_hand_q]),
+            np.concatenate([body_q[:-self.num_hand_motor], left_hand_q, body_q[-self.num_hand_motor:], right_hand_q]),
             self.cmd_received(),
             is_new_action,
         )
