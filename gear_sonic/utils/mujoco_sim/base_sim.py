@@ -236,11 +236,17 @@ class DefaultEnv:
                 self.body_joint_index.append(i)
             # elif "left_hand" in name:
             #     self.left_hand_index.append(i)
+            if "brainco" in self.config["ROBOT_SCENE"]:
+                filter = ["proximal", "metacarpal"]
+            elif "dex3" in self.config["ROBOT_SCENE"]:
+                filter = ["hand"]
+            else:
+                raise ValueError(f"Unknown robot scene: {self.config['ROBOT_SCENE']}")
             if "left" in name and any(
                 [
                     part_name in name
                     # for part_name in ["thumb", "index", "middle", "ring", "pinky"]
-                    for part_name in ["proximal", "metacarpal"]
+                    for part_name in filter
                 ]
             ):
                 self.left_hand_index.append(i)
@@ -250,7 +256,7 @@ class DefaultEnv:
                 [
                     part_name in name
                     # for part_name in ["thumb", "index", "middle", "ring", "pinky"]
-                    for part_name in ["proximal", "metacarpal"]
+                    for part_name in filter
                 ]
             ):
                 self.right_hand_index.append(i)
@@ -422,6 +428,7 @@ class DefaultEnv:
         self.unitree_bridge.PublishLowState(self.obs)
         if self.unitree_bridge.joystick:
             self.unitree_bridge.PublishWirelessController()
+        # breakpoint()
         if self.elastic_band:
             if self.elastic_band.enable and self.use_floating_root_link:
                 pose = np.concatenate(
@@ -446,15 +453,16 @@ class DefaultEnv:
         body_torques = self.compute_body_torques()
         hand_torques = self.compute_hand_torques()
         # -1: actuator array is 0-based while joint indices from the model are 1-based
-        self.torques[self.body_joint_index - 1] = body_torques
+        self.torques[:self.num_body_dof] = body_torques
         if self.num_hand_dof > 0:
             # Only assign to actuated hand joints (first num_hand_dof elements)
             # Remaining elements are mimic joints controlled by the actuated ones
-            self.torques[self.left_hand_index[: self.num_hand_dof] - 1] = hand_torques[: self.num_hand_dof]
-            self.torques[self.right_hand_index[: self.num_hand_dof] - 1] = hand_torques[self.num_hand_dof :]
+            self.torques[self.num_body_dof : self.num_body_dof + self.num_hand_dof] = hand_torques[: self.num_hand_dof]
+            self.torques[self.num_body_dof + self.num_hand_dof :] = hand_torques[self.num_hand_dof :]
 
         self.torques = np.clip(self.torques, -self.torque_limit, self.torque_limit)
 
+        # breakpoint()
         if self.config["FREE_BASE"]:
             # Prepend 6 zeros for the floating-base root DOF actuators
             self.mj_data.ctrl = np.concatenate((np.zeros(6), self.torques))
