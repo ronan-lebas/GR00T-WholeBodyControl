@@ -272,6 +272,20 @@ class DefaultEnv:
         self.left_hand_index = np.array(self.left_hand_index)
         self.right_hand_index = np.array(self.right_hand_index)
 
+        self.joint_to_actuator = {}
+        for i in range(self.mj_model.nu):
+            if self.mj_model.actuator_trntype[i] == mujoco.mjtTrn.mjTRN_JOINT:
+                joint_id = self.mj_model.actuator_trnid[i, 0]
+                self.joint_to_actuator[joint_id] = i
+
+        self.body_actuator_index = [self.joint_to_actuator.get(j, -1) for j in self.body_joint_index]
+        self.left_hand_actuator_index = [self.joint_to_actuator.get(j, -1) for j in self.left_hand_index]
+        self.right_hand_actuator_index = [self.joint_to_actuator.get(j, -1) for j in self.right_hand_index]
+
+        self.body_actuator_index = np.array(self.body_actuator_index)
+        self.left_hand_actuator_index = np.array(self.left_hand_actuator_index)
+        self.right_hand_actuator_index = np.array(self.right_hand_actuator_index)
+
     def init_renderers(self):
         self.renderers = {}
         for camera_name, camera_config in self.camera_configs.items():
@@ -400,7 +414,11 @@ class DefaultEnv:
         obs["body_ddq"] = self.mj_data.qacc[self.body_joint_index + 6 - 1]
 
 
-        obs["body_tau_est"] = self.mj_data.qfrc_actuator[self.body_joint_index + self.qvel_offset - 1]
+        # breakpoint()
+        obs["body_tau_est"] = np.zeros(len(self.body_joint_index))
+        for i, act_idx in enumerate(self.body_actuator_index):
+            if act_idx != -1:
+                obs["body_tau_est"][i] = self.mj_data.actuator_force[act_idx]
 
 
         if self.num_hand_dof > 0:
@@ -409,7 +427,10 @@ class DefaultEnv:
             obs["left_hand_ddq"] = self.mj_data.qacc[self.left_hand_index + self.qvel_offset - 1]
 
 
-            obs["left_hand_tau_est"] = self.mj_data.qfrc_actuator[self.left_hand_index + self.qvel_offset - 1]
+            obs["left_hand_tau_est"] = np.zeros(len(self.left_hand_index))
+            for i, act_idx in enumerate(self.left_hand_actuator_index):
+                if act_idx != -1:
+                    obs["left_hand_tau_est"][i] = self.mj_data.actuator_force[act_idx]
 
 
             obs["right_hand_q"] = self.mj_data.qpos[self.right_hand_index + self.qpos_offset - 1]
@@ -417,7 +438,10 @@ class DefaultEnv:
             obs["right_hand_ddq"] = self.mj_data.qacc[self.right_hand_index + self.qvel_offset - 1]
 
 
-            obs["right_hand_tau_est"] = self.mj_data.qfrc_actuator[self.right_hand_index + self.qvel_offset - 1]
+            obs["right_hand_tau_est"] = np.zeros(len(self.right_hand_index))
+            for i, act_idx in enumerate(self.right_hand_actuator_index):
+                if act_idx != -1:
+                    obs["right_hand_tau_est"][i] = self.mj_data.actuator_force[act_idx]
 
 
         obs["time"] = self.mj_data.time
@@ -452,22 +476,37 @@ class DefaultEnv:
                 self.mj_data.xfrc_applied[self.band_attached_link] = np.zeros(6)
         body_torques = self.compute_body_torques()
         hand_torques = self.compute_hand_torques()
-        # -1: actuator array is 0-based while joint indices from the model are 1-based
-        self.torques[:self.num_body_dof] = body_torques
+        
+        logic_torques = np.zeros(self.num_body_dof + self.num_hand_dof * 2)
+        logic_torques[:self.num_body_dof] = body_torques
         if self.num_hand_dof > 0:
-            # Only assign to actuated hand joints (first num_hand_dof elements)
-            # Remaining elements are mimic joints controlled by the actuated ones
-            self.torques[self.num_body_dof : self.num_body_dof + self.num_hand_dof] = hand_torques[: self.num_hand_dof]
-            self.torques[self.num_body_dof + self.num_hand_dof :] = hand_torques[self.num_hand_dof :]
+            logic_torques[self.num_body_dof : self.num_body_dof + self.num_hand_dof] = hand_torques[: self.num_hand_dof]
+            logic_torques[self.num_body_dof + self.num_hand_dof :] = hand_torques[self.num_hand_dof :]
 
-        self.torques = np.clip(self.torques, -self.torque_limit, self.torque_limit)
+        logic_torques = np.clip(logic_torques, -self.torque_limit, self.torque_limit)
+        self.torques = logic_torques
 
-        # breakpoint()
+        ctrl = np.zeros(self.mj_model.nu)
+        
+        for i, idx in enumerate(self.body_actuator_index):
+            if idx != -1 and i < len(body_torques):
+                ctrl[idx] = logic_torques[i]
+                
+        if self.num_hand_dof > 0:
+            for i, idx in enumerate(self.left_hand_actuator_index):
+                if idx != -1 and i < self.num_hand_dof:
+                    ctrl[idx] = logic_torques[self.num_body_dof + i]
+            for i, idx in enumerate(self.right_hand_actuator_index):
+                if idx != -1 and i < self.num_hand_dof:
+                    ctrl[idx] = logic_torques[self.num_body_dof + self.num_hand_dof + i]
+
         if self.config["FREE_BASE"]:
-            # Prepend 6 zeros for the floating-base root DOF actuators
-            self.mj_data.ctrl = np.concatenate((np.zeros(6), self.torques))
+            if len(ctrl) + 6 == len(self.mj_data.ctrl):
+                self.mj_data.ctrl = np.concatenate((np.zeros(6), ctrl))
+            else:
+                self.mj_data.ctrl = ctrl
         else:
-            self.mj_data.ctrl = self.torques
+            self.mj_data.ctrl = ctrl
         mujoco.mj_step(self.mj_model, self.mj_data)
 
         self.check_fall()
