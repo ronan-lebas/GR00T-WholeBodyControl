@@ -232,7 +232,7 @@
                           <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.7 0.7 0.7 1" mesh="left_wrist_yaw_link" />
                           <geom type="mesh" rgba="0.7 0.7 0.7 1" mesh="left_wrist_yaw_link" />
 
-                          <body name="left_base_link" pos="0.0591 0 0" euler="-1.570796326 0 -1.570796326">
+                          <body name="left_base_link" pos="0.0591 0 0" euler="0 1.570796326 -1.570796326">
                             <inertial pos="-0.004786706 0.001419811 0.050523908" mass="0.238" fullinertia="2.226651E-05 1.553672E-05 8.586693E-06 -2.631858E-07 1.836386E-07 1.265865E-06"/>
                             <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.7 0.7 0.7 1" mesh="left_base_link"/>
                             <geom type="mesh" rgba="0.7 0.7 0.7 1" mesh="left_base_link"/>
@@ -388,7 +388,7 @@
                           <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.7 0.7 0.7 1" mesh="right_wrist_yaw_link" />
                           <geom type="mesh" rgba="0.7 0.7 0.7 1" mesh="right_wrist_yaw_link" />
 
-                          <body name="right_base_link" pos="0.0591 0 0" euler="1.570796326 0 1.570796326">
+                          <body name="right_base_link" pos="0.0591 0 0" euler="0 1.570796326 1.570796326">
                             <inertial pos="-0.004786706 -0.001419811 0.050523908" mass="0.238" fullinertia="2.226651E-05 1.553672E-05 8.586693E-06 2.631858E-07 1.836386E-07 -1.265865E-06"/>
                             <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.7 0.7 0.7 1" mesh="right_base_link"/>
                             <geom type="mesh" rgba="0.7 0.7 0.7 1" mesh="right_base_link"/>
