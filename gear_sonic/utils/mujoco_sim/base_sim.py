@@ -431,7 +431,7 @@ class DefaultEnv:
         obs["body_ddq"] = self.mj_data.qacc[self.body_joint_index + 6 - 1]
 
 
-        obs["body_tau_est"] = self.mj_data.qfrc_actuator[self.body_joint_index + self.qvel_offset - 1]
+        obs["body_tau_est"] = self.mj_data.actuator_force[self.body_joint_index - 1]
 
 
         if self.num_hand_dof > 0:
@@ -440,7 +440,7 @@ class DefaultEnv:
             obs["left_hand_ddq"] = self.mj_data.qacc[self.left_hand_index + self.qvel_offset - 1]
 
 
-            obs["left_hand_tau_est"] = self.mj_data.qfrc_actuator[self.left_hand_index + self.qvel_offset - 1]
+            obs["left_hand_tau_est"] = self.mj_data.actuator_force[self.left_hand_index - 1]
 
 
             obs["right_hand_q"] = self.mj_data.qpos[self.right_hand_index + self.qpos_offset - 1]
@@ -448,7 +448,7 @@ class DefaultEnv:
             obs["right_hand_ddq"] = self.mj_data.qacc[self.right_hand_index + self.qvel_offset - 1]
 
 
-            obs["right_hand_tau_est"] = self.mj_data.qfrc_actuator[self.right_hand_index + self.qvel_offset - 1]
+            obs["right_hand_tau_est"] = self.mj_data.actuator_force[self.right_hand_index - 1]
 
 
         obs["time"] = self.mj_data.time
