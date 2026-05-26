@@ -223,8 +223,24 @@ class DefaultEnv:
             self.viewer.cam.trackbodyid = self.mj_model.body("pelvis").id
 
         self.body_joint_index = []
-        self.left_hand_index = []
-        self.right_hand_index = []
+        # For hands we keep two lists when needed:
+        #  - *_hand_motor_index: indices of actuated motor joints (NUM_HAND_MOTORS)
+        #  - *_hand_index: indices of full hand joints (including mimic joints)
+        left_hand_index = []
+        right_hand_index = []
+        left_hand_motor_index = []
+        right_hand_motor_index = []
+
+        # Decide filters based on scene
+        if "brainco" in self.config["ROBOT_SCENE"]:
+            motor_filter = ["proximal", "metacarpal"]
+            full_filter = ["proximal", "metacarpal", "distal"]
+        elif "dex3" in self.config["ROBOT_SCENE"]:
+            motor_filter = ["hand"]
+            full_filter = ["hand"]
+        else:
+            raise ValueError(f"Unknown robot scene: {self.config['ROBOT_SCENE']}")
+
         for i in range(self.mj_model.njnt):
             name = self.mj_model.joint(i).name
             if any(
@@ -234,37 +250,50 @@ class DefaultEnv:
                 ]
             ):
                 self.body_joint_index.append(i)
-            if "brainco" in self.config["ROBOT_SCENE"]:
-                filter = ["proximal", "metacarpal"]
-            elif "dex3" in self.config["ROBOT_SCENE"]:
-                filter = ["hand"]
-            else:
-                raise ValueError(f"Unknown robot scene: {self.config['ROBOT_SCENE']}")
-            if "left" in name and any(
-                [
-                    part_name in name
-                    for part_name in filter
-                ]
-            ):
-                self.left_hand_index.append(i)
-            if "right" in name and any(
-                [
-                    part_name in name
-                    for part_name in filter
-                ]
-            ):
-                self.right_hand_index.append(i)
-            # print(name)
-        # breakpoint()
+
+            # collect full-hand joints (including mimic joints)
+            if "left" in name and any(part in name for part in full_filter):
+                left_hand_index.append(i)
+            if "right" in name and any(part in name for part in full_filter):
+                right_hand_index.append(i)
+
+            # collect motor-only (actuated) joints
+            if "left" in name and any(part in name for part in motor_filter):
+                left_hand_motor_index.append(i)
+            if "right" in name and any(part in name for part in motor_filter):
+                right_hand_motor_index.append(i)
 
         assert len(self.body_joint_index) == self.robot.NUM_JOINTS
-        # For hands with mimic joints: total joints >= actuated motors
-        assert len(self.left_hand_index) >= self.robot.NUM_HAND_MOTORS
-        assert len(self.right_hand_index) >= self.robot.NUM_HAND_MOTORS
 
+        # For hands with mimic joints: ensure at least actuated motors found
+        assert len(left_hand_motor_index) >= self.robot.NUM_HAND_MOTORS
+        assert len(right_hand_motor_index) >= self.robot.NUM_HAND_MOTORS
+
+        # Store arrays: full joint lists and motor-only lists
         self.body_joint_index = np.array(self.body_joint_index)
-        self.left_hand_index = np.array(self.left_hand_index)
-        self.right_hand_index = np.array(self.right_hand_index)
+        self.left_hand_index = np.array(left_hand_index)
+        self.right_hand_index = np.array(right_hand_index)
+        self.left_hand_motor_index = np.array(left_hand_motor_index)
+        self.right_hand_motor_index = np.array(right_hand_motor_index)
+
+        # Build deterministic joint -> actuator index mapping
+        # We assume actuator ordering follows joint ordering for actuated joints.
+        joint_to_actuator = -np.ones(self.mj_model.njnt, dtype=int)
+        actuated_joints = set()
+        actuated_joints.update(self.body_joint_index.tolist())
+        actuated_joints.update(self.left_hand_motor_index.tolist())
+        actuated_joints.update(self.right_hand_motor_index.tolist())
+
+        act_idx = 0
+        for j in range(self.mj_model.njnt):
+            if j in actuated_joints:
+                joint_to_actuator[j] = act_idx
+                act_idx += 1
+
+        # Expose actuator-index arrays for body and hand motors
+        self.body_actuator_index = joint_to_actuator[self.body_joint_index]
+        self.left_hand_motor_actuator_index = joint_to_actuator[self.left_hand_motor_index]
+        self.right_hand_motor_actuator_index = joint_to_actuator[self.right_hand_motor_index]
 
     def init_renderers(self):
         self.renderers = {}
@@ -321,17 +350,19 @@ class DefaultEnv:
         right_hand_torques = np.zeros(self.num_hand_dof)
         if self.unitree_bridge is not None and self.unitree_bridge.low_cmd:
             for i in range(self.unitree_bridge.num_hand_motor):
+                motor_idx_l = self.left_hand_motor_index[i]
+                motor_idx_r = self.right_hand_motor_index[i]
                 left_hand_torques[i] = (
                     self.unitree_bridge.left_hand_cmd.motor_cmd[i].tau
                     + self.unitree_bridge.left_hand_cmd.motor_cmd[i].kp
                     * (
                         self.unitree_bridge.left_hand_cmd.motor_cmd[i].q
-                        - self.mj_data.qpos[self.left_hand_index[i] + self.qpos_offset - 1]
+                        - self.mj_data.qpos[motor_idx_l + self.qpos_offset - 1]
                     )
                     + self.unitree_bridge.left_hand_cmd.motor_cmd[i].kd
                     * (
                         self.unitree_bridge.left_hand_cmd.motor_cmd[i].dq
-                        - self.mj_data.qvel[self.left_hand_index[i] + self.qvel_offset - 1]
+                        - self.mj_data.qvel[motor_idx_l + self.qvel_offset - 1]
                     )
                 )
                 right_hand_torques[i] = (
@@ -339,12 +370,12 @@ class DefaultEnv:
                     + self.unitree_bridge.right_hand_cmd.motor_cmd[i].kp
                     * (
                         self.unitree_bridge.right_hand_cmd.motor_cmd[i].q
-                        - self.mj_data.qpos[self.right_hand_index[i] + self.qpos_offset - 1]
+                        - self.mj_data.qpos[motor_idx_r + self.qpos_offset - 1]
                     )
                     + self.unitree_bridge.right_hand_cmd.motor_cmd[i].kd
                     * (
                         self.unitree_bridge.right_hand_cmd.motor_cmd[i].dq
-                        - self.mj_data.qvel[self.right_hand_index[i] + self.qvel_offset - 1]
+                        - self.mj_data.qvel[motor_idx_r + self.qvel_offset - 1]
                     )
                 )
         return np.concatenate((left_hand_torques, right_hand_torques))
@@ -394,24 +425,34 @@ class DefaultEnv:
         obs["body_ddq"] = self.mj_data.qacc[self.body_joint_index + 6 - 1]
 
 
-        obs["body_tau_est"] = self.mj_data.actuator_force[self.body_joint_index - 1]
+        # Read actuator forces for body joints using actuator mapping
+        body_tau = np.zeros(len(self.body_joint_index))
+        valid_body = self.body_actuator_index >= 0
+        if np.any(valid_body):
+            body_tau[valid_body] = self.mj_data.actuator_force[self.body_actuator_index[valid_body]]
+        obs["body_tau_est"] = body_tau
 
 
         if self.num_hand_dof > 0:
             obs["left_hand_q"] = self.mj_data.qpos[self.left_hand_index + self.qpos_offset - 1]
             obs["left_hand_dq"] = self.mj_data.qvel[self.left_hand_index + self.qvel_offset - 1]
             obs["left_hand_ddq"] = self.mj_data.qacc[self.left_hand_index + self.qvel_offset - 1]
-
-
-            obs["left_hand_tau_est"] = self.mj_data.actuator_force[self.left_hand_index - 1]
-
+            # Estimated actuator torques exist only for actuated motor joints
+            left_tau = np.zeros(len(self.left_hand_motor_index))
+            valid_l = self.left_hand_motor_actuator_index >= 0
+            if np.any(valid_l):
+                left_tau[valid_l] = self.mj_data.actuator_force[self.left_hand_motor_actuator_index[valid_l]]
+            obs["left_hand_tau_est"] = left_tau
 
             obs["right_hand_q"] = self.mj_data.qpos[self.right_hand_index + self.qpos_offset - 1]
             obs["right_hand_dq"] = self.mj_data.qvel[self.right_hand_index + self.qvel_offset - 1]
             obs["right_hand_ddq"] = self.mj_data.qacc[self.right_hand_index + self.qvel_offset - 1]
 
-
-            obs["right_hand_tau_est"] = self.mj_data.actuator_force[self.right_hand_index - 1]
+            right_tau = np.zeros(len(self.right_hand_motor_index))
+            valid_r = self.right_hand_motor_actuator_index >= 0
+            if np.any(valid_r):
+                right_tau[valid_r] = self.mj_data.actuator_force[self.right_hand_motor_actuator_index[valid_r]]
+            obs["right_hand_tau_est"] = right_tau
 
 
         obs["time"] = self.mj_data.time
@@ -446,12 +487,23 @@ class DefaultEnv:
         body_torques = self.compute_body_torques()
         hand_torques = self.compute_hand_torques()
         # -1: actuator array is 0-based while joint indices from the model are 1-based
-        self.torques[self.body_joint_index - 1] = body_torques
+        # Place torques into actuator-ordered `self.torques` using mapping
+        # body
+        b_valid = self.body_actuator_index >= 0
+        if np.any(b_valid):
+            self.torques[self.body_actuator_index[b_valid]] = body_torques[b_valid]
+
         if self.num_hand_dof > 0:
-            # Only assign to actuated hand joints (first num_hand_dof elements)
-            # Remaining elements are mimic joints controlled by the actuated ones
-            self.torques[self.left_hand_index[: self.num_hand_dof] - 1] = hand_torques[: self.num_hand_dof]
-            self.torques[self.right_hand_index[: self.num_hand_dof] - 1] = hand_torques[self.num_hand_dof :]
+            # left hand motors
+            l_act = self.left_hand_motor_actuator_index[: self.num_hand_dof]
+            l_valid = l_act >= 0
+            if np.any(l_valid):
+                self.torques[l_act[l_valid]] = hand_torques[: self.num_hand_dof][l_valid]
+            # right hand motors
+            r_act = self.right_hand_motor_actuator_index[: self.num_hand_dof]
+            r_valid = r_act >= 0
+            if np.any(r_valid):
+                self.torques[r_act[r_valid]] = hand_torques[self.num_hand_dof :][r_valid]
 
         self.torques = np.clip(self.torques, -self.torque_limit, self.torque_limit)
 
