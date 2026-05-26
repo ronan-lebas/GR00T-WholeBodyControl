@@ -234,23 +234,23 @@ class DefaultEnv:
                 ]
             ):
                 self.body_joint_index.append(i)
-            # elif "left_hand" in name:
-            #     self.left_hand_index.append(i)
+            if "brainco" in self.config["ROBOT_SCENE"]:
+                filter = ["proximal", "metacarpal"]
+            elif "dex3" in self.config["ROBOT_SCENE"]:
+                filter = ["hand"]
+            else:
+                raise ValueError(f"Unknown robot scene: {self.config['ROBOT_SCENE']}")
             if "left" in name and any(
                 [
                     part_name in name
-                    # for part_name in ["thumb", "index", "middle", "ring", "pinky"]
-                    for part_name in ["proximal", "metacarpal"]
+                    for part_name in filter
                 ]
             ):
                 self.left_hand_index.append(i)
-            # elif "right_hand" in name:
-            #     self.right_hand_index.append(i)
             if "right" in name and any(
                 [
                     part_name in name
-                    # for part_name in ["thumb", "index", "middle", "ring", "pinky"]
-                    for part_name in ["proximal", "metacarpal"]
+                    for part_name in filter
                 ]
             ):
                 self.right_hand_index.append(i)
