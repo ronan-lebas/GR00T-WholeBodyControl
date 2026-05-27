@@ -2521,16 +2521,26 @@ class G1Deploy {
       if (input_interface_) {
         input_interface_->SetVR3PointCompliance(initial_vr_3point_compliance_);
         // Set initial max close ratio for hands (keyboard-controlled: X/C keys)
+#if USE_BRAINCO_HANDS
+        // BrainCo: start with hands fully open.
+        // AdjustMaxCloseRatio range is [0.2, 1.0]; 0.2 maps to 0.0 (fully open).
+        input_interface_->SetMaxCloseRatio(0.2);
+#else
         input_interface_->SetMaxCloseRatio(initial_max_close_ratio_);
-        hand_.SetMaxCloseRatio(initial_max_close_ratio_);
+#endif
+        hand_.SetMaxCloseRatio(initial_max_close_ratio_); // no-op for BrainCo
         std::cout << "[INFO] Initial VR 3-point compliance: ["
                   << initial_vr_3point_compliance_[0] << ", "
                   << initial_vr_3point_compliance_[1] << ", "
                   << initial_vr_3point_compliance_[2] << "]" << std::endl;
-        std::cout << "[INFO] Initial hand max close ratio: " << initial_max_close_ratio_ 
+        std::cout << "[INFO] Initial hand max close ratio: " << initial_max_close_ratio_
                   << " (1.0 = full closure allowed, 0.2 = limited)" << std::endl;
         std::cout << "[INFO] Keyboard controls: g/h = left hand +/- 0.1, b/v = right hand +/- 0.1 (range: 0.01-0.5)" << std::endl;
+#if USE_BRAINCO_HANDS
+        std::cout << "[INFO] Keyboard controls: x/c = BrainCo close/open all fingers (steps of ~0.125 normalized; 0.0=open, 1.0=closed)" << std::endl;
+#else
         std::cout << "[INFO] Keyboard controls: x/c = hand max close ratio +/- 0.1 (range: 0.2-1.0)" << std::endl;
+#endif
         
         // Info message about compliance observation status
         if (!has_vr_3point_compliance_obs_) {
@@ -2985,6 +2995,21 @@ class G1Deploy {
       std::tie(std::ignore, vr_5point_orientation_buffer_) = input_interface_->GetVR5PointOrientation();
       std::tie(has_left_hand_data_, left_hand_joint_buffer_) = input_interface_->GetHandPose(true);
       std::tie(has_right_hand_data_, right_hand_joint_buffer_) = input_interface_->GetHandPose(false);
+
+#if USE_BRAINCO_HANDS
+      // BrainCo: when no external hand data is available (keyboard mode), override
+      // the hand buffers with a uniform normalized close position derived from the
+      // keyboard-controlled close ratio.  AdjustMaxCloseRatio clamps to [0.2, 1.0];
+      // map linearly to BrainCo normalized space [0.0=open … 1.0=closed].
+      if (!has_left_hand_data_ && !has_right_hand_data_) {
+        const double ratio = input_interface_->GetMaxCloseRatio();
+        const double brainco_pos = std::clamp((ratio - 0.2) / 0.8, 0.0, 1.0);
+        for (int i = 0; i < static_cast<int>(left_hand_joint_buffer_.size()); ++i) {
+          left_hand_joint_buffer_[i]  = brainco_pos;
+          right_hand_joint_buffer_[i] = brainco_pos;
+        }
+      }
+#endif
       std::tie(has_upper_body_data_, upper_body_joint_positions_buffer_) = input_interface_->GetUpperBodyJointPositions();
       std::tie(std::ignore, upper_body_joint_velocities_buffer_) = input_interface_->GetUpperBodyJointVelocities();
 
