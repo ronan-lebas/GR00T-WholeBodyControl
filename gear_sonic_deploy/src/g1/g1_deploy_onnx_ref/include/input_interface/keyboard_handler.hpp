@@ -255,6 +255,10 @@ class SimpleKeyboard : public InputInterface {
                 case 'Z': encoder_mode_toggle = true; break; // Toggle encoder mode
                 case 'f':
                 case 'F': report_temperature = true; break; // Report motor temperatures
+                case 'x':
+                case 'X': AdjustMaxCloseRatio(0.1); break;  // Close hands more  (+0.1)
+                case 'c':
+                case 'C': AdjustMaxCloseRatio(-0.1); break; // Open hands more   (−0.1)
             }
 
             // Limit movement speed and height to the range of the movement mode
@@ -317,6 +321,10 @@ class SimpleKeyboard : public InputInterface {
             case 'Z': encoder_mode_toggle = true; break; // Toggle encoder mode
             case 'h':
             case 'H': report_temperature = true; break; // Report motor temperatures
+            case 'x':
+            case 'X': AdjustMaxCloseRatio(0.1); break;  // Close hands more  (+0.1)
+            case 'c':
+            case 'C': AdjustMaxCloseRatio(-0.1); break; // Open hands more   (−0.1)
           }
         }
         
