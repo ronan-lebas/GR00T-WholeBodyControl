@@ -332,6 +332,14 @@ class DefaultEnv:
         self.left_hand_motor_actuator_index = joint_to_actuator[self.left_hand_motor_index]
         self.right_hand_motor_actuator_index = joint_to_actuator[self.right_hand_motor_index]
 
+        # BrainCo: cache per-finger joint upper limits [rad] for normalized [0,1] ↔ rad conversion.
+        # These must be read here (mj_model available) because the bridge has no model access.
+        if "brainco" in self.config["ROBOT_SCENE"]:
+            self.brainco_upper_limits = np.array([
+                self.mj_model.jnt_range[j][1]
+                for j in self.left_hand_motor_index[: self.num_hand_dof]
+            ])
+
     def init_renderers(self):
         self.renderers = {}
         for camera_name, camera_config in self.camera_configs.items():
@@ -386,35 +394,56 @@ class DefaultEnv:
         left_hand_torques = np.zeros(self.num_hand_dof)
         right_hand_torques = np.zeros(self.num_hand_dof)
         if self.unitree_bridge is not None and self.unitree_bridge.low_cmd:
-            for i in range(self.unitree_bridge.num_hand_motor):
-                motor_idx_l = self.left_hand_motor_index[i]
-                motor_idx_r = self.right_hand_motor_index[i]
-                left_hand_torques[i] = (
-                    self.unitree_bridge.left_hand_cmd.motor_cmd[i].tau
-                    + self.unitree_bridge.left_hand_cmd.motor_cmd[i].kp
-                    * (
-                        self.unitree_bridge.left_hand_cmd.motor_cmd[i].q
-                        - self.mj_data.qpos[motor_idx_l + self.qpos_offset - 1]
+            if self.unitree_bridge.is_brainco:
+                # BrainCo: cmd.cmds[i].q is normalized [0, 1].
+                # Convert to joint angle [rad] using upper limits, then apply PD control.
+                # Gains chosen to stay within MuJoCo actuator ctrlrange limits:
+                #   thumb_metacarpal ±0.5 Nm, thumb_proximal ±1.1 Nm, others ±2.0 Nm
+                KP = 100 * np.array([0.3, 0.8, 1.5, 1.5, 1.5, 1.5][: self.num_hand_dof])
+                KD = np.array([0.01, 0.02, 0.02, 0.02, 0.02, 0.02][: self.num_hand_dof])
+                for i in range(self.unitree_bridge.num_hand_motor):
+                    motor_idx_l = self.left_hand_motor_index[i]
+                    motor_idx_r = self.right_hand_motor_index[i]
+                    q_des_l = float(self.unitree_bridge.left_hand_cmd.cmds[i].q) * self.brainco_upper_limits[i]
+                    q_cur_l = self.mj_data.qpos[motor_idx_l + self.qpos_offset - 1]
+                    dq_cur_l = self.mj_data.qvel[motor_idx_l + self.qvel_offset - 1]
+                    left_hand_torques[i] = KP[i] * (q_des_l - q_cur_l) + KD[i] * (0.0 - dq_cur_l)
+
+                    q_des_r = float(self.unitree_bridge.right_hand_cmd.cmds[i].q) * self.brainco_upper_limits[i]
+                    q_cur_r = self.mj_data.qpos[motor_idx_r + self.qpos_offset - 1]
+                    dq_cur_r = self.mj_data.qvel[motor_idx_r + self.qvel_offset - 1]
+                    right_hand_torques[i] = KP[i] * (q_des_r - q_cur_r) + KD[i] * (0.0 - dq_cur_r)
+            else:
+                # Dex3: cmd.motor_cmd[i].{q, dq, kp, kd, tau} are raw rad values
+                for i in range(self.unitree_bridge.num_hand_motor):
+                    motor_idx_l = self.left_hand_motor_index[i]
+                    motor_idx_r = self.right_hand_motor_index[i]
+                    left_hand_torques[i] = (
+                        self.unitree_bridge.left_hand_cmd.motor_cmd[i].tau
+                        + self.unitree_bridge.left_hand_cmd.motor_cmd[i].kp
+                        * (
+                            self.unitree_bridge.left_hand_cmd.motor_cmd[i].q
+                            - self.mj_data.qpos[motor_idx_l + self.qpos_offset - 1]
+                        )
+                        + self.unitree_bridge.left_hand_cmd.motor_cmd[i].kd
+                        * (
+                            self.unitree_bridge.left_hand_cmd.motor_cmd[i].dq
+                            - self.mj_data.qvel[motor_idx_l + self.qvel_offset - 1]
+                        )
                     )
-                    + self.unitree_bridge.left_hand_cmd.motor_cmd[i].kd
-                    * (
-                        self.unitree_bridge.left_hand_cmd.motor_cmd[i].dq
-                        - self.mj_data.qvel[motor_idx_l + self.qvel_offset - 1]
+                    right_hand_torques[i] = (
+                        self.unitree_bridge.right_hand_cmd.motor_cmd[i].tau
+                        + self.unitree_bridge.right_hand_cmd.motor_cmd[i].kp
+                        * (
+                            self.unitree_bridge.right_hand_cmd.motor_cmd[i].q
+                            - self.mj_data.qpos[motor_idx_r + self.qpos_offset - 1]
+                        )
+                        + self.unitree_bridge.right_hand_cmd.motor_cmd[i].kd
+                        * (
+                            self.unitree_bridge.right_hand_cmd.motor_cmd[i].dq
+                            - self.mj_data.qvel[motor_idx_r + self.qvel_offset - 1]
+                        )
                     )
-                )
-                right_hand_torques[i] = (
-                    self.unitree_bridge.right_hand_cmd.motor_cmd[i].tau
-                    + self.unitree_bridge.right_hand_cmd.motor_cmd[i].kp
-                    * (
-                        self.unitree_bridge.right_hand_cmd.motor_cmd[i].q
-                        - self.mj_data.qpos[motor_idx_r + self.qpos_offset - 1]
-                    )
-                    + self.unitree_bridge.right_hand_cmd.motor_cmd[i].kd
-                    * (
-                        self.unitree_bridge.right_hand_cmd.motor_cmd[i].dq
-                        - self.mj_data.qvel[motor_idx_r + self.qvel_offset - 1]
-                    )
-                )
         return np.concatenate((left_hand_torques, right_hand_torques))
 
     def compute_body_qpos(self) -> np.ndarray:
@@ -491,6 +520,17 @@ class DefaultEnv:
                 right_tau[valid_r] = self.mj_data.actuator_force[self.right_hand_motor_actuator_index[valid_r]]
             obs["right_hand_tau_est"] = right_tau
 
+            # BrainCo: also expose motor-only joint states (6 joints, excluding distal/mimic).
+            # obs["left_hand_q"] contains all hand joints (11 for BrainCo: motor + distal),
+            # so sequential indexing [0..5] would mix in distal joints. The bridge uses these
+            # dedicated motor-only keys to publish normalized [0,1] state correctly.
+            if "brainco" in self.config["ROBOT_SCENE"]:
+                motor_l = self.left_hand_motor_index[: self.num_hand_dof]
+                motor_r = self.right_hand_motor_index[: self.num_hand_dof]
+                obs["left_hand_motor_q"]  = self.mj_data.qpos[motor_l + self.qpos_offset - 1]
+                obs["left_hand_motor_dq"] = self.mj_data.qvel[motor_l + self.qvel_offset - 1]
+                obs["right_hand_motor_q"]  = self.mj_data.qpos[motor_r + self.qpos_offset - 1]
+                obs["right_hand_motor_dq"] = self.mj_data.qvel[motor_r + self.qvel_offset - 1]
 
         obs["time"] = self.mj_data.time
         return obs
