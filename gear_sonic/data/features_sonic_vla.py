@@ -209,6 +209,7 @@ def get_features_sonic_vla(robot_model: RobotModel) -> dict:
     """
     joint_names = robot_model.joint_names
     num_joints = robot_model.num_joints
+    num_hand_dof = len(robot_model.get_hand_actuated_joint_indices("left"))
 
     return {
         "observation.images.ego_view": {
@@ -295,12 +296,12 @@ def get_features_sonic_vla(robot_model: RobotModel) -> dict:
         },
         "teleop.left_hand_joints": {
             "dtype": "float32",
-            "shape": (7,),
+            "shape": (num_hand_dof,),
             "names": "left_hand_joints",
         },
         "teleop.right_hand_joints": {
             "dtype": "float32",
-            "shape": (7,),
+            "shape": (num_hand_dof,),
             "names": "right_hand_joints",
         },
         "teleop.smpl_frame_index": {
@@ -400,11 +401,13 @@ def get_g1_robot_model(
         "lower_body", "upper_body", "lower_and_upper_body"
     ] = "lower_and_upper_body",
     high_elbow_pose: bool = False,
+    hand_type: Literal["dex3", "brainco"] = "dex3",
 ):
-    """Instantiate the G1 + ThreeFinger RobotModel for Sonic VLA."""
+    """Instantiate the G1 RobotModel for Sonic VLA."""
     from gear_sonic.data.robot_model.instantiation.g1 import instantiate_g1_robot_model
 
     return instantiate_g1_robot_model(
         waist_location=waist_location,
         high_elbow_pose=high_elbow_pose,
+        hand_type=hand_type,
     )
