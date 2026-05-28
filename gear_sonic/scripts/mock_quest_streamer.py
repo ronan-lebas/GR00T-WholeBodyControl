@@ -28,24 +28,31 @@ def is_data():
     return select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], [])
 
 
-def make_grasp_joints(grasp: float, hand_type: str) -> list[float]:
-    """Return a 7-element joint list for the given grasp level.
+def make_grasp_joints(t: float, hand_type: str) -> list[float]:
+    """Return a 7-element joint list for time t.
 
-    grasp: float in [0.0, 1.0]  (0 = open, 1 = closed)
     hand_type: 'brainco' or 'dex3'
 
     BrainCo: 6 normalized values [0,1] + 1 padding zero.
-    DEX3:    7 joint angles in radians, scaled to a reasonable grasp range.
+             Each finger gets its own phase offset so they move independently,
+             clearly demonstrating per-finger control.
+    DEX3:    7 joint angles in radians, all fingers in sync.
     """
     if hand_type == "brainco":
-        return [grasp] * 6 + [0.0]
+        # Fingers: Thumb, Thumb_aux, Index, Middle, Ring, Pinky
+        # Evenly spaced phase offsets over one full period (2π), ~6 s cycle each.
+        joints = [
+            0.5 - 0.5 * math.cos(t * math.pi / 3.0 + i * 2.0 * math.pi / 6.0)
+            for i in range(6)
+        ]
+        return joints + [0.0]  # 7th slot: unused, padded with 0
     else:  # dex3
         # DEX3 joint limits (left hand, close direction):
         #   j0 thumb:  0 -> 1.05 rad
         #   j1 thumb2: 0 -> 1.05 rad
         #   j2 thumb3: 1.75 -> 0 rad (already open at 1.75, close toward 0)
         #   j3..j6 fingers: 0 -> -1.57 / -1.75 rad (close in negative direction)
-        # Simple approximation: scale grasp linearly to half the close limit.
+        grasp = 0.5 - 0.5 * math.cos(t * math.pi / 3.0)  # [0, 1], period ~6 s
         dex3_close = [1.05, 1.05, 0.0, -1.57, -1.75, -1.57, -1.75]
         return [grasp * v for v in dex3_close]
 
@@ -84,10 +91,12 @@ def main():
     stream_mode = 5  # 5 = StreamMode.PLANNER_VR_3PT
 
     finger_tracking_enabled = False
+    arm_z_animation_enabled = False
     print("Keyboard controls:")
     print("  c  - Toggle data collection (Left Grip + A)")
     print("  x  - Toggle data abort (Left Grip + B)")
     print("  f  - Toggle finger tracking (slow open/close sine wave, ~6 s period)")
+    print("  a  - Toggle arm Z animation (wrists move up/down in sine wave)")
     if args.hand == "brainco":
         print("       BrainCo: 6 DOF, values [0.0=open .. 1.0=closed], 7th slot padded")
     else:
@@ -113,12 +122,15 @@ def main():
                     finger_tracking_enabled = not finger_tracking_enabled
                     state = "ENABLED" if finger_tracking_enabled else "DISABLED"
                     print(f"Pressed 'f': Finger tracking {state}")
+                elif c == 'a':
+                    arm_z_animation_enabled = not arm_z_animation_enabled
+                    state = "ENABLED" if arm_z_animation_enabled else "DISABLED"
+                    print(f"Pressed 'a': Arm Z animation {state}")
 
             # 3. Generate Mocked 3-Point VR Data
-            # Moving the wrists up and down in a sine wave.
             # Coordinate System: X-forward, Y-left, Z-up
-            left_z = 0.3 # + 0.2 * math.sin(t * 3.0)
-            right_z = 0.3 # + 0.2 * math.cos(t * 3.0)
+            left_z  = 0.3 + (0.2 * math.sin(t * 3.0) if arm_z_animation_enabled else 0.0)
+            right_z = 0.3 + (0.2 * math.cos(t * 3.0) if arm_z_animation_enabled else 0.0)
 
             vr_3pt_pos = [
                 0.3,  0.2, left_z,   # Left Wrist (X, Y, Z)
@@ -133,13 +145,11 @@ def main():
             ]
 
             # 4. Compute dummy finger joint targets when tracking is enabled.
-            # Slow cosine ramp: 0 (open) → 1 (closed) → 0, period ~6 s.
             left_hand_joints = None
             right_hand_joints = None
             if finger_tracking_enabled:
-                grasp = 0.5 - 0.5 * math.cos(t * math.pi / 3.0)  # [0, 1]
-                left_hand_joints  = make_grasp_joints(grasp, args.hand)
-                right_hand_joints = make_grasp_joints(grasp, args.hand)
+                left_hand_joints  = make_grasp_joints(t, args.hand)
+                right_hand_joints = make_grasp_joints(t, args.hand)
 
             # 5. Send the Manager State (topic: "manager_state")
             # This tells the C++ state machine that we are staying in VR_3PT mode.
