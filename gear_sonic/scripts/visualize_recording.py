@@ -11,8 +11,31 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from pathlib import Path
 
-df = pd.read_parquet('outputs/2026-05-28-12-18-42/data/chunk-000/episode_000000.parquet')
+# auto-select latest timestamped recording folder under `outputs/`
+base_outputs = Path('outputs')
+if not base_outputs.exists():
+	raise FileNotFoundError('outputs/ directory not found')
+subdirs = [p for p in base_outputs.iterdir() if p.is_dir()]
+if not subdirs:
+	raise FileNotFoundError('no recording folders found in outputs/')
+# timestamp folders sort lexicographically when using YYYY-MM-DD-HH-MM-SS
+latest = sorted(subdirs)[-1]
+# find parquet files under latest/data (recursive)
+parquets = list(latest.rglob('*.parquet'))
+if not parquets:
+	raise FileNotFoundError(f'no parquet files under {latest}')
+# prefer episode_000000.parquet if present
+chosen = None
+for p in parquets:
+	if p.name == 'episode_000000.parquet':
+		chosen = p
+		break
+if chosen is None:
+	chosen = sorted(parquets)[-1]
+print(f'Using recording: {chosen}')
+df = pd.read_parquet(chosen)
 
 # Stack commonly used arrays
 obs_joint = np.stack(df['observation.state'].values)
@@ -28,32 +51,31 @@ if 'teleop.left_hand_joints' in df.columns:
 if 'teleop.right_hand_joints' in df.columns:
 	right_hand = np.stack(df['teleop.right_hand_joints'].values)
 
-def _deterministic_hand_map(start_idx: int, teleop_hand: np.ndarray | None):
-	"""Return deterministic mapping for teleop hand joints into action.wbc columns.
+# Infer hand DOF count from the data: 6 = BrainCo, 7 = DEX3.
+# Fall back to half of the hand columns in action.wbc if no teleop data.
+if left_hand is not None:
+	n_hand_dof = left_hand.shape[1]
+elif right_hand is not None:
+	n_hand_dof = right_hand.shape[1]
+else:
+	# action.wbc has 29 body joints + left hand + right hand
+	n_hand_dof = (act_joint.shape[1] - 29) // 2
+print(f'Hand DOF: {n_hand_dof} ({"BrainCo" if n_hand_dof == 6 else "DEX3"})')
 
-	left hand starts at index 29, right hand at 29+7.
-	"""
-	if teleop_hand is None:
-		return None
-	n = teleop_hand.shape[1]
-	return list(range(start_idx, start_idx + n))
-
-
-# deterministic mapping: left starts at 29, right at 29+7
-# deterministic action indices for hands (fixed mapping)
-left_map = list(range(29, 29 + 7))
-right_map = list(range(29 + 7, 29 + 14))
+# action.wbc layout: [0..28] body joints, [29..29+n) left hand, [29+n..29+2n) right hand
+left_map  = list(range(29, 29 + n_hand_dof))
+right_map = list(range(29 + n_hand_dof, 29 + 2 * n_hand_dof))
 
 # Create separate subplot for each teleop joint vs its corresponding action.wbc column
-n_pairs = 14
+n_pairs = 2 * n_hand_dof
 n_plots = n_pairs + 1  # +1 for EEF plotting
 cols = 3
 rows = int(np.ceil(n_plots / cols))
 fig, axes = plt.subplots(rows, cols, figsize=(16, 4 * rows), sharex=True)
 axes = axes.flatten()
 
-# plot left hand pairs (indices 0..6)
-for i in range(7):
+# plot left hand pairs
+for i in range(n_hand_dof):
 	ax = axes[i]
 	act_idx = left_map[i]
 	if left_hand is not None:
@@ -65,9 +87,9 @@ for i in range(7):
 	ax.grid(True, alpha=0.3)
 	ax.legend(fontsize='small')
 
-# plot right hand pairs (indices 7..13)
-for j in range(7):
-	ax = axes[7 + j]
+# plot right hand pairs
+for j in range(n_hand_dof):
+	ax = axes[n_hand_dof + j]
 	act_idx = right_map[j]
 	if right_hand is not None:
 		ax.plot(right_hand[:, j], label=f'right_teleop_{j}', color='C0')
