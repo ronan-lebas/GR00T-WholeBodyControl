@@ -43,7 +43,7 @@ act_joint = np.stack(df['action.wbc'].values)
 eef_state = np.stack(df['observation.eef_state'].values)
 proj_grav = np.stack(df['observation.projected_gravity'].values)
 
-# Teleop hand joints (optional in dataset)
+# Teleop hand joints (optional in dataset): the target sent by the streamer
 left_hand = None
 right_hand = None
 if 'teleop.left_hand_joints' in df.columns:
@@ -52,51 +52,68 @@ if 'teleop.right_hand_joints' in df.columns:
 	right_hand = np.stack(df['teleop.right_hand_joints'].values)
 
 # Infer hand DOF count from the data: 6 = BrainCo, 7 = DEX3.
-# Fall back to half of the hand columns in action.wbc if no teleop data.
 if left_hand is not None:
 	n_hand_dof = left_hand.shape[1]
 elif right_hand is not None:
 	n_hand_dof = right_hand.shape[1]
 else:
-	# action.wbc has 29 body joints + left hand + right hand
+	# action.wbc total size minus 29 body joints, split evenly
 	n_hand_dof = (act_joint.shape[1] - 29) // 2
-print(f'Hand DOF: {n_hand_dof} ({"BrainCo" if n_hand_dof == 6 else "DEX3"})')
+hand_type = "brainco" if n_hand_dof == 6 else "dex3"
+print(f'Hand DOF: {n_hand_dof} ({hand_type.upper()})')
 
-# action.wbc layout: [0..28] body joints, [29..29+n) left hand, [29+n..29+2n) right hand
-left_map  = list(range(29, 29 + n_hand_dof))
-right_map = list(range(29 + n_hand_dof, 29 + 2 * n_hand_dof))
+# Hardcoded actuated joint indices in the full 43/51-DOF Pinocchio q vector.
+# Hand joints follow the arm joints (not all body joints), so the indices are NOT
+# the naive [29..34] / [35..41]. Verified from instantiate_g1_robot_model().
+if hand_type == "brainco":
+	# 51-DOF model: legs(12) + waist(3) + L-arm(7) + L-hand(11) + R-arm(7) + R-hand(11)
+	# L-hand motor joints (order: thumb_meta, thumb_prox, index_prox, middle_prox, ring_prox, pinky_prox)
+	left_motor_map  = [30, 31, 22, 24, 28, 26]
+	right_motor_map = [48, 49, 40, 42, 46, 44]
+	motor_names = ['thumb_meta', 'thumb_prox', 'index_prox', 'middle_prox', 'ring_prox', 'pinky_prox']
+else:  # dex3
+	# 43-DOF model: legs(12) + waist(3) + L-arm(7) + L-hand(7) + R-arm(7) + R-hand(7)
+	# L-hand motor joints (order: thumb_0, thumb_1, thumb_2, index_0, index_1, middle_0, middle_1)
+	left_motor_map  = [26, 27, 28, 22, 23, 24, 25]
+	right_motor_map = [40, 41, 42, 36, 37, 38, 39]
+	motor_names = ['thumb_0', 'thumb_1', 'thumb_2', 'index_0', 'index_1', 'middle_0', 'middle_1']
 
-# Create separate subplot for each teleop joint vs its corresponding action.wbc column
+# Each subplot shows three signals per motor joint:
+#   teleop target  (blue solid)  — what you commanded from the streamer
+#   action.wbc     (orange dash) — what the WBC controller output (same index in q vector)
+#   obs.state      (green dot)   — actual sensor reading from the robot (same index)
 n_pairs = 2 * n_hand_dof
-n_plots = n_pairs + 1  # +1 for EEF plotting
+n_plots = n_pairs + 1  # +1 for EEF
 cols = 3
 rows = int(np.ceil(n_plots / cols))
 fig, axes = plt.subplots(rows, cols, figsize=(16, 4 * rows), sharex=True)
 axes = axes.flatten()
 
-# plot left hand pairs
+# plot left hand motors
 for i in range(n_hand_dof):
 	ax = axes[i]
-	act_idx = left_map[i]
+	q_idx = left_motor_map[i]
 	if left_hand is not None:
-		ax.plot(left_hand[:, i], label=f'left_teleop_{i}', color='C0')
+		ax.plot(left_hand[:, i], label='teleop target', color='C0')
 	else:
 		ax.text(0.5, 0.5, 'no teleop.left_hand_joints', ha='center')
-	ax.plot(act_joint[:, act_idx], label=f'action.wbc[{act_idx}]', linestyle='--', color='C1', alpha=0.9)
-	ax.set_title(f'Left joint {i}  — action idx {act_idx}')
+	ax.plot(act_joint[:, q_idx], label='action.wbc (cmd)', linestyle='--', color='C1', alpha=0.9)
+	ax.plot(obs_joint[:, q_idx], label='obs.state (actual)', linestyle=':', color='C2', alpha=0.9)
+	ax.set_title(f'L {motor_names[i]}  q[{q_idx}]')
 	ax.grid(True, alpha=0.3)
 	ax.legend(fontsize='small')
 
-# plot right hand pairs
+# plot right hand motors
 for j in range(n_hand_dof):
 	ax = axes[n_hand_dof + j]
-	act_idx = right_map[j]
+	q_idx = right_motor_map[j]
 	if right_hand is not None:
-		ax.plot(right_hand[:, j], label=f'right_teleop_{j}', color='C0')
+		ax.plot(right_hand[:, j], label='teleop target', color='C0')
 	else:
 		ax.text(0.5, 0.5, 'no teleop.right_hand_joints', ha='center')
-	ax.plot(act_joint[:, act_idx], label=f'action.wbc[{act_idx}]', linestyle='--', color='C1', alpha=0.9)
-	ax.set_title(f'Right joint {j}  — action idx {act_idx}')
+	ax.plot(act_joint[:, q_idx], label='action.wbc (cmd)', linestyle='--', color='C1', alpha=0.9)
+	ax.plot(obs_joint[:, q_idx], label='obs.state (actual)', linestyle=':', color='C2', alpha=0.9)
+	ax.set_title(f'R {motor_names[j]}  q[{q_idx}]')
 	ax.grid(True, alpha=0.3)
 	ax.legend(fontsize='small')
 
