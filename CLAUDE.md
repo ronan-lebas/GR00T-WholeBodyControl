@@ -166,5 +166,4 @@ gear_sonic/
 This repo is my fork from the NVIDIA repo.
 We are working and focusing exclusively on gear_sonic and gear_sonic_deploy, do not look at all at motionbricks or decoupleb_wbc.
 Originally, only the dex3 hands were supported. I'm working on adding the brainco hand. We already added all the necessary modifications to the simulation side and embedded code side. The new hands work properly (we can close and open the fingers with keyboard input in keyboard mode).
-The next step is to make sure the adjacent features such as 3-point teleoperation and data collection are also adapted.
 Relevant files to start working include `unitree_sdk2py_bridge.py`, `g1_deploy_onnx_ref.cpp`.
