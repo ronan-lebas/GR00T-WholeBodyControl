@@ -28,6 +28,22 @@ def is_data():
     return select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], [])
 
 
+def retarget_joints_to_wire(joints_normalized: np.ndarray, hand_type: str) -> list[float]:
+    """Convert 6 normalized [0,1] joints from video_retarget to the 7-element wire format.
+
+    For brainco: append one padding zero (7th slot unused by firmware).
+    For dex3: scale each normalized value by the per-joint close limit.
+    """
+    j = joints_normalized  # shape (6,)
+    if hand_type == "brainco":
+        return list(j) + [0.0]
+    else:  # dex3
+        dex3_close = [1.05, 1.05, 0.0, -1.57, -1.75, -1.57, -1.75]
+        # Map the first 6 normalized values; 7th slot mirrors j[5] (pinky)
+        normalized_7 = list(j) + [j[5]]
+        return [n * v for n, v in zip(normalized_7, dex3_close)]
+
+
 def make_grasp_joints(t: float, hand_type: str) -> list[float]:
     """Return a 7-element joint list for time t.
 
@@ -65,7 +81,21 @@ def main():
         default="dex3",
         help="Hand type: 'dex3' (7 DOF, joint angles in rad) or 'brainco' (6 DOF, normalized [0,1]). Default: dex3",
     )
+    parser.add_argument(
+        "--video-retarget",
+        action="store_true",
+        help=(
+            "Use video_retarget module for finger joints instead of the cosine animation. "
+            "Opens a camera GUI and streams live hand detection. "
+            "Implies finger tracking; press 'f' still toggles sending the joints."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.video_retarget:
+        import video_retarget
+        video_retarget.start(hand="right")
+        print("video_retarget started — camera GUI should be open.")
 
     old_settings = termios.tcgetattr(sys.stdin)
     tty.setcbreak(sys.stdin.fileno())
@@ -95,7 +125,8 @@ def main():
     print("Keyboard controls:")
     print("  c  - Toggle data collection (Left Grip + A)")
     print("  x  - Toggle data abort (Left Grip + B)")
-    print("  f  - Toggle finger tracking (slow open/close sine wave, ~6 s period)")
+    retarget_src = "video_retarget module" if args.video_retarget else "slow open/close sine wave, ~6 s period"
+    print(f"  f  - Toggle finger tracking ({retarget_src})")
     print("  a  - Toggle arm Z animation (wrists move up/down in sine wave)")
     if args.hand == "brainco":
         print("       BrainCo: 6 DOF, values [0.0=open .. 1.0=closed], 7th slot padded")
@@ -144,12 +175,18 @@ def main():
                 1.0, 0.0, 0.0, 0.0,  # Head (W, X, Y, Z)
             ]
 
-            # 4. Compute dummy finger joint targets when tracking is enabled.
+            # 4. Compute finger joint targets when tracking is enabled.
             left_hand_joints = None
             right_hand_joints = None
             if finger_tracking_enabled:
-                left_hand_joints  = make_grasp_joints(t, args.hand)
-                right_hand_joints = make_grasp_joints(t, args.hand)
+                if args.video_retarget:
+                    raw = video_retarget.get_joints()  # np.ndarray (6,) in [0, 1]
+                    wire = retarget_joints_to_wire(raw, args.hand)
+                    left_hand_joints  = wire
+                    right_hand_joints = wire
+                else:
+                    left_hand_joints  = make_grasp_joints(t, args.hand)
+                    right_hand_joints = make_grasp_joints(t, args.hand)
 
             # 5. Send the Manager State (topic: "manager_state")
             # This tells the C++ state machine that we are staying in VR_3PT mode.
