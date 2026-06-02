@@ -114,7 +114,7 @@ class BaseConfig(ArgsConfigTemplate):
     dataset_version: str = "sonic_model12"
 
     # WBC Configuration
-    wbc_version: Literal[tuple(WBC_VERSIONS)] = "sonic_model12"
+    wbc_version: Literal[tuple(WBC_VERSIONS)] = "sonic_model12_brainco"
     """Version of the whole body controller."""
 
     wbc_model_path: str = "policy/stand.onnx,policy/walk.onnx"

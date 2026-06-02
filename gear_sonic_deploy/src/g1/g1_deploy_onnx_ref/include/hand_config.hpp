@@ -18,7 +18,7 @@
 #pragma once
 
 // *** CHANGE THIS LINE TO 1 FOR BRAINCO HANDS, THEN RECOMPILE ***
-#define USE_BRAINCO_HANDS 0
+#define USE_BRAINCO_HANDS 1
 
 #if USE_BRAINCO_HANDS
 static constexpr int NUM_HAND_MOTORS = 6;   ///< BrainCo Revo2: 6 DOF per hand
