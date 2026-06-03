@@ -144,10 +144,47 @@ class DefaultEnv:
 
         return default_dof_properties
 
+    def _inject_box(self, xml_path: str, box_config: dict) -> str:
+        """Inject a free box body into the scene XML; returns path to temp file."""
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        worldbody = root.find("worldbody")
+
+        pos = box_config["pos"]
+        size = box_config["size"]
+        mass = box_config["mass"]
+
+        box_body = ET.SubElement(worldbody, "body")
+        box_body.set("name", "box")
+        box_body.set("pos", f"{pos[0]} {pos[1]} {pos[2]}")
+        ET.SubElement(box_body, "freejoint")
+        geom = ET.SubElement(box_body, "geom")
+        geom.set("type", "box")
+        geom.set("size", f"{size[0]} {size[1]} {size[2]}")
+        geom.set("mass", str(mass))
+
+        # Write next to the original so relative <include> paths remain valid
+        xml_dir = os.path.dirname(xml_path)
+        with tempfile.NamedTemporaryFile(
+            mode="w", delete=False, suffix=".xml", dir=xml_dir
+        ) as f:
+            tree.write(f.name)
+            return f.name
+
     def init_scene(self):
         """Initialize the default robot scene"""
         xml_path = str(pathlib.Path(GEAR_SONIC_ROOT) / self.config["ROBOT_SCENE"])
-        self.mj_model = mujoco.MjModel.from_xml_path(xml_path)
+
+        box_config = self.config.get("box_config", None)
+        if box_config:
+            tmp_xml = self._inject_box(xml_path, box_config)
+            try:
+                self.mj_model = mujoco.MjModel.from_xml_path(tmp_xml)
+            finally:
+                os.remove(tmp_xml)
+        else:
+            self.mj_model = mujoco.MjModel.from_xml_path(xml_path)
+
         self.mj_data = mujoco.MjData(self.mj_model)
         self.mj_model.opt.timestep = self.sim_dt
         self.torso_index = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
