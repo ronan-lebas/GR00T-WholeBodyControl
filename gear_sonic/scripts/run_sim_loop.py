@@ -17,6 +17,11 @@ from gear_sonic.data.robot_model.robot_model import RobotModel
 
 ArgsConfig = SimLoopConfig
 
+# Box parameters — edit these to change the box in the simulation
+BOX_SIZE = (0.2, 0.2, 0.2)   # half-extents in meters (x, y, z)
+BOX_POS  = (0.5, 0.0, 0.1)   # position in meters (x, y, z); z = half-height to rest on floor
+BOX_MASS = 1.0                # mass in kg
+
 
 class SimWrapper:
     def __init__(self, robot_model: RobotModel, env_name: str, config: Dict[str, any], **kwargs):
@@ -37,6 +42,13 @@ def main(config: ArgsConfig):
     wbc_config = config.load_wbc_yaml()
     # NOTE: we will override the interface to local if it is not specified
     wbc_config["ENV_NAME"] = config.env_name
+
+    if config.box:
+        wbc_config["box_config"] = {
+            "size": BOX_SIZE,
+            "pos": BOX_POS,
+            "mass": BOX_MASS,
+        }
 
     if config.enable_image_publish:
         assert (
