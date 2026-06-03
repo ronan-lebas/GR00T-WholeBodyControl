@@ -7,6 +7,7 @@ import sys
 import select
 import termios
 import tty
+from pathlib import Path
 
 # We import the exact message builders
 # so the ZMQ serialization perfectly matches what the C++ code expects.
@@ -93,9 +94,11 @@ def main():
     args = parser.parse_args()
 
     if args.video_retarget:
-        import video_retarget
-        video_retarget.start(hand="right")
-        print("video_retarget started — camera GUI should be open.")
+        _demos_path = Path(__file__).resolve().parents[2] / "third_party" / "brainco-retargeting" / "demos"
+        sys.path.insert(0, str(_demos_path))
+        import retarget_streaming
+        retarget_streaming.start(hand="right")
+        print("retarget_streaming started — camera GUI should be open.")
 
     old_settings = termios.tcgetattr(sys.stdin)
     tty.setcbreak(sys.stdin.fileno())
@@ -180,7 +183,7 @@ def main():
             right_hand_joints = None
             if finger_tracking_enabled:
                 if args.video_retarget:
-                    raw = video_retarget.get_joints()  # np.ndarray (6,) in [0, 1]
+                    raw = retarget_streaming.get_joints()  # np.ndarray (6,) in [0, 1]
                     wire = retarget_joints_to_wire(raw, args.hand)
                     left_hand_joints  = wire
                     right_hand_joints = wire
@@ -227,6 +230,8 @@ def main():
         socket.send(build_command_message(start=False, stop=True, planner=True))
         time.sleep(0.1)
     finally:
+        if args.video_retarget:
+            retarget_streaming.stop()
         socket.close()
         context.term()
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
