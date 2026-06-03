@@ -344,3 +344,6 @@ class SimLoopConfig(BaseConfig):
 
     verbose: bool = False
     """Verbose output, override the base config verbose"""
+
+    box: bool = False
+    """Add a box object to the simulation scene"""
