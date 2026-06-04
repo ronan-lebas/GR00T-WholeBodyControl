@@ -86,11 +86,23 @@ class UnitreeSdk2Bridge:
         self.is_brainco = "brainco" in config.get("ROBOT_SCENE", "")
 
         if self.is_brainco:
-            # BrainCo joint upper limits [rad]: thumb_metacarpal, thumb_proximal,
-            # index_proximal, middle_proximal, ring_proximal, pinky_proximal
-            self.brainco_upper_limits = np.array(
+            # Per-hand BrainCo joint limits [rad] for normalized [0,1] <-> rad conversion of
+            # the state feedback. The normalized value is mapped affinely over the joint's
+            # full [lower, upper] travel: norm = (q - lower) / (upper - lower). This mirrors
+            # the command-side mapping in DefaultEnv.compute_hand_torques() so the round trip
+            # is exact even for joints with a non-zero lower limit (e.g. thumb metacarpal).
+            #
+            # These are fallback defaults (lower = 0, official Revo2 upper limits, in joint
+            # order: thumb_metacarpal, thumb_proximal, index, middle, ring, pinky). The owning
+            # DefaultEnv overrides them per hand from the loaded MuJoCo model via
+            # set_brainco_limits() (the bridge itself has no model access).
+            default_upper = np.array(
                 [1.5184, 1.0472, 1.4661, 1.4661, 1.4661, 1.4661][: self.num_hand_motor]
             )
+            self.brainco_lower_limits_left = np.zeros(self.num_hand_motor)
+            self.brainco_upper_limits_left = default_upper.copy()
+            self.brainco_lower_limits_right = np.zeros(self.num_hand_motor)
+            self.brainco_upper_limits_right = default_upper.copy()
 
             # State publishers: normalized [0,1] on rt/brainco/*/state
             def _ms():  # helper to build a zero MotorState_
@@ -197,6 +209,15 @@ class UnitreeSdk2Bridge:
             self.right_hand_cmd_received = True
             self.new_right_hand_cmd = True
 
+    def set_brainco_limits(self, lower_left, upper_left, lower_right, upper_right):
+        """Override the per-hand BrainCo joint limits [rad] used for normalized<->rad
+        state-feedback conversion. Called by the owning DefaultEnv with values read from
+        the loaded MuJoCo model so the state mapping matches the command mapping exactly."""
+        self.brainco_lower_limits_left  = np.asarray(lower_left,  dtype=float)
+        self.brainco_upper_limits_left  = np.asarray(upper_left,  dtype=float)
+        self.brainco_lower_limits_right = np.asarray(lower_right, dtype=float)
+        self.brainco_upper_limits_right = np.asarray(upper_right, dtype=float)
+
     def cmd_received(self):
         with self.low_cmd_lock:
             low_cmd_received = self.low_cmd_received
@@ -248,20 +269,24 @@ class UnitreeSdk2Bridge:
 
         # publish hand state
         if self.is_brainco:
-            # BrainCo: convert motor joint angles [rad] → normalized [0, 1] using joint upper limits.
+            # BrainCo: convert motor joint angles [rad] -> normalized [0, 1] with the per-hand
+            # affine map norm = (q - lower) / (upper - lower), the inverse of the command map.
             # Use "left_hand_motor_q" (motor-only joints, not the full hand_q which includes distal joints).
+            span_left  = self.brainco_upper_limits_left  - self.brainco_lower_limits_left
+            span_right = self.brainco_upper_limits_right - self.brainco_lower_limits_right
+
             left_motor_q  = obs.get("left_hand_motor_q",  obs["left_hand_q"][:self.num_hand_motor])
             left_motor_dq = obs.get("left_hand_motor_dq", obs["left_hand_dq"][:self.num_hand_motor])
             for i in range(self.num_hand_motor):
-                self.left_hand_state.states[i].q  = float(left_motor_q[i]  / self.brainco_upper_limits[i])
-                self.left_hand_state.states[i].dq = float(left_motor_dq[i] / self.brainco_upper_limits[i])
+                self.left_hand_state.states[i].q  = float((left_motor_q[i] - self.brainco_lower_limits_left[i]) / span_left[i])
+                self.left_hand_state.states[i].dq = float(left_motor_dq[i] / span_left[i])
             self.left_hand_state_puber.Write(self.left_hand_state)
 
             right_motor_q  = obs.get("right_hand_motor_q",  obs["right_hand_q"][:self.num_hand_motor])
             right_motor_dq = obs.get("right_hand_motor_dq", obs["right_hand_dq"][:self.num_hand_motor])
             for i in range(self.num_hand_motor):
-                self.right_hand_state.states[i].q  = float(right_motor_q[i]  / self.brainco_upper_limits[i])
-                self.right_hand_state.states[i].dq = float(right_motor_dq[i] / self.brainco_upper_limits[i])
+                self.right_hand_state.states[i].q  = float((right_motor_q[i] - self.brainco_lower_limits_right[i]) / span_right[i])
+                self.right_hand_state.states[i].dq = float(right_motor_dq[i] / span_right[i])
             self.right_hand_state_puber.Write(self.right_hand_state)
         else:
             # Dex3: publish raw joint angles

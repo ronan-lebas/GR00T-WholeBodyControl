@@ -332,12 +332,31 @@ class DefaultEnv:
         self.left_hand_motor_actuator_index = joint_to_actuator[self.left_hand_motor_index]
         self.right_hand_motor_actuator_index = joint_to_actuator[self.right_hand_motor_index]
 
-        # BrainCo: cache per-finger joint upper limits [rad] for normalized [0,1] ↔ rad conversion.
-        # These must be read here (mj_model available) because the bridge has no model access.
+        # BrainCo: cache per-finger joint limits [rad] for normalized [0,1] <-> rad conversion.
+        # BrainCo commands/states are normalized [0,1] (0 = open, 1 = closed). We map them
+        # with an AFFINE transform over each joint's full [lower, upper] travel so that:
+        #   - normalized 0 maps to the lower limit and 1 to the upper limit;
+        #   - joints whose lower limit is non-zero (e.g. the thumb metacarpal) sweep their
+        #     entire travel instead of dead-zoning against the lower limit (a plain
+        #     `q = norm * upper` would clamp everything below `lower / upper` to the limit).
+        # Limits are read per hand because the left/right joint ranges are not guaranteed
+        # to match, and must be read here (mj_model available) since the bridge has no model.
         if "brainco" in self.config["ROBOT_SCENE"]:
-            self.brainco_upper_limits = np.array([
+            self.brainco_lower_limits_left = np.array([
+                self.mj_model.jnt_range[j][0]
+                for j in self.left_hand_motor_index[: self.num_hand_dof]
+            ])
+            self.brainco_upper_limits_left = np.array([
                 self.mj_model.jnt_range[j][1]
                 for j in self.left_hand_motor_index[: self.num_hand_dof]
+            ])
+            self.brainco_lower_limits_right = np.array([
+                self.mj_model.jnt_range[j][0]
+                for j in self.right_hand_motor_index[: self.num_hand_dof]
+            ])
+            self.brainco_upper_limits_right = np.array([
+                self.mj_model.jnt_range[j][1]
+                for j in self.right_hand_motor_index[: self.num_hand_dof]
             ])
 
     def init_renderers(self):
@@ -395,8 +414,10 @@ class DefaultEnv:
         right_hand_torques = np.zeros(self.num_hand_dof)
         if self.unitree_bridge is not None and self.unitree_bridge.low_cmd:
             if self.unitree_bridge.is_brainco:
-                # BrainCo: cmd.cmds[i].q is normalized [0, 1].
-                # Convert to joint angle [rad] using upper limits, then apply PD control.
+                # BrainCo: cmd.cmds[i].q is normalized [0, 1]. Map it to a joint angle [rad]
+                # with the per-hand affine transform q = lower + norm * (upper - lower) so the
+                # full normalized command sweeps the joint's entire [lower, upper] travel
+                # (see brainco_*_limits_* computation in the setup above), then apply PD control.
                 # Gains chosen to stay within MuJoCo actuator ctrlrange limits:
                 #   thumb_metacarpal ±0.5 Nm, thumb_proximal ±1.1 Nm, others ±2.0 Nm
                 KP = 100 * np.array([0.3, 0.8, 1.5, 1.5, 1.5, 1.5][: self.num_hand_dof])
@@ -404,12 +425,18 @@ class DefaultEnv:
                 for i in range(self.unitree_bridge.num_hand_motor):
                     motor_idx_l = self.left_hand_motor_index[i]
                     motor_idx_r = self.right_hand_motor_index[i]
-                    q_des_l = float(self.unitree_bridge.left_hand_cmd.cmds[i].q) * self.brainco_upper_limits[i]
+                    norm_l = float(self.unitree_bridge.left_hand_cmd.cmds[i].q)
+                    q_des_l = self.brainco_lower_limits_left[i] + norm_l * (
+                        self.brainco_upper_limits_left[i] - self.brainco_lower_limits_left[i]
+                    )
                     q_cur_l = self.mj_data.qpos[motor_idx_l + self.qpos_offset - 1]
                     dq_cur_l = self.mj_data.qvel[motor_idx_l + self.qvel_offset - 1]
                     left_hand_torques[i] = KP[i] * (q_des_l - q_cur_l) + KD[i] * (0.0 - dq_cur_l)
 
-                    q_des_r = float(self.unitree_bridge.right_hand_cmd.cmds[i].q) * self.brainco_upper_limits[i]
+                    norm_r = float(self.unitree_bridge.right_hand_cmd.cmds[i].q)
+                    q_des_r = self.brainco_lower_limits_right[i] + norm_r * (
+                        self.brainco_upper_limits_right[i] - self.brainco_lower_limits_right[i]
+                    )
                     q_cur_r = self.mj_data.qpos[motor_idx_r + self.qpos_offset - 1]
                     dq_cur_r = self.mj_data.qvel[motor_idx_r + self.qvel_offset - 1]
                     right_hand_torques[i] = KP[i] * (q_des_r - q_cur_r) + KD[i] * (0.0 - dq_cur_r)
@@ -635,6 +662,16 @@ class DefaultEnv:
 
     def set_unitree_bridge(self, unitree_bridge):
         self.unitree_bridge = unitree_bridge
+        # Share the per-hand BrainCo joint limits (read from the MuJoCo model) with the
+        # bridge so its normalized<->rad state feedback uses the exact same affine
+        # [lower, upper] mapping as the command path in compute_hand_torques().
+        if getattr(unitree_bridge, "is_brainco", False) and hasattr(self, "brainco_lower_limits_left"):
+            unitree_bridge.set_brainco_limits(
+                self.brainco_lower_limits_left,
+                self.brainco_upper_limits_left,
+                self.brainco_lower_limits_right,
+                self.brainco_upper_limits_right,
+            )
 
     def get_privileged_obs(self):
         return {}
