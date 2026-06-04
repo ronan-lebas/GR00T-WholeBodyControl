@@ -15,6 +15,7 @@ from gear_sonic.data.robot_model.supplemental_info.g1.g1_supplemental_info impor
 def instantiate_g1_robot_model(
     waist_location: Literal["lower_body", "upper_body", "lower_and_upper_body"] = "lower_body",
     high_elbow_pose: bool = False,
+    hand_type: Literal["dex3", "brainco"] = "dex3",
 ):
     """
     Instantiate a G1 robot model with configurable waist location and pose.
@@ -25,11 +26,16 @@ def instantiate_g1_robot_model(
                         or "lower_and_upper_body" (waist reference from arms/manipulation
                         via IK then passed to lower body policy)
         high_elbow_pose: Whether to use high elbow pose configuration for default joint positions
+        hand_type: Type of hands used by the robot, either "dex3" or "brainco", changing URDF routing.
 
     Returns:
         RobotModel: Configured G1 robot model
     """
-    model_data_dir = Path(__file__).resolve().parent.parent / "model_data" / "g1" / "with_dex3"
+    if hand_type == "brainco":
+        model_data_dir = Path(__file__).resolve().parent.parent / "model_data" / "g1" / "with_brainco"
+    else:
+        model_data_dir = Path(__file__).resolve().parent.parent / "model_data" / "g1" / "with_dex3"
+
     robot_model_config = {
         "asset_path": str(model_data_dir),
         "urdf_path": str(model_data_dir / "g1_29dof_with_hand.urdf"),
@@ -51,7 +57,7 @@ def instantiate_g1_robot_model(
 
     # Create single configurable supplemental info instance
     robot_model_supplemental_info = G1SupplementalInfo(
-        waist_location=waist_location_enum, elbow_pose=elbow_pose_enum
+        waist_location=waist_location_enum, elbow_pose=elbow_pose_enum, hand_type=hand_type
     )
 
     robot_model = RobotModel(

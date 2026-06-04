@@ -3,6 +3,9 @@
 #   pip install -e decoupled_wbc/        (or decoupled_wbc[full], decoupled_wbc[dev])
 #   pip install -e gear_sonic/           (or gear_sonic[teleop], gear_sonic[sim])
 
+[tool.uv]
+override-dependencies = ["numpy>=1.24,<2"]
+
 [tool.black]
 line-length = 100
 include = '\.pyi?$'

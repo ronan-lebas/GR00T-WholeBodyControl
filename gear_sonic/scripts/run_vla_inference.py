@@ -170,21 +170,13 @@ def pack_latent_action_message(
     if left_hand_joints is not None:
         left_hand_joints = np.asarray(left_hand_joints, dtype=np.float32)
         if left_hand_joints.ndim == 1:
-            if left_hand_joints.shape[0] != 7:
-                raise ValueError(
-                    f"left_hand_joints must have shape [7], got {left_hand_joints.shape}"
-                )
-            left_hand_joints = left_hand_joints.reshape(1, 7)
+            left_hand_joints = left_hand_joints.reshape(1, -1)
         pose_data["left_hand_joints"] = left_hand_joints
 
     if right_hand_joints is not None:
         right_hand_joints = np.asarray(right_hand_joints, dtype=np.float32)
         if right_hand_joints.ndim == 1:
-            if right_hand_joints.shape[0] != 7:
-                raise ValueError(
-                    f"right_hand_joints must have shape [7], got {right_hand_joints.shape}"
-                )
-            right_hand_joints = right_hand_joints.reshape(1, 7)
+            right_hand_joints = right_hand_joints.reshape(1, -1)
         pose_data["right_hand_joints"] = right_hand_joints
 
     return pack_pose_message(pose_data, topic="pose", version=4)

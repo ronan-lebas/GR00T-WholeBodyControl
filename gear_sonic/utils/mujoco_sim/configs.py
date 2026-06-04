@@ -15,7 +15,7 @@ import yaml
 
 from gear_sonic.utils.network.network_utils import resolve_interface
 
-WBC_VERSIONS = ["sonic_model12"]
+WBC_VERSIONS = ["sonic_model12", "sonic_model12_brainco"]
 
 @dataclass
 class ArgsConfigTemplate:
@@ -114,7 +114,7 @@ class BaseConfig(ArgsConfigTemplate):
     dataset_version: str = "sonic_model12"
 
     # WBC Configuration
-    wbc_version: Literal[tuple(WBC_VERSIONS)] = "sonic_model12"
+    wbc_version: Literal[tuple(WBC_VERSIONS)] = "sonic_model12_brainco"
     """Version of the whole body controller."""
 
     wbc_model_path: str = "policy/stand.onnx,policy/walk.onnx"
@@ -315,6 +315,8 @@ class BaseConfig(ArgsConfigTemplate):
 
         if self.wbc_version == "sonic_model12":
             config_path = str(configs_dir / "g1_29dof_sonic_model12.yaml")
+        elif self.wbc_version == "sonic_model12_brainco":
+            config_path = str(configs_dir / "g1_29dof_sonic_model12_brainco.yaml")
         else:
             raise ValueError(
                 f"Invalid wbc_version: {self.wbc_version}, please use one of: "

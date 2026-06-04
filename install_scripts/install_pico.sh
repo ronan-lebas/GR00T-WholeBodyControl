@@ -76,6 +76,15 @@ source .venv_teleop/bin/activate
 echo "[INFO] Installing gear_sonic[teleop] …"
 uv pip install -e "gear_sonic[teleop]"
 
+# ── brainco-retargeting (live camera + retargeting pipeline) ──────────────────
+BRAINCO_DIR="$REPO_ROOT/third_party/brainco-retargeting"
+if [ ! -f "$BRAINCO_DIR/pyproject.toml" ]; then
+    echo "[INFO] third_party/brainco-retargeting is empty — initialising submodule …"
+    git -C "$REPO_ROOT" submodule update --init third_party/brainco-retargeting
+fi
+echo "[INFO] Installing brainco-retargeting[live] …"
+uv pip install -e "$BRAINCO_DIR[live]"
+
 # ── 5. Install xrobotoolkit_sdk (CMake-based, not a pip package) ──────────────
 echo "[INFO] Installing XRoboToolkit SDK …"
 # Install cmake + pybind11 into the venv so the CMake-based build can find them.
