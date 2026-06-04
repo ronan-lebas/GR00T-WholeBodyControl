@@ -24,54 +24,85 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
 # For DEX3 (7 DOF):    all 7 values are joint angles in radians (0.0 = open).
 WIRE_HAND_DOF = 7
 
+# Per-joint [lower, upper] travel limits (radians), taken verbatim from the DEX3
+# MJCF (model_data/g1/with_dex3/g1_29dof_with_hand.xml). Joint order matches the
+# wire format: [thumb_0, thumb_1, thumb_2, index_0, index_1, middle_0, middle_1].
+# Left and right differ because the hands use a mirrored joint convention, so the
+# tables already encode the correct per-hand signs (no extra mirroring needed).
+# The right thumb_0 (metacarpal) is the exception that keeps the left's sign: its
+# base link is mounted as a geometric reflection, so the same joint sign already
+# yields mirror-symmetric world motion. These limits bake that in already.
+DEX3_LIMITS_LEFT = [
+    (-1.0472, 1.0472),    # thumb_0
+    (-0.724312, 1.0472),  # thumb_1
+    (0.0, 1.74533),       # thumb_2
+    (-1.5708, 0.0),       # index_0
+    (-1.74533, 0.0),      # index_1
+    (-1.5708, 0.0),       # middle_0
+    (-1.74533, 0.0),      # middle_1
+]
+DEX3_LIMITS_RIGHT = [
+    (-1.0472, 1.0472),    # thumb_0
+    (-1.0472, 0.724312),  # thumb_1
+    (-1.74533, 0.0),      # thumb_2
+    (0.0, 1.5708),        # index_0
+    (0.0, 1.74533),       # index_1
+    (0.0, 1.5708),        # middle_0
+    (0.0, 1.74533),       # middle_1
+]
+
 
 def is_data():
     return select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], [])
 
 
-def retarget_joints_to_wire(joints_normalized: np.ndarray, hand_type: str) -> list[float]:
-    """Convert 6 normalized [0,1] joints from video_retarget to the 7-element wire format.
+def retarget_joints_to_wire(joints_normalized: np.ndarray) -> list[float]:
+    """Convert the 6 normalized [0,1] joints from video_retarget to the 7-element
+    wire format. Video retarget is BrainCo-only (rejected for DEX3 in main()).
 
-    For brainco: append one padding zero (7th slot unused by firmware).
-    For dex3: scale each normalized value by the per-joint close limit.
+    BrainCo uses normalized [0,1] joints — the deploy/sim side maps them onto each
+    joint's range — so both hands share the same wire vector; the 7th slot is
+    padding ignored by the firmware.
     """
-    j = joints_normalized  # shape (6,)
-    if hand_type == "brainco":
-        return list(j) + [0.0]
-    else:  # dex3
-        dex3_close = [1.05, 1.05, 0.0, -1.57, -1.75, -1.57, -1.75]
-        # Map the first 6 normalized values; 7th slot mirrors j[5] (pinky)
-        normalized_7 = list(j) + [j[5]]
-        return [n * v for n, v in zip(normalized_7, dex3_close)]
+    return list(joints_normalized) + [0.0]
 
 
-def make_grasp_joints(t: float, hand_type: str) -> list[float]:
-    """Return a 7-element joint list for time t.
+def make_demo_joints(t: float, hand_type: str, is_left: bool = True) -> list[float]:
+    """Return a 7-element joint list for time t — a per-joint range-of-motion demo.
+
+    Every joint follows its own cosine sweep across its FULL travel, each with a
+    distinct phase offset so the joints move independently.
 
     hand_type: 'brainco' or 'dex3'
+    is_left:   selects the hand's per-joint limits/convention (DEX3 only).
 
-    BrainCo: 6 normalized values [0,1] + 1 padding zero.
-             Each finger gets its own phase offset so they move independently,
-             clearly demonstrating per-finger control.
-    DEX3:    7 joint angles in radians, all fingers in sync.
+    BrainCo: 6 normalized values [0,1] + 1 padding zero. The sim/deploy side maps
+             [0,1] onto each joint's [lower, upper] range, so the normalized sweep
+             already spans full travel and is identical for both hands (``is_left``
+             ignored).
+    DEX3:    7 joint angles in radians, each swept over its own [lo, hi] limit from
+             DEX3_LIMITS_{LEFT,RIGHT}. The per-hand tables encode the mirrored
+             joint convention, so no extra sign handling is needed here.
     """
+    omega = math.pi / 3.0  # ~6 s period
+
     if hand_type == "brainco":
         # Fingers: Thumb, Thumb_aux, Index, Middle, Ring, Pinky
         # Evenly spaced phase offsets over one full period (2π), ~6 s cycle each.
         joints = [
-            0.5 - 0.5 * math.cos(t * math.pi / 3.0 + i * 2.0 * math.pi / 6.0)
+            0.5 - 0.5 * math.cos(omega * t + i * 2.0 * math.pi / 6.0)
             for i in range(6)
         ]
         return joints + [0.0]  # 7th slot: unused, padded with 0
     else:  # dex3
-        # DEX3 joint limits (left hand, close direction):
-        #   j0 thumb:  0 -> 1.05 rad
-        #   j1 thumb2: 0 -> 1.05 rad
-        #   j2 thumb3: 1.75 -> 0 rad (already open at 1.75, close toward 0)
-        #   j3..j6 fingers: 0 -> -1.57 / -1.75 rad (close in negative direction)
-        grasp = 0.5 - 0.5 * math.cos(t * math.pi / 3.0)  # [0, 1], period ~6 s
-        dex3_close = [1.05, 1.05, 0.0, -1.57, -1.75, -1.57, -1.75]
-        return [grasp * v for v in dex3_close]
+        limits = DEX3_LIMITS_LEFT if is_left else DEX3_LIMITS_RIGHT
+        n = len(limits)
+        out = []
+        for i, (lo, hi) in enumerate(limits):
+            phase = i * 2.0 * math.pi / n
+            s = 0.5 - 0.5 * math.cos(omega * t + phase)  # [0, 1]
+            out.append(lo + (hi - lo) * s)  # sweep lo <-> hi
+        return out
 
 
 def main():
@@ -92,6 +123,14 @@ def main():
         ),
     )
     args = parser.parse_args()
+
+    if args.video_retarget and args.hand != "brainco":
+        raise SystemExit(
+            "--video-retarget is only supported with --hand brainco. The retargeting "
+            "module outputs BrainCo-style normalized [0,1] joints and has no DEX3 "
+            "mapping, so it is not expected to work with dex3. Use the keyboard "
+            "cosine animation ('f' toggle) for dex3 instead."
+        )
 
     if args.video_retarget:
         _demos_path = Path(__file__).resolve().parents[2] / "third_party" / "brainco-retargeting" / "demos"
@@ -128,7 +167,7 @@ def main():
     print("Keyboard controls:")
     print("  c  - Toggle data collection (Left Grip + A)")
     print("  x  - Toggle data abort (Left Grip + B)")
-    retarget_src = "video_retarget module" if args.video_retarget else "slow open/close sine wave, ~6 s period"
+    retarget_src = "video_retarget module" if args.video_retarget else "per-joint full-range cosine sweep, ~6 s period"
     print(f"  f  - Toggle finger tracking ({retarget_src})")
     print("  a  - Toggle arm Z animation (wrists move up/down in sine wave)")
     if args.hand == "brainco":
@@ -184,12 +223,13 @@ def main():
             if finger_tracking_enabled:
                 if args.video_retarget:
                     raw = retarget_streaming.get_joints()  # np.ndarray (6,) in [0, 1]
-                    wire = retarget_joints_to_wire(raw, args.hand)
+                    # BrainCo only: both hands share the same normalized wire vector.
+                    wire = retarget_joints_to_wire(raw)
                     left_hand_joints  = wire
                     right_hand_joints = wire
                 else:
-                    left_hand_joints  = make_grasp_joints(t, args.hand)
-                    right_hand_joints = make_grasp_joints(t, args.hand)
+                    left_hand_joints  = make_demo_joints(t, args.hand, is_left=True)
+                    right_hand_joints = make_demo_joints(t, args.hand, is_left=False)
 
             # 5. Send the Manager State (topic: "manager_state")
             # This tells the C++ state machine that we are staying in VR_3PT mode.
