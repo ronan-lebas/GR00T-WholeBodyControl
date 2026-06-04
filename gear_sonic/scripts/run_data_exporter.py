@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 import time
+from typing import Literal
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -102,6 +103,9 @@ class SonicDataExporterConfig:
 
     text_to_speech: bool = True
     """Use text-to-speech voice feedback."""
+
+    hand_type: Literal["dex3", "brainco"] = "dex3"
+    """Hand type: 'dex3' (7 DOF, Unitree DEX3) or 'brainco' (6 DOF, BrainCo Revo2)."""
 
 
 # ---------------------------------------------------------------------------
@@ -753,17 +757,18 @@ class GrootDataCollector:
             else planner_msg if planner_msg is not None
             else smpl_msg
         )
+        num_hand_dof = len(self.robot_model.get_hand_actuated_joint_indices("left"))
         frame_data["teleop.left_hand_joints"] = (
-            hand_msg["left_hand_joints"].astype(np.float32)
+            hand_msg["left_hand_joints"].astype(np.float32)[:num_hand_dof]
             if hand_msg is not None
             and hand_msg.get("left_hand_joints") is not None
-            else np.zeros(7, dtype=np.float32)
+            else np.zeros(num_hand_dof, dtype=np.float32)
         )
         frame_data["teleop.right_hand_joints"] = (
-            hand_msg["right_hand_joints"].astype(np.float32)
+            hand_msg["right_hand_joints"].astype(np.float32)[:num_hand_dof]
             if hand_msg is not None
             and hand_msg.get("right_hand_joints") is not None
-            else np.zeros(7, dtype=np.float32)
+            else np.zeros(num_hand_dof, dtype=np.float32)
         )
 
         # Planner command fields
@@ -909,7 +914,7 @@ class GrootDataCollector:
 
 
 def main(config: SonicDataExporterConfig):
-    g1_rm = get_g1_robot_model()
+    g1_rm = get_g1_robot_model(hand_type=config.hand_type)
 
     dataset_features = get_features_sonic_vla(g1_rm)
     modality_config = get_modality_config_sonic_vla(g1_rm)
