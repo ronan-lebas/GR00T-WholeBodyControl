@@ -1,11 +1,21 @@
 #!/bin/bash
 set -e
 
-source /opt/ros/humble/setup.bash
-source /ros2_ws/install/setup.bash
+source /opt/ros/noetic/setup.bash
+source /catkin_ws/devel/setup.bash
 
-# Start ros_tcp_endpoint in background (bridges Quest Unity TCP → ROS2 topics)
-ros2 launch ros_tcp_endpoint endpoint.py &
+# ROS1 needs a master. Start roscore and wait until it answers before the relay
+# (an rospy node) and the endpoint try to register.
+roscore &
+ROSCORE_PID=$!
+until rosnode list >/dev/null 2>&1; do
+    sleep 0.2
+done
+echo "[quest-relay] roscore up (PID $ROSCORE_PID)"
+
+# Start ros_tcp_endpoint in background (bridges Quest Unity TCP → ROS1 topics).
+# endpoint_no_adb.launch omits the adb_reverse node (Quest connects over TCP).
+roslaunch ros_tcp_endpoint endpoint_no_adb.launch tcp_ip:=0.0.0.0 tcp_port:=10000 &
 ROS_ENDPOINT_PID=$!
 
 # Give the endpoint a moment to initialize before the relay starts subscribing

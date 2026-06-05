@@ -1,4 +1,4 @@
-# Quest ROS2 → ZMQ relay image.
+# Quest ROS1 → ZMQ relay image.
 #
 # Build context must be the repo root so we can COPY from both
 # third_party/ROS-TCP-Endpoint/ and gear_sonic_deploy/docker/quest_relay/.
@@ -11,33 +11,36 @@
 #   docker build -t quest-relay -f gear_sonic_deploy/docker/quest_relay/Dockerfile .
 #   docker run --rm -p 10000:10000 -p 5559:5559 quest-relay
 
-FROM ros:humble-ros-base
+FROM ros:noetic-ros-base
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Build deps + CycloneDDS (fixes rootless Docker multicast; same as third_party/ROS-TCP-Endpoint/Dockerfile)
+# Build tooling + message deps. ROS1 uses a ROS master + TCPROS (no DDS), so no
+# CycloneDDS machinery is needed. geometry_msgs/tf2_msgs are required because the
+# relay subscribes to the head pose and /tf.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
-    python3-colcon-common-extensions \
-    python3-rosdep \
-    ros-humble-rmw-cyclonedds-cpp \
-    ros-humble-ros-base \
+    python3-catkin-tools \
+    ros-noetic-geometry-msgs \
+    ros-noetic-tf2-msgs \
     && rm -rf /var/lib/apt/lists/*
 
-# Build vr_haptic_msgs and ros_tcp_endpoint from the local third_party copy
-WORKDIR /ros2_ws
+# Build vr_haptic_msgs and ros_tcp_endpoint in a catkin workspace.
+WORKDIR /catkin_ws
 COPY third_party/ROS-TCP-Endpoint/ src/ros_tcp_endpoint/
-# vr_haptic_msgs lives inside the repo; move it to a sibling package so colcon
-# doesn't see it as a nested package of ros_tcp_endpoint.
-RUN mv src/ros_tcp_endpoint/vr_haptic_msgs src/vr_haptic_msgs
-RUN . /opt/ros/humble/setup.sh \
-    && colcon build --packages-select vr_haptic_msgs ros_tcp_endpoint \
-    && rm -rf build log
+# The copy of vr_haptic_msgs vendored inside ROS-TCP-Endpoint ships ament (ROS2)
+# build files that won't build under catkin. Drop it and reassemble a catkin
+# package from the .msg files plus the catkin build files in quest_relay/.
+RUN rm -rf src/ros_tcp_endpoint/vr_haptic_msgs
+COPY third_party/ROS-TCP-Endpoint/vr_haptic_msgs/msg/ src/vr_haptic_msgs/msg/
+COPY gear_sonic_deploy/docker/quest_relay/vr_haptic_msgs_ros1/package.xml src/vr_haptic_msgs/package.xml
+COPY gear_sonic_deploy/docker/quest_relay/vr_haptic_msgs_ros1/CMakeLists.txt src/vr_haptic_msgs/CMakeLists.txt
+# Container launch variant without the adb_reverse node (Quest connects over TCP).
+COPY gear_sonic_deploy/docker/quest_relay/endpoint_no_adb.launch src/ros_tcp_endpoint/launch/endpoint_no_adb.launch
 
-# CycloneDDS unicast config (no multicast — required for slirp4netns / rootless Docker)
-COPY third_party/ROS-TCP-Endpoint/cyclonedds.xml /cyclonedds.xml
-ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
-ENV CYCLONEDDS_URI=file:///cyclonedds.xml
+RUN . /opt/ros/noetic/setup.sh \
+    && catkin_make \
+    && rm -rf build
 
 RUN pip3 install --no-cache-dir pyzmq msgpack
 

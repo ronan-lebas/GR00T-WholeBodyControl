@@ -7,13 +7,13 @@ build the image, run the container (with the right port mappings), stream
 its logs, and tear it down cleanly on Ctrl-C.
 
 The container runs *both* the ROS-TCP endpoint (Quest connects here over the
-Unity ROS-TCP-Connector protocol) and the ZMQ relay that republishes the
-tracking data as a single msgpack ``quest_data`` blob. The host-side
-``quest_manager_thread_server.py`` consumes that blob with ``--zmq-relay-host``
-(no rclpy needed on the host).
+Unity ROS-TCP-Connector protocol, launched via roslaunch on a ROS1/Noetic
+master) and the ZMQ relay that republishes the tracking data as a single
+msgpack ``quest_data`` blob. The host-side ``quest_manager_thread_server.py``
+consumes that blob with ``--zmq-relay-host`` (no ROS needed on the host).
 
 Data flow:
-    Quest (Unity) --TCP:10000--> ros_tcp_endpoint --DDS--> relay --ZMQ:5559--> manager
+    Quest (Unity) --TCP:10000--> ros_tcp_endpoint --TCPROS--> relay --ZMQ:5559--> manager
 
 Usage (from anywhere in the repo):
     python gear_sonic_deploy/docker/quest_relay/run_quest_relay.py
@@ -217,10 +217,10 @@ def main() -> int:
     )
     # Forwarded to relay.py inside the container.
     parser.add_argument(
-        "--head-topic", default=None, help="ROS2 head pose topic (relay default if unset)."
+        "--head-topic", default=None, help="ROS1 head pose topic (relay default if unset)."
     )
-    parser.add_argument("--left-hand-topic", default=None, help="ROS2 left ManoLandmarks topic.")
-    parser.add_argument("--right-hand-topic", default=None, help="ROS2 right ManoLandmarks topic.")
+    parser.add_argument("--left-hand-topic", default=None, help="ROS1 left ManoLandmarks topic.")
+    parser.add_argument("--right-hand-topic", default=None, help="ROS1 right ManoLandmarks topic.")
     parser.add_argument("--hz", type=float, default=None, help="Relay publish rate in Hz.")
     args = parser.parse_args()
 

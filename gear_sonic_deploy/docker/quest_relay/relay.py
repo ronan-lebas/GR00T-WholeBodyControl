@@ -1,7 +1,7 @@
 """
-Quest ROS2 → ZMQ relay.
+Quest ROS1 → ZMQ relay.
 
-Subscribes to Meta Quest ROS2 topics published via ROS TCP Connector and
+Subscribes to Meta Quest ROS1 topics published via ROS TCP Connector and
 republishes the data as a single msgpack blob over a ZMQ PUB socket.
 
 The host-side QuestReader (in quest_manager_thread_server.py) connects as
@@ -35,10 +35,9 @@ import threading
 import time
 
 import msgpack
-import rclpy
+import rospy
 import zmq
 from geometry_msgs.msg import PoseStamped
-from rclpy.node import Node
 from tf2_msgs.msg import TFMessage
 from vr_haptic_msgs.msg import ManoLandmarks
 
@@ -47,12 +46,10 @@ _ZERO_POS = [0.0, 0.0, 0.0]
 _ZERO_LANDMARKS = [[0.0, 0.0, 0.0]] * 21
 
 
-class QuestRelayNode(Node):
-    """ROS2 node that subscribes to Quest topics and exposes a thread-safe snapshot."""
+class QuestRelayNode:
+    """ROS1 node that subscribes to Quest topics and exposes a thread-safe snapshot."""
 
     def __init__(self, head_topic, left_hand_topic, right_hand_topic):
-        super().__init__("quest_relay")
-
         self._lock = threading.Lock()
         self._state = {
             "head_pos": list(_ZERO_POS),
@@ -68,14 +65,12 @@ class QuestRelayNode(Node):
             "timestamp": 0.0,
         }
 
-        self.create_subscription(PoseStamped, head_topic, self._on_headset, 10)
-        self.create_subscription(TFMessage, "/tf", self._on_tf, 10)
-        self.create_subscription(ManoLandmarks, left_hand_topic, self._on_left_hand, 10)
-        self.create_subscription(ManoLandmarks, right_hand_topic, self._on_right_hand, 10)
+        rospy.Subscriber(head_topic, PoseStamped, self._on_headset, queue_size=10)
+        rospy.Subscriber("/tf", TFMessage, self._on_tf, queue_size=10)
+        rospy.Subscriber(left_hand_topic, ManoLandmarks, self._on_left_hand, queue_size=10)
+        rospy.Subscriber(right_hand_topic, ManoLandmarks, self._on_right_hand, queue_size=10)
 
-        self.get_logger().info(
-            f"Subscribed to: {head_topic}, /tf, {left_hand_topic}, {right_hand_topic}"
-        )
+        rospy.loginfo(f"Subscribed to: {head_topic}, /tf, {left_hand_topic}, {right_hand_topic}")
 
     def _on_headset(self, msg: PoseStamped) -> None:
         p, o = msg.pose.position, msg.pose.orientation
@@ -138,22 +133,22 @@ def _mano_to_list(msg: ManoLandmarks) -> list:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Quest ROS2 → ZMQ relay")
+    parser = argparse.ArgumentParser(description="Quest ROS1 → ZMQ relay")
     parser.add_argument("--zmq-port", type=int, default=5559, help="ZMQ PUB port (default: 5559)")
     parser.add_argument(
         "--head-topic",
         default="/quest/pose/headset",
-        help="ROS2 head pose topic (default: /quest/pose/headset)",
+        help="ROS1 head pose topic (default: /quest/pose/headset)",
     )
     parser.add_argument(
         "--left-hand-topic",
         default="/quest/hand_pose/left",
-        help="ROS2 left ManoLandmarks topic (default: /quest/hand_pose/left)",
+        help="ROS1 left ManoLandmarks topic (default: /quest/hand_pose/left)",
     )
     parser.add_argument(
         "--right-hand-topic",
         default="/quest/hand_pose/right",
-        help="ROS2 right ManoLandmarks topic (default: /quest/hand_pose/right)",
+        help="ROS1 right ManoLandmarks topic (default: /quest/hand_pose/right)",
     )
     parser.add_argument(
         "--hz",
@@ -168,23 +163,16 @@ def main():
     pub.bind(f"tcp://0.0.0.0:{args.zmq_port}")
     print(f"[relay] ZMQ PUB bound to port {args.zmq_port}")
 
-    rclpy.init(args=None)
+    # disable_signals=True so our own KeyboardInterrupt/finally teardown below runs.
+    rospy.init_node("quest_relay", anonymous=True, disable_signals=True)
     node = QuestRelayNode(
         head_topic=args.head_topic,
         left_hand_topic=args.left_hand_topic,
         right_hand_topic=args.right_hand_topic,
     )
-
-    def _spin() -> None:
-        # Swallow the RCLError raised when main() shuts down the context on exit.
-        try:
-            rclpy.spin(node)
-        except Exception:
-            pass
-
-    spin_thread = threading.Thread(target=_spin, daemon=True)
-    spin_thread.start()
-    print("[relay] ROS2 spinning. Waiting for Quest data...")
+    # In ROS1 rospy.Subscriber callbacks are serviced by background threads
+    # automatically — no explicit spin thread is needed to receive messages.
+    print("[relay] ROS1 node up. Waiting for Quest data...")
 
     period = 1.0 / max(1.0, args.hz)
     topic_bytes = b"quest_data"
@@ -207,6 +195,18 @@ def main():
                     f"L={'ok' if snap['left_tracked'] else '-'} "
                     f"R={'ok' if snap['right_tracked'] else '-'}"
                 )
+                # Sample a couple of values per topic so you can eyeball that real
+                # data (not zeros) is flowing without flooding the log.
+                hp = snap["head_pos"]
+                lw = snap["left_wrist_pos"]
+                rw = snap["right_wrist_pos"]
+                print(
+                    f"[relay]   sample | head_pos=({hp[0]:+.3f}, {hp[1]:+.3f}, {hp[2]:+.3f}) "
+                    f"| L_wrist=({lw[0]:+.3f}, {lw[1]:+.3f}) "
+                    f"L_lm0={tuple(round(v, 3) for v in snap['left_landmarks'][0])} "
+                    f"| R_wrist=({rw[0]:+.3f}, {rw[1]:+.3f}) "
+                    f"R_lm0={tuple(round(v, 3) for v in snap['right_landmarks'][0])}"
+                )
                 last_log = now
                 published = 0
 
@@ -217,7 +217,6 @@ def main():
     except KeyboardInterrupt:
         print("\n[relay] Shutting down...")
     finally:
-        rclpy.shutdown()
         pub.close()
         ctx.term()
 
