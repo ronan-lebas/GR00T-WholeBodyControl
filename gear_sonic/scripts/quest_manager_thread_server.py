@@ -149,6 +149,24 @@ def _is_data() -> bool:
 # ---------------------------------------------------------------------------
 
 
+def correct_landmark_frame(landmarks: np.ndarray) -> np.ndarray:
+    """Transform Quest MANO landmarks into the wrist TF frame.
+
+    Quest hand-tracking publishes landmarks in a frame that is rotated +90 deg
+    around world +Z relative to the wrist TF frame used by the controller.
+    Applying Rz(-90 deg) to every landmark position realigns the hand skeleton
+    with the wrist pose.
+
+    Args:
+        landmarks: (..., 3) landmark positions in Quest world frame.
+
+    Returns:
+        (..., 3) corrected positions in wrist-TF-compatible world frame.
+    """
+    R = sRot.from_euler("z", -np.pi / 2)
+    return R.apply(landmarks.reshape(-1, 3)).reshape(landmarks.shape)
+
+
 def retarget_hand(landmarks: np.ndarray, side: str) -> list[float]:
     """MANO-21 landmarks (21, 3) → 7-element BrainCo wire list.
 
@@ -837,11 +855,11 @@ def run_quest_manager(
                     right_hand = None
                     if finger_tracking:
                         try:
-                            left_hand = retarget_hand(latest["left_landmarks"], "left")
+                            left_hand = retarget_hand(correct_landmark_frame(latest["left_landmarks"]), "left")
                         except Exception:
                             left_hand = None
                         try:
-                            right_hand = retarget_hand(latest["right_landmarks"], "right")
+                            right_hand = retarget_hand(correct_landmark_frame(latest["right_landmarks"]), "right")
                         except Exception:
                             right_hand = None
 
