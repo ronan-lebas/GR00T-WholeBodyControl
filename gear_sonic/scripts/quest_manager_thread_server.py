@@ -44,10 +44,20 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
     pack_pose_message,
 )
 
-# Brainco pure-numpy retargeter (no dex_retargeting dependency)
-_BRAINCO_PKG = Path(__file__).resolve().parents[2] / "third_party" / "brainco-retargeting" / "brainco_retargeting"
-sys.path.insert(0, str(_BRAINCO_PKG))
-import np_retargeting  # noqa: E402 (path manipulation above)
+# Brainco retargeters — pure-numpy and optimization-based (dex_retargeting)
+_BRAINCO_PKG  = Path(__file__).resolve().parents[2] / "third_party" / "brainco-retargeting" / "brainco_retargeting"
+_BRAINCO_ROOT = _BRAINCO_PKG.parent  # exposes the brainco_retargeting package itself
+sys.path.insert(0, str(_BRAINCO_PKG))   # for bare `import np_retargeting`
+sys.path.insert(0, str(_BRAINCO_ROOT))  # for `from brainco_retargeting import ...`
+import np_retargeting  # noqa: E402
+
+try:
+    from brainco_retargeting import BrainCoRetargeter
+    from brainco_retargeting._utils import mp21_to_xr25
+    _HAS_DEX_RETARGETER = True
+except ImportError:
+    print("Warning: BrainCoRetargeter (dex) not available — np_retargeting will be used.")
+    _HAS_DEX_RETARGETER = False
 
 # ROS2
 try:
@@ -167,13 +177,23 @@ def correct_landmark_frame(landmarks: np.ndarray) -> np.ndarray:
     return R.apply(landmarks.reshape(-1, 3)).reshape(landmarks.shape)
 
 
-def retarget_hand(landmarks: np.ndarray, side: str) -> list[float]:
+def retarget_hand(landmarks: np.ndarray, side: str, retargeter=None) -> list[float]:
     """MANO-21 landmarks (21, 3) → 7-element BrainCo wire list.
 
-    MANO and MediaPipe-21 share the same joint ordering, so np_retargeting
-    works directly on Quest hand_pose data.
-    Returns 6 normalized [0, 1] values + 1 padding zero.
+    Two backends (selected by the caller via `retargeter`):
+      retargeter=None  — pure-numpy (np_retargeting), no extra dependencies.
+      retargeter=BrainCoRetargeter instance — optimization-based (dex_retargeting):
+          MANO-21 → XR-25 → canonicalize → dex solver → normalized [0, 1].
+
+    Both paths return 6 normalized [0, 1] values + 1 padding zero.
     """
+    if retargeter is not None:
+        xr25 = retargeter.canonicalize(mp21_to_xr25(landmarks), side)
+        fn = retargeter.retarget_left if side == "left" else retargeter.retarget_right
+        normalized = list(fn(xr25))
+        return normalized + [0.0]
+
+    # pure-numpy fallback
     angles = np_retargeting.retarget(landmarks, side)
     normalized = [
         float(np.clip(angles[f"{side}_{k}_joint"] / _JOINT_LIMITS[k], 0.0, 1.0))
@@ -814,6 +834,7 @@ def run_quest_manager(
     zmq_relay_host: str | None = None,
     zmq_relay_port: int = 5559,
     replay_npz: str | None = None,
+    np_retarget: bool = False,
 ) -> None:
     """Start the Quest teleoperation manager.
 
@@ -858,6 +879,17 @@ def run_quest_manager(
 
     # --- Feedback reader (for measured-joint recalibration) ---
     feedback = FeedbackReader(zmq_host=zmq_feedback_host, zmq_port=zmq_feedback_port)
+
+    # --- Finger retargeter ---
+    if np_retarget:
+        hand_retargeter = None
+        print("[Manager] Finger retargeting: np_retargeting (pure numpy)")
+    elif _HAS_DEX_RETARGETER:
+        hand_retargeter = BrainCoRetargeter()
+        print("[Manager] Finger retargeting: BrainCoRetargeter (dex, optimization-based)")
+    else:
+        hand_retargeter = None
+        print("[Manager] Finger retargeting: BrainCoRetargeter unavailable, falling back to np_retargeting")
 
     # --- Wait for subscriber ---
     print("[Manager] Waiting 2 s for C++ subscriber to connect...")
@@ -981,11 +1013,11 @@ def run_quest_manager(
                     right_hand = None
                     if finger_tracking:
                         try:
-                            left_hand = retarget_hand(correct_landmark_frame(latest["left_landmarks"]), "left")
+                            left_hand = retarget_hand(correct_landmark_frame(latest["left_landmarks"]), "left", hand_retargeter)
                         except Exception:
                             left_hand = None
                         try:
-                            right_hand = retarget_hand(correct_landmark_frame(latest["right_landmarks"]), "right")
+                            right_hand = retarget_hand(correct_landmark_frame(latest["right_landmarks"]), "right", hand_retargeter)
                         except Exception:
                             right_hand = None
 
@@ -1114,6 +1146,15 @@ if __name__ == "__main__":
         help="ZMQ port of the quest-relay container (default: 5559)",
     )
     parser.add_argument(
+        "--np-retarget",
+        action="store_true",
+        help=(
+            "Use the pure-numpy retargeter (np_retargeting) for finger tracking instead of "
+            "the default optimization-based BrainCoRetargeter (dex_retargeting). "
+            "Useful when dex_retargeting / sapien is not installed."
+        ),
+    )
+    parser.add_argument(
         "--replay-from-data",
         type=str,
         default=None,
@@ -1137,4 +1178,5 @@ if __name__ == "__main__":
         zmq_relay_host=args.zmq_relay_host,
         zmq_relay_port=args.zmq_relay_port,
         replay_npz=args.replay_from_data,
+        np_retarget=args.np_retarget,
     )
