@@ -324,6 +324,111 @@ class QuestReader:
             return self._latest["timestamp"] > 0.0
 
 
+class NpzReplayReader:
+    """Drop-in replacement for QuestReader that replays a recorded NPZ trajectory.
+
+    Exposes the same duck-typed interface (start / stop / get_latest / has_data)
+    so it can be passed directly to run_quest_manager without any other changes.
+
+    Playback is time-anchored to the original recording timestamps so the replay
+    runs at the same speed as the original capture.  When the end is reached the
+    recording loops back to the beginning automatically.
+
+    Extra methods for interactive control (called from the keyboard handler):
+        toggle_pause() — pause / resume playback
+        step(delta)    — move delta frames while paused (can be negative)
+    """
+
+    def __init__(self, npz_path: str) -> None:
+        raw = np.load(npz_path, allow_pickle=True)
+        self._n = int(raw["head_pos"].shape[0])
+        self._data = {
+            "head_pos":         raw["head_pos"].astype(np.float64),
+            "head_quat":        raw["head_quat"].astype(np.float64),
+            "left_wrist_pos":   raw["left_wrist_pos"].astype(np.float64),
+            "left_wrist_quat":  raw["left_wrist_quat"].astype(np.float64),
+            "right_wrist_pos":  raw["right_wrist_pos"].astype(np.float64),
+            "right_wrist_quat": raw["right_wrist_quat"].astype(np.float64),
+            "left_landmarks":   raw["left_landmarks"].astype(np.float64),
+            "right_landmarks":  raw["right_landmarks"].astype(np.float64),
+        }
+        self._timestamps = raw["timestamp"].astype(np.float64)
+        duration = float(self._timestamps[-1] - self._timestamps[0])
+        self._frame_idx: int = 0
+        self._paused: bool = False
+        self._started: bool = False
+        self._t0_wall: float = 0.0   # wall-clock time at last start/resume
+        self._t0_data: float = 0.0   # recording timestamp at last start/resume
+        print(f"[NpzReplayReader] Loaded {self._n} frames, {duration:.1f} s  ←  {npz_path}")
+
+    # ---- QuestReader interface ----
+
+    def start(self) -> None:
+        self._t0_wall = time.time()
+        self._t0_data = self._timestamps[0]
+        self._started = True
+        print("[NpzReplayReader] Replay started  |  k=pause/resume  ,=step-back  .=step-fwd")
+
+    def stop(self) -> None:
+        pass  # nothing to tear down
+
+    def get_latest(self) -> dict:
+        if self._started and not self._paused:
+            target = self._t0_data + (time.time() - self._t0_wall)
+            if target >= self._timestamps[-1]:
+                # loop: restart from the beginning
+                self._t0_wall = time.time()
+                self._t0_data = self._timestamps[0]
+                self._frame_idx = 0
+            else:
+                idx = int(np.searchsorted(self._timestamps, target, side="right")) - 1
+                self._frame_idx = max(0, min(idx, self._n - 1))
+        return self._frame_at(self._frame_idx)
+
+    @property
+    def has_data(self) -> bool:
+        return self._started
+
+    # ---- replay control ----
+
+    def toggle_pause(self) -> None:
+        if self._paused:
+            # re-anchor wall clock so playback continues from the current frame
+            self._t0_wall = time.time()
+            self._t0_data = self._timestamps[self._frame_idx]
+            self._paused = False
+            print(f"[NpzReplayReader] Resumed  (frame {self._frame_idx}/{self._n - 1})")
+        else:
+            self._paused = True
+            print(f"[NpzReplayReader] Paused   (frame {self._frame_idx}/{self._n - 1})")
+
+    def step(self, delta: int) -> None:
+        """Move delta frames while paused.  No-op when playing."""
+        if not self._paused:
+            return
+        self._frame_idx = max(0, min(self._frame_idx + delta, self._n - 1))
+        print(f"[NpzReplayReader] Step {delta:+d}  →  frame {self._frame_idx}/{self._n - 1}")
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
+
+    # ---- internal ----
+
+    def _frame_at(self, idx: int) -> dict:
+        return {
+            "head_pos":         self._data["head_pos"][idx].copy(),
+            "head_quat":        self._data["head_quat"][idx].copy(),
+            "left_wrist_pos":   self._data["left_wrist_pos"][idx].copy(),
+            "left_wrist_quat":  self._data["left_wrist_quat"][idx].copy(),
+            "right_wrist_pos":  self._data["right_wrist_pos"][idx].copy(),
+            "right_wrist_quat": self._data["right_wrist_quat"][idx].copy(),
+            "left_landmarks":   self._data["left_landmarks"][idx].copy(),
+            "right_landmarks":  self._data["right_landmarks"][idx].copy(),
+            "timestamp":        float(self._timestamps[idx]),
+        }
+
+
 class _QuestNode(Node):
     """Internal rclpy Node — callbacks update the reader via on_update."""
 
@@ -708,11 +813,17 @@ def run_quest_manager(
     zmq_feedback_port: int = 5557,
     zmq_relay_host: str | None = None,
     zmq_relay_port: int = 5559,
+    replay_npz: str | None = None,
 ) -> None:
     """Start the Quest teleoperation manager.
 
-    When zmq_relay_host is set, reads Quest data from the relay Docker container
-    over ZMQ instead of subscribing to ROS2 topics directly (no rclpy needed).
+    When replay_npz is set, a recorded NPZ trajectory is used as the Quest data
+    source instead of subscribing to ROS2 topics or a ZMQ relay.  All downstream
+    processing (calibration, 3-pt pose, finger retargeting, ZMQ streaming) runs
+    unchanged — the recording replaces the human operator.
+
+    When zmq_relay_host is set (and replay_npz is None), reads Quest data from the
+    relay Docker container over ZMQ instead of subscribing to ROS2 topics directly.
     """
     # --- ZMQ setup ---
     context = zmq.Context()
@@ -720,21 +831,26 @@ def run_quest_manager(
     socket.bind(f"tcp://*:{port}")
     print(f"[Manager] ZMQ PUB socket bound to port {port}")
 
-    # --- Quest reader ---
-    reader = QuestReader(
-        head_topic=head_topic,
-        left_hand_topic=left_hand_topic,
-        right_hand_topic=right_hand_topic,
-        zmq_relay_host=zmq_relay_host,
-        zmq_relay_port=zmq_relay_port,
-    )
+    # --- Quest reader (live or replay) ---
+    if replay_npz is not None:
+        reader: QuestReader | NpzReplayReader = NpzReplayReader(replay_npz)
+    else:
+        reader = QuestReader(
+            head_topic=head_topic,
+            left_hand_topic=left_hand_topic,
+            right_hand_topic=right_hand_topic,
+            zmq_relay_host=zmq_relay_host,
+            zmq_relay_port=zmq_relay_port,
+        )
     reader.start()
 
     # === BEGIN TEMP DEBUG STUB — synthetic Quest motion (delete these lines) ===
     # Wrap get_latest so calibration AND streaming both see the fake motion.
-    _real_get_latest = reader.get_latest
-    reader.get_latest = lambda: _debug_rewrite_quest_data(_real_get_latest())
-    print("[Manager] *** DEBUG STUB ACTIVE — streaming synthetic Quest motion ***")
+    # Skipped in replay mode because the NPZ data is already the motion source.
+    if replay_npz is None:
+        _real_get_latest = reader.get_latest
+        reader.get_latest = lambda: _debug_rewrite_quest_data(_real_get_latest())
+        print("[Manager] *** DEBUG STUB ACTIVE — streaming synthetic Quest motion ***")
     # === END TEMP DEBUG STUB ===================================================
 
     # --- 3-pt pose processor ---
@@ -759,6 +875,10 @@ def run_quest_manager(
     print("  c - Toggle data collection")
     print("  x - Toggle data abort")
     print("  q - Stop policy and exit")
+    if replay_npz is not None:
+        print("  k - Pause/resume replay")
+        print("  , - Step back 1 frame  (only while replay is paused)")
+        print("  . - Step forward 1 frame  (only while replay is paused)")
     print()
 
     current_mode = StreamMode.OFF
@@ -834,6 +954,12 @@ def run_quest_manager(
                 elif c == "q":
                     print("[Manager] 'q' pressed: stopping policy and exiting...")
                     break
+                elif c == "k" and replay_npz is not None:
+                    reader.toggle_pause()
+                elif c == "," and replay_npz is not None:
+                    reader.step(-1)
+                elif c == "." and replay_npz is not None:
+                    reader.step(1)
 
             # --- Get Quest data ---
             latest = reader.get_latest()
@@ -987,6 +1113,18 @@ if __name__ == "__main__":
         default=5559,
         help="ZMQ port of the quest-relay container (default: 5559)",
     )
+    parser.add_argument(
+        "--replay-from-data",
+        type=str,
+        default=None,
+        metavar="NPZ_PATH",
+        help=(
+            "Replay a recorded NPZ trajectory instead of connecting to ROS2 / ZMQ. "
+            "The recording replaces the live Quest operator; all other processing "
+            "(calibration, 3-pt pose, finger retargeting, ZMQ streaming) runs unchanged. "
+            "Replay controls: k=pause/resume  ,=step-back  .=step-forward"
+        ),
+    )
     args = parser.parse_args()
 
     run_quest_manager(
@@ -998,4 +1136,5 @@ if __name__ == "__main__":
         zmq_feedback_port=args.zmq_feedback_port,
         zmq_relay_host=args.zmq_relay_host,
         zmq_relay_port=args.zmq_relay_port,
+        replay_npz=args.replay_from_data,
     )
