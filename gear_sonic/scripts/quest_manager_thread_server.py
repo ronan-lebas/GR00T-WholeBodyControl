@@ -765,57 +765,57 @@ def _blend_vr3pt_pose(pose_a: np.ndarray, pose_b: np.ndarray, alpha: float) -> n
 # without a live Quest streaming real data. Remove this block, the helpers
 # below, and the reader.get_latest() wrap in run_quest_manager() to revert.
 # ===========================================================================
-def _debug_make_landmarks(curl: float) -> np.ndarray:
-    """Synthetic MANO-21 landmarks; curl in [0, 1] flexes all fingers (0=open, 1=fist)."""
-    seg = 0.035  # segment length (meters); only relative geometry matters
-    lm = np.zeros((21, 3), dtype=np.float64)
-    lm[0] = [0.0, 0.0, 0.0]  # wrist
-    beta = curl * 1.4  # per-joint bend angle (rad)
-    # index(5), middle(9), ring(13), pinky(17): MCP, PIP, DIP, TIP chains curling in -z
-    for mcp, x in {5: 0.03, 9: 0.01, 13: -0.01, 17: -0.03}.items():
-        p_mcp = np.array([x, 0.06, 0.0])
-        p_pip = p_mcp + seg * np.array([0.0, 1.0, 0.0])
-        p_dip = p_pip + seg * np.array([0.0, np.cos(beta), -np.sin(beta)])
-        p_tip = p_dip + seg * np.array([0.0, np.cos(2 * beta), -np.sin(2 * beta)])
-        lm[mcp], lm[mcp + 1], lm[mcp + 2], lm[mcp + 3] = p_mcp, p_pip, p_dip, p_tip
-    # thumb: CMC(1), MCP(2), IP(3), TIP(4) splayed out then curling toward palm
-    d = np.array([0.6, 0.6, 0.0])
-    d = d / np.linalg.norm(d)
-    tb = curl * 0.9
+# def _debug_make_landmarks(curl: float) -> np.ndarray:
+#     """Synthetic MANO-21 landmarks; curl in [0, 1] flexes all fingers (0=open, 1=fist)."""
+#     seg = 0.035  # segment length (meters); only relative geometry matters
+#     lm = np.zeros((21, 3), dtype=np.float64)
+#     lm[0] = [0.0, 0.0, 0.0]  # wrist
+#     beta = curl * 1.4  # per-joint bend angle (rad)
+#     # index(5), middle(9), ring(13), pinky(17): MCP, PIP, DIP, TIP chains curling in -z
+#     for mcp, x in {5: 0.03, 9: 0.01, 13: -0.01, 17: -0.03}.items():
+#         p_mcp = np.array([x, 0.06, 0.0])
+#         p_pip = p_mcp + seg * np.array([0.0, 1.0, 0.0])
+#         p_dip = p_pip + seg * np.array([0.0, np.cos(beta), -np.sin(beta)])
+#         p_tip = p_dip + seg * np.array([0.0, np.cos(2 * beta), -np.sin(2 * beta)])
+#         lm[mcp], lm[mcp + 1], lm[mcp + 2], lm[mcp + 3] = p_mcp, p_pip, p_dip, p_tip
+#     # thumb: CMC(1), MCP(2), IP(3), TIP(4) splayed out then curling toward palm
+#     d = np.array([0.6, 0.6, 0.0])
+#     d = d / np.linalg.norm(d)
+#     tb = curl * 0.9
 
-    def _rotz(v, a):
-        c, s = np.cos(a), np.sin(a)
-        return np.array([c * v[0] - s * v[1], s * v[0] + c * v[1], v[2]])
+#     def _rotz(v, a):
+#         c, s = np.cos(a), np.sin(a)
+#         return np.array([c * v[0] - s * v[1], s * v[0] + c * v[1], v[2]])
 
-    t_cmc = np.array([0.03, 0.02, 0.0])
-    t_mcp = t_cmc + seg * d
-    t_ip = t_mcp + seg * _rotz(d, tb)
-    t_tip = t_ip + seg * _rotz(d, 2 * tb)
-    lm[1], lm[2], lm[3], lm[4] = t_cmc, t_mcp, t_ip, t_tip
-    return lm
+#     t_cmc = np.array([0.03, 0.02, 0.0])
+#     t_mcp = t_cmc + seg * d
+#     t_ip = t_mcp + seg * _rotz(d, tb)
+#     t_tip = t_ip + seg * _rotz(d, 2 * tb)
+#     lm[1], lm[2], lm[3], lm[4] = t_cmc, t_mcp, t_ip, t_tip
+#     return lm
 
 
-def _debug_rewrite_quest_data(latest: dict) -> dict:
-    """Overwrite head/wrist/landmark fields with smooth synthetic motion."""
-    t = time.time()
-    # Head: gentle yaw oscillation, fixed position.
-    latest["head_pos"] = np.array([0.0, 0.0, 0.0])
-    latest["head_quat"] = sRot.from_euler("z", 0.35 * np.sin(0.4 * t)).as_quat(scalar_first=True)
-    # Wrists: oscillate position (relative motion drives the arms after calibration)
-    # plus a slow pitch so orientation tracking is visible.
-    latest["left_wrist_pos"] = np.array(
-        [0.30 + 0.08 * np.sin(0.5 * t), 0.20, 0.20 + 0.08 * np.sin(0.7 * t)]
-    )
-    latest["right_wrist_pos"] = np.array(
-        [0.30 + 0.08 * np.sin(0.5 * t + np.pi), -0.20, 0.20 + 0.08 * np.cos(0.7 * t)]
-    )
-    latest["left_wrist_quat"] = sRot.from_euler("y", 0.3 * np.sin(0.8 * t)).as_quat(scalar_first=True)
-    latest["right_wrist_quat"] = sRot.from_euler("y", -0.3 * np.sin(0.8 * t)).as_quat(scalar_first=True)
-    # Fingers: open/close all fingers together.
-    curl = 0.5 * (1.0 + np.sin(1.5 * t))
-    latest["left_landmarks"] = _debug_make_landmarks(curl)
-    latest["right_landmarks"] = _debug_make_landmarks(curl)
-    return latest
+# def _debug_rewrite_quest_data(latest: dict) -> dict:
+#     """Overwrite head/wrist/landmark fields with smooth synthetic motion."""
+#     t = time.time()
+#     # Head: gentle yaw oscillation, fixed position.
+#     latest["head_pos"] = np.array([0.0, 0.0, 0.0])
+#     latest["head_quat"] = sRot.from_euler("z", 0.35 * np.sin(0.4 * t)).as_quat(scalar_first=True)
+#     # Wrists: oscillate position (relative motion drives the arms after calibration)
+#     # plus a slow pitch so orientation tracking is visible.
+#     latest["left_wrist_pos"] = np.array(
+#         [0.30 + 0.08 * np.sin(0.5 * t), 0.20, 0.20 + 0.08 * np.sin(0.7 * t)]
+#     )
+#     latest["right_wrist_pos"] = np.array(
+#         [0.30 + 0.08 * np.sin(0.5 * t + np.pi), -0.20, 0.20 + 0.08 * np.cos(0.7 * t)]
+#     )
+#     latest["left_wrist_quat"] = sRot.from_euler("y", 0.3 * np.sin(0.8 * t)).as_quat(scalar_first=True)
+#     latest["right_wrist_quat"] = sRot.from_euler("y", -0.3 * np.sin(0.8 * t)).as_quat(scalar_first=True)
+#     # Fingers: open/close all fingers together.
+#     curl = 0.5 * (1.0 + np.sin(1.5 * t))
+#     latest["left_landmarks"] = _debug_make_landmarks(curl)
+#     latest["right_landmarks"] = _debug_make_landmarks(curl)
+#     return latest
 # ===========================================================================
 # === END TEMP DEBUG STUB ===================================================
 # ===========================================================================
@@ -896,12 +896,12 @@ def run_quest_manager(
     reader.start()
 
     # === BEGIN TEMP DEBUG STUB — synthetic Quest motion (delete these lines) ===
-    # Wrap get_latest so calibration AND streaming both see the fake motion.
-    # Skipped in replay mode because the NPZ data is already the motion source.
-    if replay_npz is None:
-        _real_get_latest = reader.get_latest
-        reader.get_latest = lambda: _debug_rewrite_quest_data(_real_get_latest())
-        print("[Manager] *** DEBUG STUB ACTIVE — streaming synthetic Quest motion ***")
+    # # Wrap get_latest so calibration AND streaming both see the fake motion.
+    # # Skipped in replay mode because the NPZ data is already the motion source.
+    # if replay_npz is None:
+    #     _real_get_latest = reader.get_latest
+    #     reader.get_latest = lambda: _debug_rewrite_quest_data(_real_get_latest())
+    #     print("[Manager] *** DEBUG STUB ACTIVE — streaming synthetic Quest motion ***")
     # === END TEMP DEBUG STUB ===================================================
 
     # --- 3-pt pose processor ---
@@ -943,7 +943,7 @@ def run_quest_manager(
     print()
 
     current_mode = StreamMode.OFF
-    finger_tracking = False
+    finger_tracking = True
 
     # Pause/freeze state: while paused, the robot holds the last commanded pose
     # and live operator motion is ignored. On resume, the robot eases back to the
