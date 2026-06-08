@@ -154,6 +154,29 @@ def _is_data() -> bool:
     return select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], [])
 
 
+def _read_key() -> str | None:
+    """Read one keypress (including arrow-key escape sequences).
+
+    Returns a single-character string for normal keys, or one of the strings
+    "left" / "right" / "up" / "down" for arrow keys.  Returns None when there
+    is no input available.
+
+    Arrow keys send a 3-byte escape sequence (\x1b [ D/C/A/B).  After reading
+    the leading \x1b we wait up to 50 ms for the rest to arrive — the zero-
+    timeout select used by _is_data() is too tight and misses the trailing bytes.
+    """
+    if not _is_data():
+        return None
+    c = sys.stdin.read(1)
+    if c == "\x1b":
+        if select.select([sys.stdin], [], [], 0.05) == ([sys.stdin], [], []):
+            c2 = sys.stdin.read(1)
+            if c2 == "[" and select.select([sys.stdin], [], [], 0.05) == ([sys.stdin], [], []):
+                c3 = sys.stdin.read(1)
+                return {"A": "up", "B": "down", "C": "right", "D": "left"}.get(c3, "\x1b")
+    return c
+
+
 # ---------------------------------------------------------------------------
 # Hand retargeting
 # ---------------------------------------------------------------------------
@@ -386,8 +409,9 @@ class NpzReplayReader:
     def start(self) -> None:
         self._t0_wall = time.time()
         self._t0_data = self._timestamps[0]
+        self._paused = True  # start paused; press 's' to begin playback
         self._started = True
-        print("[NpzReplayReader] Replay started  |  k=pause/resume  ,=step-back  .=step-fwd")
+        print("[NpzReplayReader] Loaded — paused at frame 0  |  s=start  k=pause/resume  ←/→=step")
 
     def stop(self) -> None:
         pass  # nothing to tear down
@@ -423,9 +447,15 @@ class NpzReplayReader:
             print(f"[NpzReplayReader] Paused   (frame {self._frame_idx}/{self._n - 1})")
 
     def step(self, delta: int) -> None:
-        """Move delta frames while paused.  No-op when playing."""
+        """Move delta frames. Works during both playback and pause.
+
+        Automatically pauses the clock on the first arrow-key press so the
+        clock does not fight the step direction.  Press 'k' to resume
+        clock-based playback from the current frame.
+        """
         if not self._paused:
-            return
+            self._paused = True
+            print("[NpzReplayReader] Arrow key — paused for manual frame stepping  (k=resume)")
         self._frame_idx = max(0, min(self._frame_idx + delta, self._n - 1))
         print(f"[NpzReplayReader] Step {delta:+d}  →  frame {self._frame_idx}/{self._n - 1}")
 
@@ -909,8 +939,7 @@ def run_quest_manager(
     print("  q - Stop policy and exit")
     if replay_npz is not None:
         print("  k - Pause/resume replay")
-        print("  , - Step back 1 frame  (only while replay is paused)")
-        print("  . - Step forward 1 frame  (only while replay is paused)")
+        print("  ← / →  - Step back / forward 1 frame")
     print()
 
     current_mode = StreamMode.OFF
@@ -936,9 +965,9 @@ def run_quest_manager(
             # --- Keyboard ---
             toggle_dc = False
             toggle_da = False
-            if _is_data():
-                c = sys.stdin.read(1)
-                if c == "s" and current_mode == StreamMode.OFF:
+            key = _read_key()
+            if key is not None:
+                if key == "s" and current_mode == StreamMode.OFF:
                     print("[Manager] 's' pressed: starting policy, entering VR_3PT mode...")
                     latest = reader.get_latest()
                     if not three_point.is_calibrated:
@@ -947,7 +976,10 @@ def run_quest_manager(
                     socket.send(build_command_message(start=True, stop=False, planner=True))
                     current_mode = StreamMode.PLANNER_VR_3PT
                     print(f"[Manager] Mode: {current_mode.name}")
-                elif c == "r":
+                    # If replay started paused, begin playback now.
+                    if replay_npz is not None and isinstance(reader, NpzReplayReader) and reader.is_paused:
+                        reader.toggle_pause()
+                elif key == "r":
                     print("[Manager] 'r' pressed: recalibrating (stand in rest pose)...")
                     latest = reader.get_latest()
                     three_point.reset()
@@ -955,10 +987,10 @@ def run_quest_manager(
                     if feedback.poll() and feedback.full_body_q is not None:
                         three_point.reset_with_measured_q(feedback.full_body_q)
                     three_point.calibrate_now(latest)
-                elif c == "f":
+                elif key == "f":
                     finger_tracking = not finger_tracking
                     print(f"[Manager] Finger retargeting {'ENABLED' if finger_tracking else 'DISABLED'}")
-                elif c == "p" and current_mode == StreamMode.PLANNER_VR_3PT:
+                elif key == "p" and current_mode == StreamMode.PLANNER_VR_3PT:
                     paused = not paused
                     if paused:
                         print(
@@ -977,20 +1009,20 @@ def run_quest_manager(
                             )
                         else:
                             print("[Manager] RESUMED teleoperation.")
-                elif c == "c":
+                elif key == "c":
                     toggle_dc = True
                     print("[Manager] 'c' pressed: toggling data collection")
-                elif c == "x":
+                elif key == "x":
                     toggle_da = True
                     print("[Manager] 'x' pressed: toggling data abort")
-                elif c == "q":
+                elif key == "q":
                     print("[Manager] 'q' pressed: stopping policy and exiting...")
                     break
-                elif c == "k" and replay_npz is not None:
+                elif key == "k" and replay_npz is not None:
                     reader.toggle_pause()
-                elif c == "," and replay_npz is not None:
+                elif key == "left" and replay_npz is not None:
                     reader.step(-1)
-                elif c == "." and replay_npz is not None:
+                elif key == "right" and replay_npz is not None:
                     reader.step(1)
 
             # --- Get Quest data ---
@@ -1163,7 +1195,7 @@ if __name__ == "__main__":
             "Replay a recorded NPZ trajectory instead of connecting to ROS2 / ZMQ. "
             "The recording replaces the live Quest operator; all other processing "
             "(calibration, 3-pt pose, finger retargeting, ZMQ streaming) runs unchanged. "
-            "Replay controls: k=pause/resume  ,=step-back  .=step-forward"
+            "Replay controls: s=start  k=pause/resume  ←/→=step-back/forward"
         ),
     )
     args = parser.parse_args()
