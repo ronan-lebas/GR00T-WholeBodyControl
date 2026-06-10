@@ -11,7 +11,9 @@ Usage:
     python quest_manager_thread_server.py
 
 Keyboard controls:
-    s  - Start policy + enter VR_3PT mode (calibrates on first press)
+    s  - Start policy + enter VR_3PT mode (live: calibrates after --calib-delay-sec
+         so the operator can assume the rest pose; replay: calibrates on frame 0,
+         which is the prepended rest pose)
     r  - Recalibrate VR 3-pt tracking (operator should be in rest pose)
     f  - Toggle finger retargeting on/off
     c  - Toggle data collection
@@ -82,12 +84,16 @@ except ImportError:
 # Robot model for FK-based calibration
 try:
     from gear_sonic.data.robot_model.instantiation.g1 import instantiate_g1_robot_model
-    from gear_sonic.utils.teleop.vis.vr3pt_pose_visualizer import get_g1_key_frame_poses
+    from gear_sonic.utils.teleop.vis.vr3pt_pose_visualizer import (
+        G1_KEY_FRAME_OFFSETS,
+        get_g1_key_frame_poses,
+    )
     _HAS_ROBOT_MODEL = True
 except ImportError:
     print("Warning: Robot model not available. Calibration will use fixed fallback offsets.")
     instantiate_g1_robot_model = None
     get_g1_key_frame_poses = None
+    G1_KEY_FRAME_OFFSETS = None
     _HAS_ROBOT_MODEL = False
 
 # msgpack — used by both FeedbackReader and the ZMQ relay reader
@@ -112,6 +118,27 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 WIRE_HAND_DOF = 7  # always 7 on the wire; BrainCo uses 6 + 1 padding
+
+# Kinematic chain constants for the head row (same as pico ThreePointPose):
+# root -> torso_link (+Z) -> head (along head's local Z).
+_TORSO_LINK_OFFSET_Z = 0.05
+_NECK_LINK_LENGTH = 0.35
+
+# VR 3-point key-frame offsets, in each wrist LINK's local frame (must match
+# G1_KEY_FRAME_OFFSETS and the deploy VR_3POINT_OFFSETS). The policy's wrist target
+# is link_pos + R_link @ offset, so the offset must be re-applied with the *live*
+# commanded orientation — otherwise a wrist rotation (palm flip) makes the offset
+# arm swing and the link translates instead of rotating in place.
+if G1_KEY_FRAME_OFFSETS is not None:
+    _WRIST_OFFSET = {
+        "left": np.asarray(G1_KEY_FRAME_OFFSETS["left_wrist"], dtype=float),
+        "right": np.asarray(G1_KEY_FRAME_OFFSETS["right_wrist"], dtype=float),
+    }
+else:
+    _WRIST_OFFSET = {
+        "left": np.array([0.18, -0.025, 0.0]),
+        "right": np.array([0.18, 0.025, 0.0]),
+    }
 
 # On resume from pause, ease from the frozen pose to the live operator pose over
 # this many seconds (instead of snapping) to avoid an abrupt jump.
@@ -367,6 +394,138 @@ class QuestReader:
             return self._latest["timestamp"] > 0.0
 
 
+# Robot head kinematic point in root frame (root -> torso_link -> head along +Z),
+# matching QuestThreePointPose's head row. Used to express the FK rest wrist
+# positions as head-relative vectors for the synthetic operator rest pose.
+_ROBOT_HEAD_REF = np.array([0.0, 0.0, _TORSO_LINK_OFFSET_Z + _NECK_LINK_LENGTH])
+
+# Fallback synthetic rest geometry (head-relative, head-yaw frame) if the robot
+# model / FK is unavailable. Approximates the G1 rest wrist LINK: arms forward,
+# palms in (key-frame minus the +0.18 m offset).
+_FALLBACK_REST_VEC = {
+    "left": np.array([0.38, 0.16, -0.30]) - np.array([0.18, -0.025, 0.0]),
+    "right": np.array([0.38, -0.16, -0.30]) - np.array([0.18, 0.025, 0.0]),
+}
+
+_FK_REST_CACHE: dict | None = None
+
+
+def _g1_fk_rest() -> dict | None:
+    """Robot FK rest wrist LINK poses (cached, offset removed). None if unavailable.
+
+    Uses apply_offset=False so the synthetic rest operator wrist is placed at the
+    robot wrist LINK (matching the link-anchored calibration); the key-frame offset
+    is re-applied at runtime with the live orientation.
+    """
+    global _FK_REST_CACHE
+    if _FK_REST_CACHE is not None:
+        return _FK_REST_CACHE
+    if not _HAS_ROBOT_MODEL or instantiate_g1_robot_model is None:
+        return None
+    try:
+        _FK_REST_CACHE = get_g1_key_frame_poses(instantiate_g1_robot_model(), apply_offset=False)
+    except Exception as e:  # pragma: no cover - defensive
+        print(f"[prepend_rest_pose] Could not load FK rest poses: {e}")
+        _FK_REST_CACHE = None
+    return _FK_REST_CACHE
+
+
+def prepend_rest_pose(
+    data: dict,
+    timestamps: np.ndarray,
+    hold_sec: float,
+    interp_sec: float,
+) -> tuple[dict, np.ndarray]:
+    """Prepend a synthetic rest pose (held, then interpolated) to a recording.
+
+    Recorded Quest trajectories rarely start in a clean rest pose, so calibrating
+    on frame 0 of the raw data gives a garbage reference. This builds a neutral
+    rest frame from the recording's first head pose (upright, yaw preserved, arms
+    relaxed), holds it for `hold_sec`, then interpolates to the original first
+    frame over `interp_sec`. After this, frame 0 is a valid calibration pose and
+    the robot eases from rest into the recorded motion.
+
+    Args:
+        data: dict of (n, ...) arrays — head/wrist pos+quat and landmarks.
+        timestamps: (n,) recording timestamps.
+        hold_sec: seconds to hold the rest pose (>= one frame so frame 0 is rest).
+        interp_sec: seconds to interpolate rest -> original first frame.
+
+    Returns:
+        (extended_data, extended_timestamps) with the prefix prepended.
+    """
+    n = timestamps.shape[0]
+    if n == 0 or (hold_sec <= 0.0 and interp_sec <= 0.0):
+        return data, timestamps
+
+    dt = float(np.median(np.diff(timestamps))) if n > 1 else 1.0 / 90.0
+    n_hold = max(1, int(round(hold_sec / dt)))
+    n_interp = max(0, int(round(interp_sec / dt)))
+
+    # --- build the synthetic rest frame ---
+    # The synthetic operator rest pose is the G1 FK rest pose lifted into the Quest
+    # world frame via the operator's head yaw. Matching the robot rest exactly makes
+    # the orientation map M = O_cal^-1 . R_rest = identity, so the robot mirrors the
+    # operator's wrist orientation with no offset (and the position vector maps 1:1).
+    head_pos0 = data["head_pos"][0]
+    yaw0 = _quat_yaw(data["head_quat"][0])
+    r0 = _yaw_rot(yaw0)
+    head_quat_rest = r0.as_quat(scalar_first=True)  # upright, operator's heading
+
+    fk = _g1_fk_rest()
+    rest = {
+        "head_pos": head_pos0.copy(),
+        "head_quat": head_quat_rest,
+        # Hold the first-frame fingers so finger retargeting does not jump.
+        "left_landmarks": data["left_landmarks"][0].copy(),
+        "right_landmarks": data["right_landmarks"][0].copy(),
+    }
+    for side, pos_key, quat_key in (
+        ("left", "left_wrist_pos", "left_wrist_quat"),
+        ("right", "right_wrist_pos", "right_wrist_quat"),
+    ):
+        if fk is not None:
+            rest_vec = fk[f"{side}_wrist"]["position"] - _ROBOT_HEAD_REF
+            r_rest = sRot.from_quat(fk[f"{side}_wrist"]["orientation_wxyz"], scalar_first=True)
+        else:
+            rest_vec = _FALLBACK_REST_VEC[side]
+            r_rest = sRot.identity()
+        rest[pos_key] = head_pos0 + r0.apply(rest_vec)
+        # World wrist orientation W_cal = R0 . R_rest, so O_cal = R0^-1 . W_cal = R_rest.
+        rest[quat_key] = (r0 * r_rest).as_quat(scalar_first=True)
+    first = {k: data[k][0] for k in data}
+
+    pos_keys = ("head_pos", "left_wrist_pos", "right_wrist_pos")
+    quat_keys = ("head_quat", "left_wrist_quat", "right_wrist_quat")
+    lm_keys = ("left_landmarks", "right_landmarks")
+
+    pre = {k: [] for k in data}
+    # Hold the rest pose (frame 0 is guaranteed to be the rest pose).
+    for _ in range(n_hold):
+        for k in data:
+            pre[k].append(rest[k].copy())
+    # Interpolate rest -> original first frame (exclusive of both endpoints).
+    for i in range(1, n_interp + 1):
+        alpha = i / (n_interp + 1)
+        for k in pos_keys:
+            pre[k].append((1.0 - alpha) * rest[k] + alpha * first[k])
+        for k in quat_keys:
+            pre[k].append(_nlerp_quat(rest[k], first[k], alpha))
+        for k in lm_keys:
+            pre[k].append((1.0 - alpha) * rest[k] + alpha * first[k])
+
+    n_pre = n_hold + n_interp
+    ext = {k: np.concatenate([np.asarray(pre[k]), data[k]], axis=0) for k in data}
+    # Continuous, evenly-spaced timestamps for the prefix, ending one dt before t0.
+    pre_ts = timestamps[0] - dt * np.arange(n_pre, 0, -1)
+    ext_ts = np.concatenate([pre_ts, timestamps])
+    print(
+        f"[NpzReplayReader] Prepended rest pose: {n_hold} hold + {n_interp} interp "
+        f"frames ({n_pre * dt:.1f}s @ {1.0 / dt:.0f} Hz)."
+    )
+    return ext, ext_ts
+
+
 class NpzReplayReader:
     """Drop-in replacement for QuestReader that replays a recorded NPZ trajectory.
 
@@ -382,9 +541,13 @@ class NpzReplayReader:
         step(delta)    — move delta frames while paused (can be negative)
     """
 
-    def __init__(self, npz_path: str) -> None:
+    def __init__(
+        self,
+        npz_path: str,
+        rest_hold_sec: float = 1.0,
+        rest_interp_sec: float = 1.5,
+    ) -> None:
         raw = np.load(npz_path, allow_pickle=True)
-        self._n = int(raw["head_pos"].shape[0])
         self._data = {
             "head_pos":         raw["head_pos"].astype(np.float64),
             "head_quat":        raw["head_quat"].astype(np.float64),
@@ -396,6 +559,11 @@ class NpzReplayReader:
             "right_landmarks":  raw["right_landmarks"].astype(np.float64),
         }
         self._timestamps = raw["timestamp"].astype(np.float64)
+        # Prepend a synthetic rest pose so calibration on frame 0 is valid.
+        self._data, self._timestamps = prepend_rest_pose(
+            self._data, self._timestamps, rest_hold_sec, rest_interp_sec
+        )
+        self._n = int(self._timestamps.shape[0])
         duration = float(self._timestamps[-1] - self._timestamps[0])
         self._frame_idx: int = 0
         self._paused: bool = False
@@ -556,9 +724,21 @@ def _relay_dict_to_numpy(data: dict) -> dict:
 # QuestThreePointPose — calibration + 3-pt pose extraction
 # ---------------------------------------------------------------------------
 
-# Same kinematic chain constants as pico_manager_thread_server.py:ThreePointPose
-_TORSO_LINK_OFFSET_Z = 0.05
-_NECK_LINK_LENGTH = 0.35
+def _quat_yaw(quat_wxyz: np.ndarray) -> float:
+    """Yaw (rotation about world +Z, radians) of a scalar-first quaternion.
+
+    Uses the forward-axis (local +X) projection onto the XY plane, which stays
+    well-defined under moderate head pitch/roll — unlike an Euler decomposition,
+    which is ambiguous near gimbal lock. The Quest head frame's local +X points
+    forward (ROS FLU), so this returns the operator's heading.
+    """
+    fwd = sRot.from_quat(quat_wxyz, scalar_first=True).apply([1.0, 0.0, 0.0])
+    return float(np.arctan2(fwd[1], fwd[0]))
+
+
+def _yaw_rot(yaw: float) -> sRot:
+    """Rotation about world +Z by `yaw` radians."""
+    return sRot.from_euler("z", yaw)
 
 
 class QuestThreePointPose:
@@ -569,18 +749,53 @@ class QuestThreePointPose:
     Output shape: (3, 7) — rows are [L-wrist, R-wrist, Head].
     Each row: [x, y, z, qw, qx, qy, qz] in robot frame, scalar-first quaternion.
 
-    Calibration aligns Quest vr_origin coordinates to robot root frame using the
-    same offset approach as ThreePointPose in pico_manager_thread_server.py:
-      1. Capture head quaternion → inv(head_quat) rotates everything to head-neutral
-      2. Compute wrist position/orientation offsets vs G1 FK reference at rest pose
+    Calibration aligns Quest vr_origin coordinates to the robot root frame. The
+    operator should be in a neutral rest pose when calibrating. We capture, in a
+    yaw-only head frame (R0 = Rz(head_yaw_cal)):
+
+      Position — the head->wrist *vector* (not the absolute wrist position):
+        v_cal = R0^-1 . (p_wrist_cal - p_head_cal)
+      At runtime the wrist LINK tracks the *change* of that vector since
+      calibration, scaled by `pos_scale` and added to the robot rest LINK position:
+        link(t) = link_rest + pos_scale * [ R0^-1 . (p_wrist(t) - p_head(t)) - v_cal ]
+      The value SENT is the policy's key-frame point, link + R(t) @ offset, with the
+      +0.18 m offset re-applied using the live orientation R(t). This matters: the
+      policy reconstructs link = sent_pos - R(t) @ offset, so freezing the offset at
+      the rest orientation would make a palm flip swing the offset arm and translate
+      the link (hands drift together) instead of rotating in place.
+      Using the head->wrist vector makes tracking invariant to the operator
+      walking / leaning / turning (head and wrist translate together), which a
+      previous absolute-position mapping got wrong.
+
+      Orientation — a WORLD-frame delta. With O(t) = R0^-1 . W_wrist(t) the
+      operator wrist in the calibration-yaw frame and M = O_cal^-1 . R_rest:
+        R_robot(t) = O(t) . M
+      so the robot wrist mirrors the operator's world-frame rotation since
+      calibration, anchored at the robot rest orientation. (A body-frame delta
+      M . O(t) rotates about the wrong axis.)
+
+      Head — yaw only. The robot has no neck joint, so the head row drives the
+      torso heading. We pass the operator's relative head yaw and zero pitch/roll.
     """
 
-    def __init__(self):
-        self._calib_head_quat_inv: np.ndarray | None = None  # scalar-first [w,x,y,z]
-        self._calib_lwrist_pos_offset: np.ndarray | None = None
-        self._calib_rwrist_pos_offset: np.ndarray | None = None
-        self._calib_lwrist_rot_offset: sRot | None = None
-        self._calib_rwrist_rot_offset: sRot | None = None
+    def __init__(self, pos_scale: float = 1.0):
+        # Scale applied to the operator head->wrist displacement to account for the
+        # robot vs. operator arm-length / form-factor difference. 1.0 = 1:1 mapping;
+        # <1.0 shrinks the commanded workspace so a smaller robot does not saturate.
+        # Orientation is dimensionless and therefore unaffected by this factor.
+        self._pos_scale = float(pos_scale)
+
+        # Calibration-yaw frame R0 = Rz(head_yaw_cal), stored as its inverse rotation.
+        self._calib_yaw_inv: sRot | None = None
+        # Head->wrist vectors at calibration (in the R0 frame).
+        self._calib_lwrist_vec: np.ndarray | None = None
+        self._calib_rwrist_vec: np.ndarray | None = None
+        # Robot rest wrist positions the calibration vectors map to.
+        self._calib_lwrist_rest: np.ndarray | None = None
+        self._calib_rwrist_rest: np.ndarray | None = None
+        # Orientation maps M = O_cal^-1 . R_rest, applied at runtime as R(t) = O(t) . M.
+        self._calib_lwrist_rot_map: sRot | None = None
+        self._calib_rwrist_rot_map: sRot | None = None
 
         self._override_robot_q: np.ndarray | None = None  # measured joints for recalibration FK
 
@@ -594,7 +809,7 @@ class QuestThreePointPose:
 
     @property
     def is_calibrated(self) -> bool:
-        return self._calib_head_quat_inv is not None
+        return self._calib_yaw_inv is not None
 
     def calibrate_now(self, latest: dict) -> bool:
         """Capture calibration using current Quest frame.
@@ -614,11 +829,13 @@ class QuestThreePointPose:
 
     def reset(self) -> None:
         """Clear all calibration state."""
-        self._calib_head_quat_inv = None
-        self._calib_lwrist_pos_offset = None
-        self._calib_rwrist_pos_offset = None
-        self._calib_lwrist_rot_offset = None
-        self._calib_rwrist_rot_offset = None
+        self._calib_yaw_inv = None
+        self._calib_lwrist_vec = None
+        self._calib_rwrist_vec = None
+        self._calib_lwrist_rest = None
+        self._calib_rwrist_rest = None
+        self._calib_lwrist_rot_map = None
+        self._calib_rwrist_rot_map = None
         self._override_robot_q = None
         print("[QuestThreePointPose] Calibration reset.")
 
@@ -632,23 +849,28 @@ class QuestThreePointPose:
         print("[QuestThreePointPose] Next calibration will use measured robot joints as FK reference.")
 
     def _capture_calibration(self, latest: dict) -> None:
+        head_pos = latest["head_pos"].copy()
         head_quat = latest["head_quat"].copy()  # [w,x,y,z] scalar-first
         lw_pos = latest["left_wrist_pos"].copy()
         rw_pos = latest["right_wrist_pos"].copy()
         lw_quat = latest["left_wrist_quat"].copy()
         rw_quat = latest["right_wrist_quat"].copy()
 
-        head_rot = sRot.from_quat(head_quat, scalar_first=True)
-        head_rot_inv = head_rot.inv()
-        self._calib_head_quat_inv = head_rot_inv.as_quat(scalar_first=True)
+        # Calibration-yaw frame: R0 = Rz(head_yaw). We only use the head *yaw* so a
+        # tilted/nodding head at calibration does not skew the wrist mapping.
+        r0_inv = _yaw_rot(_quat_yaw(head_quat)).inv()
+        self._calib_yaw_inv = r0_inv
 
-        # Rotate wrist positions/orientations into head-neutral frame
-        lw_pos_corr = head_rot_inv.apply(lw_pos)
-        rw_pos_corr = head_rot_inv.apply(rw_pos)
-        lw_rot_corr = head_rot_inv * sRot.from_quat(lw_quat, scalar_first=True)
-        rw_rot_corr = head_rot_inv * sRot.from_quat(rw_quat, scalar_first=True)
+        # Head->wrist vectors at calibration, expressed in the R0 frame.
+        lw_vec = r0_inv.apply(lw_pos - head_pos)
+        rw_vec = r0_inv.apply(rw_pos - head_pos)
+        # Operator wrist orientation in the R0 frame (O_cal).
+        lw_o_cal = r0_inv * sRot.from_quat(lw_quat, scalar_first=True)
+        rw_o_cal = r0_inv * sRot.from_quat(rw_quat, scalar_first=True)
 
-        # G1 FK reference positions — use override joints if set (measured robot pose)
+        # G1 FK reference LINK poses (apply_offset=False) — use override joints if set.
+        # We anchor to the wrist LINK, not the key-frame point: the +0.18 m key-frame
+        # offset is re-applied at runtime with the live orientation (see _apply_calibration).
         if self._robot_model is not None and get_g1_key_frame_poses is not None:
             fk_q = None
             if self._override_robot_q is not None:
@@ -656,27 +878,32 @@ class QuestThreePointPose:
                     body_actuated_joint_values=self._override_robot_q[:29]
                 )
                 self._override_robot_q = None  # consumed
-            g1_poses = get_g1_key_frame_poses(self._robot_model, q=fk_q)
+            g1_poses = get_g1_key_frame_poses(self._robot_model, q=fk_q, apply_offset=False)
             g1_lw_pos = g1_poses["left_wrist"]["position"]
             g1_rw_pos = g1_poses["right_wrist"]["position"]
             g1_lw_rot = sRot.from_quat(g1_poses["left_wrist"]["orientation_wxyz"], scalar_first=True)
             g1_rw_rot = sRot.from_quat(g1_poses["right_wrist"]["orientation_wxyz"], scalar_first=True)
         else:
-            # Fallback: approximate G1 rest wrist positions in robot frame
-            g1_lw_pos = np.array([0.25, 0.20, 0.15])
-            g1_rw_pos = np.array([0.25, -0.20, 0.15])
+            # Fallback: approximate G1 rest wrist LINK positions (key frame minus offset).
+            g1_lw_pos = np.array([0.38, 0.16, 0.10]) - _WRIST_OFFSET["left"]
+            g1_rw_pos = np.array([0.38, -0.16, 0.10]) - _WRIST_OFFSET["right"]
             g1_lw_rot = sRot.from_quat([1, 0, 0, 0], scalar_first=True)
             g1_rw_rot = sRot.from_quat([1, 0, 0, 0], scalar_first=True)
 
-        self._calib_lwrist_pos_offset = lw_pos_corr - g1_lw_pos
-        self._calib_rwrist_pos_offset = rw_pos_corr - g1_rw_pos
-        self._calib_lwrist_rot_offset = g1_lw_rot * lw_rot_corr.inv()
-        self._calib_rwrist_rot_offset = g1_rw_rot * rw_rot_corr.inv()
+        # Position: store the calibration head->wrist vector and the robot rest pose
+        # it maps to. Runtime tracks the change in the vector scaled by pos_scale.
+        self._calib_lwrist_vec = lw_vec
+        self._calib_rwrist_vec = rw_vec
+        self._calib_lwrist_rest = g1_lw_pos
+        self._calib_rwrist_rest = g1_rw_pos
+        # Orientation: M = O_cal^-1 . R_rest, so R(t) = O(t) . M maps O_cal -> R_rest.
+        self._calib_lwrist_rot_map = lw_o_cal.inv() * g1_lw_rot
+        self._calib_rwrist_rot_map = rw_o_cal.inv() * g1_rw_rot
 
         print(
-            f"[QuestThreePointPose] Calibration captured:\n"
-            f"  L-wrist pos offset: {self._calib_lwrist_pos_offset}\n"
-            f"  R-wrist pos offset: {self._calib_rwrist_pos_offset}"
+            f"[QuestThreePointPose] Calibration captured (pos_scale={self._pos_scale}):\n"
+            f"  L head->wrist {np.round(lw_vec, 3)} -> rest {np.round(g1_lw_pos, 3)}\n"
+            f"  R head->wrist {np.round(rw_vec, 3)} -> rest {np.round(g1_rw_pos, 3)}"
         )
 
     def process_quest_pose(self, latest: dict) -> np.ndarray:
@@ -691,30 +918,43 @@ class QuestThreePointPose:
         return self._apply_calibration(latest)
 
     def _apply_calibration(self, latest: dict) -> np.ndarray:
+        head_pos = latest["head_pos"]
         head_quat = latest["head_quat"]
         lw_pos = latest["left_wrist_pos"]
         rw_pos = latest["right_wrist_pos"]
         lw_quat = latest["left_wrist_quat"]
         rw_quat = latest["right_wrist_quat"]
 
-        calib_inv = sRot.from_quat(self._calib_head_quat_inv, scalar_first=True)
+        r0_inv = self._calib_yaw_inv
+        s = self._pos_scale
 
-        # L-wrist position: rotate into head-neutral, subtract offset
-        lw_pos_calib = calib_inv.apply(lw_pos) - self._calib_lwrist_pos_offset
-        rw_pos_calib = calib_inv.apply(rw_pos) - self._calib_rwrist_pos_offset
+        # Orientation: world-frame delta — R(t) = O(t) . M, with O(t) the operator
+        # wrist in the calibration-yaw frame and M = O_cal^-1 . R_rest.
+        lw_rot_calib = (r0_inv * sRot.from_quat(lw_quat, scalar_first=True)) * self._calib_lwrist_rot_map
+        rw_rot_calib = (r0_inv * sRot.from_quat(rw_quat, scalar_first=True)) * self._calib_rwrist_rot_map
 
-        # L-wrist orientation: rot_offset * (head_inv * current)
-        lw_rot_calib = self._calib_lwrist_rot_offset * (
-            calib_inv * sRot.from_quat(lw_quat, scalar_first=True)
-        )
-        rw_rot_calib = self._calib_rwrist_rot_offset * (
-            calib_inv * sRot.from_quat(rw_quat, scalar_first=True)
-        )
+        # Position of the wrist LINK: rest + scaled change of the head->wrist vector
+        # since calibration (vector in the calibration-yaw frame). Subtracting the head
+        # position makes this invariant to the operator translating.
+        lw_vec = r0_inv.apply(lw_pos - head_pos)
+        rw_vec = r0_inv.apply(rw_pos - head_pos)
+        lw_link = self._calib_lwrist_rest + s * (lw_vec - self._calib_lwrist_vec)
+        rw_link = self._calib_rwrist_rest + s * (rw_vec - self._calib_rwrist_vec)
 
-        # Head orientation: calib_inv * current head orientation
-        head_rot_calib = calib_inv * sRot.from_quat(head_quat, scalar_first=True)
+        # Key-frame target = link + R(t) @ offset. Re-applying the offset with the live
+        # orientation means a wrist rotation rotates the key frame in place (the link
+        # stays put) instead of swinging the offset arm and translating the link — which
+        # is exactly how the policy reconstructs the link from (position, orientation).
+        lw_pos_calib = lw_link + lw_rot_calib.apply(_WRIST_OFFSET["left"])
+        rw_pos_calib = rw_link + rw_rot_calib.apply(_WRIST_OFFSET["right"])
 
-        # Head position via kinematic chain (same as pico's ThreePointPose)
+        # Head: yaw only. The G1 has no neck joint, so the head row drives the torso
+        # heading — we pass the operator's relative head yaw and discard pitch/roll.
+        head_rel = r0_inv * sRot.from_quat(head_quat, scalar_first=True)
+        head_rot_calib = _yaw_rot(_quat_yaw(head_rel.as_quat(scalar_first=True)))
+
+        # Head position via kinematic chain (same as pico's ThreePointPose). With a
+        # yaw-only head this stays directly above the torso.
         head_z = head_rot_calib.apply([0, 0, 1])
         head_pos_calib = np.array([0, 0, _TORSO_LINK_OFFSET_Z]) + _NECK_LINK_LENGTH * head_z
 
@@ -865,16 +1105,25 @@ def run_quest_manager(
     zmq_relay_port: int = 5559,
     replay_npz: str | None = None,
     np_retarget: bool = False,
+    pos_scale: float = 1.0,
+    calib_delay_sec: float = 3.0,
+    rest_hold_sec: float = 1.0,
+    rest_interp_sec: float = 1.5,
 ) -> None:
     """Start the Quest teleoperation manager.
 
     When replay_npz is set, a recorded NPZ trajectory is used as the Quest data
     source instead of subscribing to ROS2 topics or a ZMQ relay.  All downstream
     processing (calibration, 3-pt pose, finger retargeting, ZMQ streaming) runs
-    unchanged — the recording replaces the human operator.
+    unchanged — the recording replaces the human operator. A synthetic rest pose
+    is prepended to the recording (rest_hold_sec + rest_interp_sec) so calibration
+    on frame 0 is valid.
 
     When zmq_relay_host is set (and replay_npz is None), reads Quest data from the
     relay Docker container over ZMQ instead of subscribing to ROS2 topics directly.
+
+    For live operation, pressing 's' starts a calib_delay_sec countdown before
+    capturing calibration, giving the operator time to assume the rest pose.
     """
     # --- ZMQ setup ---
     context = zmq.Context()
@@ -884,7 +1133,9 @@ def run_quest_manager(
 
     # --- Quest reader (live or replay) ---
     if replay_npz is not None:
-        reader: QuestReader | NpzReplayReader = NpzReplayReader(replay_npz)
+        reader: QuestReader | NpzReplayReader = NpzReplayReader(
+            replay_npz, rest_hold_sec=rest_hold_sec, rest_interp_sec=rest_interp_sec
+        )
     else:
         reader = QuestReader(
             head_topic=head_topic,
@@ -905,7 +1156,7 @@ def run_quest_manager(
     # === END TEMP DEBUG STUB ===================================================
 
     # --- 3-pt pose processor ---
-    three_point = QuestThreePointPose()
+    three_point = QuestThreePointPose(pos_scale=pos_scale)
 
     # --- Feedback reader (for measured-joint recalibration) ---
     feedback = FeedbackReader(zmq_host=zmq_feedback_host, zmq_port=zmq_feedback_port)
@@ -944,6 +1195,22 @@ def run_quest_manager(
 
     current_mode = StreamMode.OFF
     finger_tracking = True
+    is_replay = replay_npz is not None
+
+    # Deferred calibration: on live Quest, 's'/'r' arm a countdown so the operator
+    # can assume the rest pose before the frame is captured. Replay calibrates
+    # immediately (frame 0 is the prepended rest pose).
+    calib_pending = False
+    calib_deadline = 0.0
+    calib_next_tick = 0.0
+    calib_start_policy = False  # also send the start command when the timer fires
+
+    def _capture_calibration_now(use_measured: bool) -> None:
+        latest_c = reader.get_latest()
+        three_point.reset()
+        if use_measured and feedback.poll() and feedback.full_body_q is not None:
+            three_point.reset_with_measured_q(feedback.full_body_q)
+        three_point.calibrate_now(latest_c)
 
     # Pause/freeze state: while paused, the robot holds the last commanded pose
     # and live operator motion is ignored. On resume, the robot eases back to the
@@ -967,26 +1234,39 @@ def run_quest_manager(
             toggle_da = False
             key = _read_key()
             if key is not None:
-                if key == "s" and current_mode == StreamMode.OFF:
-                    print("[Manager] 's' pressed: starting policy, entering VR_3PT mode...")
-                    latest = reader.get_latest()
-                    if not three_point.is_calibrated:
-                        print("[Manager] Running initial calibration (stand in rest pose)...")
-                        three_point.calibrate_now(latest)
-                    socket.send(build_command_message(start=True, stop=False, planner=True))
-                    current_mode = StreamMode.PLANNER_VR_3PT
-                    print(f"[Manager] Mode: {current_mode.name}")
-                    # If replay started paused, begin playback now.
-                    if replay_npz is not None and isinstance(reader, NpzReplayReader) and reader.is_paused:
-                        reader.toggle_pause()
-                elif key == "r":
-                    print("[Manager] 'r' pressed: recalibrating (stand in rest pose)...")
-                    latest = reader.get_latest()
-                    three_point.reset()
-                    # Use measured robot joints for FK reference if feedback is available
-                    if feedback.poll() and feedback.full_body_q is not None:
-                        three_point.reset_with_measured_q(feedback.full_body_q)
-                    three_point.calibrate_now(latest)
+                if key == "s" and current_mode == StreamMode.OFF and not calib_pending:
+                    if is_replay or calib_delay_sec <= 0.0:
+                        # Replay frame 0 is the prepended rest pose — calibrate now.
+                        print("[Manager] 's' pressed: starting policy, entering VR_3PT mode...")
+                        if not three_point.is_calibrated:
+                            three_point.calibrate_now(reader.get_latest())
+                        socket.send(build_command_message(start=True, stop=False, planner=True))
+                        current_mode = StreamMode.PLANNER_VR_3PT
+                        print(f"[Manager] Mode: {current_mode.name}")
+                        if isinstance(reader, NpzReplayReader) and reader.is_paused:
+                            reader.toggle_pause()
+                    else:
+                        calib_pending = True
+                        calib_start_policy = True
+                        calib_deadline = time.time() + calib_delay_sec
+                        calib_next_tick = int(np.ceil(calib_delay_sec))
+                        print(
+                            f"[Manager] 's' pressed: calibrating in {calib_delay_sec:.0f}s — "
+                            "assume the rest pose and hold still..."
+                        )
+                elif key == "r" and not calib_pending:
+                    if is_replay or calib_delay_sec <= 0.0:
+                        print("[Manager] 'r' pressed: recalibrating (rest pose)...")
+                        _capture_calibration_now(use_measured=True)
+                    else:
+                        calib_pending = True
+                        calib_start_policy = False
+                        calib_deadline = time.time() + calib_delay_sec
+                        calib_next_tick = int(np.ceil(calib_delay_sec))
+                        print(
+                            f"[Manager] 'r' pressed: recalibrating in {calib_delay_sec:.0f}s — "
+                            "assume the rest pose and hold still..."
+                        )
                 elif key == "f":
                     finger_tracking = not finger_tracking
                     print(f"[Manager] Finger retargeting {'ENABLED' if finger_tracking else 'DISABLED'}")
@@ -1024,6 +1304,23 @@ def run_quest_manager(
                     reader.step(-1)
                 elif key == "right" and replay_npz is not None:
                     reader.step(1)
+
+            # --- Deferred calibration countdown (live Quest) ---
+            if calib_pending:
+                remaining = calib_deadline - time.time()
+                if remaining <= 0.0:
+                    print("[Manager] Capturing calibration now (hold still)...")
+                    _capture_calibration_now(use_measured=calib_start_policy is False)
+                    if calib_start_policy and current_mode == StreamMode.OFF:
+                        socket.send(build_command_message(start=True, stop=False, planner=True))
+                        current_mode = StreamMode.PLANNER_VR_3PT
+                        print(f"[Manager] Mode: {current_mode.name}")
+                    calib_pending = False
+                else:
+                    sec = int(np.ceil(remaining))
+                    if sec < calib_next_tick:
+                        print(f"[Manager]   calibrating in {sec}s...")
+                        calib_next_tick = sec
 
             # --- Get Quest data ---
             latest = reader.get_latest()
@@ -1198,6 +1495,44 @@ if __name__ == "__main__":
             "Replay controls: s=start  k=pause/resume  ←/→=step-back/forward"
         ),
     )
+    parser.add_argument(
+        "--pos-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Scale factor on the operator head->wrist displacement to account for the "
+            "robot vs operator arm length (form factor). 1.0 = 1:1; e.g. 0.8 shrinks the "
+            "reach so a smaller robot does not saturate. Orientation is unaffected."
+        ),
+    )
+    parser.add_argument(
+        "--calib-delay-sec",
+        type=float,
+        default=3.0,
+        help=(
+            "Live Quest only: seconds to wait after pressing 's'/'r' before capturing "
+            "calibration, so the operator can assume the rest pose. 0 disables the delay. "
+            "Ignored in --replay-from-data mode (frame 0 is the prepended rest pose)."
+        ),
+    )
+    parser.add_argument(
+        "--rest-hold-sec",
+        type=float,
+        default=1.0,
+        help=(
+            "Replay only: seconds to hold the synthetic rest pose prepended to the "
+            "recording (frame 0 is the rest pose used for calibration)."
+        ),
+    )
+    parser.add_argument(
+        "--rest-interp-sec",
+        type=float,
+        default=1.5,
+        help=(
+            "Replay only: seconds to interpolate from the synthetic rest pose to the "
+            "recording's first frame, so the robot eases into the motion."
+        ),
+    )
     args = parser.parse_args()
 
     run_quest_manager(
@@ -1211,4 +1546,8 @@ if __name__ == "__main__":
         zmq_relay_port=args.zmq_relay_port,
         replay_npz=args.replay_from_data,
         np_retarget=args.np_retarget,
+        pos_scale=args.pos_scale,
+        calib_delay_sec=args.calib_delay_sec,
+        rest_hold_sec=args.rest_hold_sec,
+        rest_interp_sec=args.rest_interp_sec,
     )
