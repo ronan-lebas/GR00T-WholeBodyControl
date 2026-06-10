@@ -28,13 +28,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Build vr_haptic_msgs and ros_tcp_endpoint in a catkin workspace.
 WORKDIR /catkin_ws
 COPY third_party/ROS-TCP-Endpoint/ src/ros_tcp_endpoint/
-# The copy of vr_haptic_msgs vendored inside ROS-TCP-Endpoint ships ament (ROS2)
-# build files that won't build under catkin. Drop it and reassemble a catkin
-# package from the .msg files plus the catkin build files in quest_relay/.
-RUN rm -rf src/ros_tcp_endpoint/vr_haptic_msgs
-COPY third_party/ROS-TCP-Endpoint/vr_haptic_msgs/msg/ src/vr_haptic_msgs/msg/
-COPY gear_sonic_deploy/docker/quest_relay/vr_haptic_msgs_ros1/package.xml src/vr_haptic_msgs/package.xml
-COPY gear_sonic_deploy/docker/quest_relay/vr_haptic_msgs_ros1/CMakeLists.txt src/vr_haptic_msgs/CMakeLists.txt
+# vr_haptic_msgs is fully vendored in quest_relay (msg definitions + catkin build files).
+COPY gear_sonic_deploy/docker/quest_relay/vr_haptic_msgs_ros1/ src/vr_haptic_msgs/
 # Container launch variant without the adb_reverse node (Quest connects over TCP).
 COPY gear_sonic_deploy/docker/quest_relay/endpoint_no_adb.launch src/ros_tcp_endpoint/launch/endpoint_no_adb.launch
 
