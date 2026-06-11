@@ -155,6 +155,53 @@ def _slerp(q0: np.ndarray, q1: np.ndarray, alpha: float) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Low-pass filter on the 3-point teleop command
+# ---------------------------------------------------------------------------
+
+
+class PoseLowPass:
+    """Exponential moving average on the VR 3-point targets (pos + quat).
+
+    Smooths the per-row wrist/head targets to take the edge off Quest tracking
+    jitter, complementing the existing low-passes on the head locomotion
+    velocity and in the finger retargeter.
+
+    Frame-rate independent: the blend factor is derived from the measured loop
+    dt and a time constant ``tau`` (alpha = dt / (tau + dt)), the same scheme
+    used for the head velocity filter. ``tau <= 0`` disables filtering. The 3
+    position rows are lerped; the 3 orientation rows are slerped (shortest
+    path). State persists across calls; ``reset()`` drops it so the next frame
+    re-seeds the filter (call it after calibration / pause to avoid a lagged
+    jump from stale state).
+    """
+
+    def __init__(self, tau: float):
+        self.tau = max(0.0, float(tau))
+        self._pos: np.ndarray | None = None
+        self._quat: np.ndarray | None = None
+
+    def reset(self) -> None:
+        self._pos = None
+        self._quat = None
+
+    def __call__(
+        self, pos: np.ndarray, quat: np.ndarray, dt: float
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if self.tau <= 0.0 or dt <= 0.0:
+            return pos, quat
+        if self._pos is None or self._quat is None:
+            self._pos = pos.copy()
+            self._quat = quat.copy()
+            return pos.copy(), quat.copy()
+        alpha = dt / (self.tau + dt)
+        self._pos = (1.0 - alpha) * self._pos + alpha * pos
+        self._quat = np.concatenate(
+            [_slerp(self._quat[4 * i : 4 * i + 4], quat[4 * i : 4 * i + 4], alpha) for i in range(3)]
+        )
+        return self._pos.copy(), self._quat.copy()
+
+
+# ---------------------------------------------------------------------------
 # Robot FK reference (rest pose of the wrist links in the root frame)
 # ---------------------------------------------------------------------------
 
@@ -828,6 +875,7 @@ class QuestManager:
         self.args = args
         self.robot_ref = RobotRestReference()
         self.tracker = QuestThreePointTracker(self.robot_ref, pos_scale=args.pos_scale)
+        self.pose_filter = PoseLowPass(args.smooth_tau)
         self.retargeter = FingerRetargeting(force_np=args.np_retarget)
         self.feedback = RobotFeedback(args.feedback_host, args.feedback_port)
 
@@ -850,6 +898,8 @@ class QuestManager:
         self.stream_mode = STREAM_MODE_OFF
         self.finger_tracking = True
         self.teleop_paused = False
+        # monotonic time of the previous filtered compute(), for the pose filter dt
+        self._last_compute_t: float | None = None
         # Locomotion (head-position walking). `_walking` adds hysteresis around
         # the speed deadband so the robot does not flap between IDLE and walk.
         self.walk_mode = _WALK_MODES[args.walk_mode]
@@ -902,6 +952,8 @@ class QuestManager:
                     "recalibrating against the default rest pose instead"
                 )
         self.tracker.calibrate(frame, body_q_29=body_q)
+        self.pose_filter.reset()
+        self._last_compute_t = None
         if kind == "start":
             self.yaw_offset = 0.0
             self.last_facing_yaw = 0.0
@@ -935,6 +987,8 @@ class QuestManager:
             if self.teleop_paused:
                 self.frozen_pos = None  # captured from the next computed targets
                 self.resume_ramp_start = None
+                self.pose_filter.reset()  # re-seed from the live pose on resume
+                self._last_compute_t = None
                 print("[QuestManager] Teleop PAUSED — robot frozen at last pose")
             else:
                 self.resume_ramp_start = time.monotonic()
@@ -1079,6 +1133,9 @@ class QuestManager:
 
                 if self.stream_mode == STREAM_MODE_PLANNER_VR_3PT and frame is not None:
                     pos, quat, yaw_rel, head_vel = self.tracker.compute(frame)
+                    dt = 0.0 if self._last_compute_t is None else t_start - self._last_compute_t
+                    self._last_compute_t = t_start
+                    pos, quat = self.pose_filter(pos, quat, dt)
                     hands = self._compute_hands(frame)
                     pos, quat, facing_yaw, hands = self._apply_pause_resume(
                         pos, quat, yaw_rel, hands
@@ -1164,6 +1221,13 @@ def main() -> None:
         type=float,
         default=0.8,
         help="scale on operator arm reach (orientation unaffected)",
+    )
+    parser.add_argument(
+        "--smooth-tau",
+        type=float,
+        default=0.05,
+        help="EMA time constant (s) for the 3-point wrist/head pos+quat targets; "
+        "higher = smoother but laggier, 0 disables",
     )
     parser.add_argument(
         "--calib-delay-sec",
