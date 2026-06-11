@@ -26,10 +26,18 @@ Output ("planner" topic, robot ROOT frame, X-forward, Y-left, Z-up):
     vr_orientation[12] scalar-first quaternions for the same three rows.
     left/right_hand_joints[7]  BrainCo: 6 normalized motors [0=open, 1=closed]
                        + one 0.0 padding slot.
+    mode + movement[3] locomotion: the operator's head planar velocity (in the
+                       fixed calibration frame, same frame as facing) drives a
+                       SLOW_WALK/WALK command so the robot walks when the
+                       operator walks. Disable with --disable-walk (robot then
+                       only turns in place via facing).
 
 Usage:
     # Live Quest (relay container must be running, see run_quest_relay.py)
     python quest_manager_thread_server.py
+
+    # Turn in place only, no base translation
+    python quest_manager_thread_server.py --disable-walk
 
     # Replay a recorded trajectory (record_quest_data.py NPZ format)
     python quest_manager_thread_server.py --replay data/quest/traj_xxx.npz
@@ -89,7 +97,14 @@ except ImportError:
 # pico_manager_thread_server.StreamMode / mock_quest_streamer.py).
 STREAM_MODE_OFF = 0
 STREAM_MODE_PLANNER_VR_3PT = 5
+
+# LocomotionMode values (see localmotion_kplanner.hpp). IDLE keeps the robot
+# stationary (only turning via the facing command); SLOW_WALK / WALK translate
+# the base along the planner movement_direction.
 LOCOMOTION_IDLE = 0
+LOCOMOTION_SLOW_WALK = 1
+LOCOMOTION_WALK = 2
+_WALK_MODES = {"slow": LOCOMOTION_SLOW_WALK, "walk": LOCOMOTION_WALK}
 
 # Wire format always carries 7 hand values; BrainCo uses the first 6
 # (normalized [0=open, 1=closed]) and the 7th slot is padding.
@@ -282,7 +297,20 @@ class QuestThreePointTracker:
     Head row: identity orientation — the torso target stays aligned with the
     root, which itself rotates via the ``facing`` command; position via the
     fixed kinematic chain torso + [0, 0, 0.35].
+
+    Locomotion: the operator's head also drives base translation. compute()
+    returns the head's planar velocity expressed in the fixed R0 frame (the
+    same frame as ``facing``), low-pass filtered and computed from sensor
+    timestamps so it is independent of this loop's polling rate. The manager
+    turns that velocity into a planner movement_direction + speed so the robot
+    walks when the operator walks. (The head ROW of vr_position stays fixed;
+    walking is a separate planner command, not a moving torso target.)
     """
+
+    # Head-velocity low-pass time constant (s) and the staleness window after
+    # which a frozen / dropped Quest stream decays the velocity back to zero.
+    _VEL_TAU = 0.25
+    _VEL_STALE_SEC = 0.3
 
     _WRIST_OFFSET = {
         "left": np.asarray(G1_KEY_FRAME_OFFSETS["left_wrist"], dtype=np.float64),
@@ -290,7 +318,7 @@ class QuestThreePointTracker:
     }
     _HEAD_OFFSET = np.asarray(G1_KEY_FRAME_OFFSETS["torso"], dtype=np.float64)
 
-    def __init__(self, robot_ref: RobotRestReference, pos_scale: float = 1.0):
+    def __init__(self, robot_ref: RobotRestReference, pos_scale: float = 0.8):
         self._robot_ref = robot_ref
         self.pos_scale = float(pos_scale)
         self._calibrated = False
@@ -302,6 +330,11 @@ class QuestThreePointTracker:
         self._link_ref: dict[str, np.ndarray] = {}
         self._rot_ref: dict[str, sRot] = {}
         self._torso_pos = np.zeros(3)
+        # Head planar velocity tracking (R0 frame), reset on each calibration.
+        self._prev_head_pos: np.ndarray | None = None
+        self._prev_ts: float | None = None
+        self._head_vel = np.zeros(3)
+        self._last_vel_wall = 0.0
 
     @property
     def is_calibrated(self) -> bool:
@@ -321,6 +354,10 @@ class QuestThreePointTracker:
             self._w_cal_inv[side] = _rot(frame[f"{side}_wrist_quat"]).inv()
             self._link_ref[side], self._rot_ref[side] = fk[side]
         self._torso_pos = fk["torso_pos"]
+        self._prev_head_pos = None
+        self._prev_ts = None
+        self._head_vel = np.zeros(3)
+        self._last_vel_wall = time.monotonic()
         self._calibrated = True
 
         src = "default rest pose" if body_q_29 is None else "measured robot joints"
@@ -332,12 +369,49 @@ class QuestThreePointTracker:
             v = self._v_cal[side]
             print(f"  {side}: head->wrist cal vector [{v[0]:+.3f}, {v[1]:+.3f}, {v[2]:+.3f}]")
 
-    def compute(self, frame: dict) -> tuple[np.ndarray, np.ndarray, float]:
-        """One Quest frame -> (vr_position (9,), vr_orientation (12,), yaw_rel).
+    def _update_head_velocity(self, head_pos: np.ndarray, ts: float) -> None:
+        """Low-pass head planar velocity in the fixed R0 frame.
+
+        Velocity is differenced over sensor timestamps (not loop time), so a
+        repeated frame (sample-and-hold relay, paused replay) contributes no
+        spurious motion; if no fresh frame arrives within ``_VEL_STALE_SEC``
+        the estimate decays to zero so the robot does not keep walking.
+        """
+        now = time.monotonic()
+        if self._prev_head_pos is None or self._prev_ts is None:
+            self._prev_head_pos = head_pos
+            self._prev_ts = ts
+            self._last_vel_wall = now
+            return
+        dt = ts - self._prev_ts
+        if dt < -1e-4:
+            # Sensor time jumped backwards (replay looped or stepped back):
+            # re-anchor on this frame instead of freezing on a stale prev
+            # timestamp or differencing across the discontinuity.
+            self._prev_head_pos = head_pos
+            self._prev_ts = ts
+            self._last_vel_wall = now
+            return
+        if dt > 1e-4:
+            raw = self._r0_inv.apply(head_pos - self._prev_head_pos) / dt
+            raw[2] = 0.0
+            alpha = dt / (self._VEL_TAU + dt)
+            self._head_vel = (1.0 - alpha) * self._head_vel + alpha * raw
+            self._prev_head_pos = head_pos
+            self._prev_ts = ts
+            self._last_vel_wall = now
+        elif now - self._last_vel_wall > self._VEL_STALE_SEC:
+            self._head_vel = np.zeros(3)
+
+    def compute(self, frame: dict) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+        """One Quest frame -> (vr_position (9,), vr_orientation (12,), yaw_rel,
+        head_vel (3,)).
 
         Positions/orientations are body-relative targets in the robot root
         frame; yaw_rel is the operator heading change since calibration and
-        must be sent as the planner ``facing`` direction to turn the robot.
+        must be sent as the planner ``facing`` direction to turn the robot;
+        head_vel is the operator's planar head velocity (m/s, z=0) in the fixed
+        R0 frame, used to drive base locomotion.
         """
         if not self._calibrated:
             raise RuntimeError("compute() called before calibrate()")
@@ -348,6 +422,7 @@ class QuestThreePointTracker:
         pos = np.zeros((3, 3), dtype=np.float64)
         quat = np.zeros((3, 4), dtype=np.float64)
         head_pos = np.asarray(frame["head_pos"], dtype=np.float64)
+        self._update_head_velocity(head_pos, float(frame["timestamp"]))
 
         for i, side in enumerate(_SIDES):
             wrist_pos = np.asarray(frame[f"{side}_wrist_pos"], dtype=np.float64)
@@ -364,7 +439,7 @@ class QuestThreePointTracker:
         pos[2] = self._torso_pos + self._HEAD_OFFSET
         quat[2] = np.array([1.0, 0.0, 0.0, 0.0])
 
-        return pos.flatten(), quat.flatten(), yaw_rel
+        return pos.flatten(), quat.flatten(), yaw_rel, self._head_vel.copy()
 
 
 # ---------------------------------------------------------------------------
@@ -775,6 +850,10 @@ class QuestManager:
         self.stream_mode = STREAM_MODE_OFF
         self.finger_tracking = True
         self.teleop_paused = False
+        # Locomotion (head-position walking). `_walking` adds hysteresis around
+        # the speed deadband so the robot does not flap between IDLE and walk.
+        self.walk_mode = _WALK_MODES[args.walk_mode]
+        self._walking = False
         self.resume_ramp_start: float | None = None
         # Countdown state: (deadline, kind) with kind in {"start", "recalib"}
         self.pending_calib: tuple[float, str] | None = None
@@ -941,6 +1020,37 @@ class QuestManager:
                 )
         return pos, quat, facing_yaw, hands
 
+    def _walk_command(self, head_vel: np.ndarray) -> tuple[int, list[float], float]:
+        """Map operator head planar velocity (R0 frame) to a planner movement.
+
+        Returns (locomotion_mode, movement_direction[3], speed). While walking
+        is disabled or teleop is paused — and below the speed deadband — this
+        is IDLE with a zero movement vector, i.e. exactly the previous
+        stationary behavior (the robot still turns via the facing command).
+        """
+        if self.args.disable_walk or self.teleop_paused:
+            self._walking = False
+            return LOCOMOTION_IDLE, [0.0, 0.0, 0.0], -1.0
+
+        speed = float(np.hypot(head_vel[0], head_vel[1]))
+        # Hysteresis: start above the deadband, keep going until well below it.
+        if self._walking:
+            self._walking = speed >= 0.5 * self.args.walk_deadband
+        else:
+            self._walking = speed >= self.args.walk_deadband
+        if not self._walking:
+            return LOCOMOTION_IDLE, [0.0, 0.0, 0.0], -1.0
+
+        direction = np.asarray(head_vel[:2], dtype=np.float64) / max(speed, 1e-6)
+        cmd_speed = float(
+            np.clip(
+                speed * self.args.walk_speed_scale,
+                self.args.walk_min_speed,
+                self.args.walk_max_speed,
+            )
+        )
+        return self.walk_mode, [float(direction[0]), float(direction[1]), 0.0], cmd_speed
+
     # -- main loop ------------------------------------------------------------------
 
     def run(self) -> None:
@@ -968,18 +1078,19 @@ class QuestManager:
                 self._update_countdown(frame)
 
                 if self.stream_mode == STREAM_MODE_PLANNER_VR_3PT and frame is not None:
-                    pos, quat, yaw_rel = self.tracker.compute(frame)
+                    pos, quat, yaw_rel, head_vel = self.tracker.compute(frame)
                     hands = self._compute_hands(frame)
                     pos, quat, facing_yaw, hands = self._apply_pause_resume(
                         pos, quat, yaw_rel, hands
                     )
                     self.last_facing_yaw = facing_yaw
+                    mode, movement, speed = self._walk_command(head_vel)
                     self.pub.send(
                         build_planner_message(
-                            mode=LOCOMOTION_IDLE,
-                            movement=[0.0, 0.0, 0.0],
+                            mode=mode,
+                            movement=movement,
                             facing=[float(np.cos(facing_yaw)), float(np.sin(facing_yaw)), 0.0],
-                            speed=-1.0,
+                            speed=speed,
                             height=-1.0,
                             left_hand_position=hands["left"],
                             right_hand_position=hands["right"],
@@ -1008,10 +1119,16 @@ class QuestManager:
                         else ("PAUSED" if self.teleop_paused else "VR_3PT")
                     )
                     data = "ok" if frame is not None else "waiting"
+                    walk = (
+                        "off"
+                        if self.args.disable_walk
+                        else ("walk" if self._walking else "idle")
+                    )
                     print(
                         f"[QuestManager] {state} | quest={data} | "
                         f"{sent / (now - last_report):.1f} planner msg/s | "
-                        f"fingers={'on' if self.finger_tracking else 'off'}"
+                        f"fingers={'on' if self.finger_tracking else 'off'} | "
+                        f"walk={walk}"
                     )
                     last_report = now
                     sent = 0
@@ -1045,7 +1162,7 @@ def main() -> None:
     parser.add_argument(
         "--pos-scale",
         type=float,
-        default=1.0,
+        default=0.8,
         help="scale on operator arm reach (orientation unaffected)",
     )
     parser.add_argument(
@@ -1059,6 +1176,42 @@ def main() -> None:
         type=float,
         default=1.0,
         help="ease-in duration from frozen to live pose when resuming after pause",
+    )
+    parser.add_argument(
+        "--disable-walk",
+        action="store_true",
+        help="disable head-position walking; robot only turns in place (facing) "
+        "and never translates, reproducing the pre-walk behavior",
+    )
+    parser.add_argument(
+        "--walk-mode",
+        choices=tuple(_WALK_MODES),
+        default="slow",
+        help="locomotion mode used while the operator walks",
+    )
+    parser.add_argument(
+        "--walk-deadband",
+        type=float,
+        default=0.08,
+        help="operator head speed (m/s) above which a walk command is sent",
+    )
+    parser.add_argument(
+        "--walk-speed-scale",
+        type=float,
+        default=1.0,
+        help="scale from operator head speed to commanded robot walk speed",
+    )
+    parser.add_argument(
+        "--walk-min-speed",
+        type=float,
+        default=0.2,
+        help="lower clamp on commanded walk speed (m/s) once walking",
+    )
+    parser.add_argument(
+        "--walk-max-speed",
+        type=float,
+        default=0.8,
+        help="upper clamp on commanded walk speed (m/s)",
     )
     parser.add_argument(
         "--np-retarget",
