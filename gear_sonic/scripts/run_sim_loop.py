@@ -19,7 +19,7 @@ ArgsConfig = SimLoopConfig
 
 # Box parameters — edit these to change the box in the simulation
 BOX_SIZE = (0.2, 0.2, 0.2)   # half-extents in meters (x, y, z)
-BOX_POS  = (0.5, 0.0, 0.1)   # position in meters (x, y, z); z = half-height to rest on floor
+BOX_POS  = (1.5, 0.0, 0.1)   # position in meters (x, y, z); z = half-height to rest on floor
 BOX_MASS = 1.0                # mass in kg
 
 
