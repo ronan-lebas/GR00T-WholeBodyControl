@@ -165,5 +165,6 @@ gear_sonic/
 
 This repo is a fork from the NVIDIA repo.
 We are working and focusing exclusively on gear_sonic and gear_sonic_deploy, do not look at all at motionbricks or decoupleb_wbc.
-Originally, only the dex3 hands were supported. The brainco hands were added in a PR.  
-Now, we are focusing exclusively on the brainco hands version with the Meta quest teleoperation (includes teleoperation with data from the quest).
+Originally, only the dex3 hands were supported. The brainco hands were added in a PR, as well as teleoperation using the Meta Quest.  
+Now, we are focusing exclusively on the brainco hands version with the Meta quest teleoperation.  
+Future directions for work include object pose estimation.  
