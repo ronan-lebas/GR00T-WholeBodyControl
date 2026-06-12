@@ -28,11 +28,17 @@ class ImagePublishProcess:
         zmq_port: int = 5555,
         start_method: str = "spawn",
         verbose: bool = False,
+        extra_buffers: Dict[str, Dict[str, Any]] | None = None,
+        fp_meta: Dict[str, Any] | None = None,
     ):
         self.camera_configs = camera_configs
         self.image_dt = image_dt
         self.zmq_port = zmq_port
         self.verbose = verbose
+        # Non-RGB streams (e.g. depth/seg) keyed by name -> {"shape", "dtype"}.
+        # These bypass the uint8/255 scaling and are PNG-encoded losslessly on the wire.
+        self.extra_buffers = extra_buffers or {}
+        self.fp_meta = fp_meta
         self.shared_memory_blocks = {}
         self.shared_memory_info = {}
         self.process = None
@@ -61,6 +67,20 @@ class ImagePublishProcess:
                 "dtype": np.uint8,
             }
 
+        for buffer_name, spec in self.extra_buffers.items():
+            shape = tuple(spec["shape"])
+            dtype = np.dtype(spec["dtype"])
+            size = int(np.prod(shape)) * dtype.itemsize
+
+            shm = shared_memory.SharedMemory(create=True, size=size)
+            self.shared_memory_blocks[buffer_name] = shm
+            self.shared_memory_info[buffer_name] = {
+                "name": shm.name,
+                "size": size,
+                "shape": shape,
+                "dtype": dtype,
+            }
+
     def start_process(self):
         """Start the image publishing subprocess"""
         self.process = self.mp_context.Process(
@@ -72,6 +92,8 @@ class ImagePublishProcess:
                 self.stop_event,
                 self.data_ready_event,
                 self.verbose,
+                set(self.extra_buffers.keys()),
+                self.fp_meta,
             ),
         )
         self.process.start()
@@ -95,6 +117,18 @@ class ImagePublishProcess:
                 )
 
                 np.copyto(shared_array, image)
+                images_updated += 1
+
+        # Extra (non-RGB) streams already carry the correct dtype/shape; copy verbatim.
+        for buffer_name in self.extra_buffers.keys():
+            if buffer_name in render_caches:
+                info = self.shared_memory_info[buffer_name]
+                shared_array = np.ndarray(
+                    info["shape"],
+                    dtype=info["dtype"],
+                    buffer=self.shared_memory_blocks[buffer_name].buf,
+                )
+                np.copyto(shared_array, render_caches[buffer_name].astype(info["dtype"]))
                 images_updated += 1
 
         if images_updated > 0:
@@ -124,7 +158,14 @@ class ImagePublishProcess:
 
     @staticmethod
     def _image_publish_worker(
-        shared_memory_info, image_dt, zmq_port, stop_event, data_ready_event, verbose
+        shared_memory_info,
+        image_dt,
+        zmq_port,
+        stop_event,
+        data_ready_event,
+        verbose,
+        extra_buffer_names=frozenset(),
+        fp_meta=None,
     ):
         """Worker function that runs in the subprocess"""
         try:
@@ -179,8 +220,15 @@ class ImagePublishProcess:
 
                         serialized_data = image_msg.serialize()
 
+                        # Legacy top-level duplicates (RGB only); depth/seg are uint16/mask
+                        # and cannot be JPEG-encoded.
                         for camera_name, image_copy in image_copies.items():
+                            if camera_name in extra_buffer_names:
+                                continue
                             serialized_data[f"{camera_name}"] = ImageUtils.encode_image(image_copy)
+
+                        if fp_meta is not None:
+                            serialized_data["fp_meta"] = fp_meta
 
                         sensor_server.send_message(serialized_data)
 

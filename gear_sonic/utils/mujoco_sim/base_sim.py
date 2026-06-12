@@ -61,6 +61,15 @@ class DefaultEnv:
         self.unitree_bridge = None
         self.onscreen = onscreen
 
+        # FoundationPose export: render ego-view depth + box segmentation alongside RGB.
+        self.render_depth_seg = self.config.get("render_depth_seg", False)
+        # Background/invalid depth (in meters) above this is zeroed out before saving.
+        self.fp_depth_max_m = 10.0
+        self.fp_cam_id = -1
+        self.fp_box_geom_id = -1
+        self.fp_cam_K = None
+        self.fp_box_half_extents = None
+
         self.init_scene()
         self.last_reward = 0
 
@@ -79,12 +88,29 @@ class DefaultEnv:
             )
             return
         start_method = self.config.get("MP_START_METHOD", "spawn")
+
+        extra_buffers = {}
+        fp_meta = None
+        if self.render_depth_seg and self.fp_cam_K is not None:
+            ego_cfg = self.camera_configs["ego_view"]
+            h, w = ego_cfg["height"], ego_cfg["width"]
+            extra_buffers = {
+                "ego_view_depth": {"shape": (h, w), "dtype": np.uint16},
+                "ego_view_seg": {"shape": (h, w), "dtype": np.uint8},
+            }
+            fp_meta = {
+                "cam_K": self.fp_cam_K.flatten().tolist(),
+                "box_half_extents": self.fp_box_half_extents,
+            }
+
         self.image_publish_process = ImagePublishProcess(
             camera_configs=self.camera_configs,
             image_dt=self.image_dt,
             zmq_port=camera_port,
             start_method=start_method,
             verbose=self.config.get("verbose", False),
+            extra_buffers=extra_buffers,
+            fp_meta=fp_meta,
         )
         self.image_publish_process.start_process()
 
@@ -190,6 +216,9 @@ class DefaultEnv:
         self.torso_index = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
         self.root_body = "pelvis"
         self.root_body_id = self.mj_model.body(self.root_body).id
+
+        if self.render_depth_seg:
+            self._setup_foundation_pose(box_config)
 
         self.joint_class_map = self._get_dof_indices_by_class()
 
@@ -366,6 +395,62 @@ class DefaultEnv:
                 self.mj_model, height=camera_config["height"], width=camera_config["width"]
             )
             self.renderers[camera_name] = renderer
+
+    def _setup_foundation_pose(self, box_config: dict | None):
+        """Cache the ego-camera intrinsics and box geom id for FoundationPose export."""
+        ego_cfg = self.camera_configs.get("ego_view")
+        if ego_cfg is None:
+            print("[FoundationPose] No ego_view camera configured; depth/seg export disabled")
+            self.render_depth_seg = False
+            return
+        if box_config is None:
+            print("[FoundationPose] No box in scene; depth/seg export disabled")
+            self.render_depth_seg = False
+            return
+
+        cam_name = ego_cfg.get("mjcf_name", "ego_view")
+        self.fp_cam_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_CAMERA, cam_name)
+        box_body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "box")
+        self.fp_box_geom_id = int(self.mj_model.body_geomadr[box_body_id])
+
+        # Pinhole intrinsics from MuJoCo's vertical FOV (square pixels, principal point centered).
+        height = ego_cfg["height"]
+        width = ego_cfg["width"]
+        fovy_rad = np.deg2rad(float(self.mj_model.cam_fovy[self.fp_cam_id]))
+        fy = (height / 2.0) / np.tan(fovy_rad / 2.0)
+        fx = fy
+        cx = width / 2.0
+        cy = height / 2.0
+        self.fp_cam_K = np.array(
+            [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64
+        )
+        self.fp_box_half_extents = [float(s) for s in box_config["size"]]
+        print(
+            f"[FoundationPose] ego depth/seg enabled (cam '{cam_name}', box geom "
+            f"{self.fp_box_geom_id}, fovy {np.rad2deg(fovy_rad):.1f} deg)"
+        )
+
+    def _render_ego_depth_seg(self, renderer) -> tuple[np.ndarray, np.ndarray]:
+        """Render ego-view depth (uint16 mm) and box mask (uint8) reusing the current scene.
+
+        ``renderer.update_scene`` must already have been called for the ego camera.
+        """
+        renderer.enable_depth_rendering()
+        depth_m = renderer.render()
+        renderer.disable_depth_rendering()
+
+        renderer.enable_segmentation_rendering()
+        seg = renderer.render()
+        renderer.disable_segmentation_rendering()
+
+        invalid = (depth_m <= 0.0) | (depth_m > self.fp_depth_max_m) | ~np.isfinite(depth_m)
+        depth_mm = np.where(invalid, 0.0, depth_m * 1000.0)
+        depth_mm = np.clip(depth_mm, 0, 65535).astype(np.uint16)
+
+        # Segmentation buffer is (H, W, 2): [..., 0] = object id, [..., 1] = object type.
+        is_box = (seg[..., 1] == mujoco.mjtObj.mjOBJ_GEOM) & (seg[..., 0] == self.fp_box_geom_id)
+        mask = (is_box.astype(np.uint8)) * 255
+        return depth_mm, mask
 
     def compute_body_torques(self) -> np.ndarray:
         # PD control: tau = tau_ff + kp * (q_des - q) + kd * (dq_des - dq)
@@ -687,6 +772,11 @@ class DefaultEnv:
             else:
                 renderer.update_scene(self.mj_data, camera=camera_name)
             render_caches[camera_name + "_image"] = renderer.render()
+
+            if self.render_depth_seg and camera_name == "ego_view":
+                depth_mm, mask = self._render_ego_depth_seg(renderer)
+                render_caches["ego_view_depth"] = depth_mm
+                render_caches["ego_view_seg"] = mask
 
         if self.image_publish_process is not None:
             self.image_publish_process.update_shared_memory(render_caches)

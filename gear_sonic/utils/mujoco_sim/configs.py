@@ -349,3 +349,6 @@ class SimLoopConfig(BaseConfig):
 
     box: bool = False
     """Add a box object to the simulation scene"""
+
+    render_depth_seg: bool = False
+    """Render ego-view depth + box segmentation and publish them (for FoundationPose export)."""

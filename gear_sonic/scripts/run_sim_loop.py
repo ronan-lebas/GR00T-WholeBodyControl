@@ -50,6 +50,14 @@ def main(config: ArgsConfig):
             "mass": BOX_MASS,
         }
 
+    if config.render_depth_seg:
+        assert config.box, "render_depth_seg requires --box (the segmented object is the box)"
+        assert config.enable_image_publish and config.enable_offscreen, (
+            "render_depth_seg requires --enable_image_publish and --enable_offscreen "
+            "(depth/seg are rendered offscreen and shipped over the camera stream)"
+        )
+        wbc_config["render_depth_seg"] = True
+
     if config.enable_image_publish:
         assert (
             config.enable_offscreen
