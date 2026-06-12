@@ -222,3 +222,5 @@ sonic_release/
 
 
 third_party/Revo_xml
+*teleop.gif
+traj_*_*_*.gif
