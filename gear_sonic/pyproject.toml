@@ -49,6 +49,8 @@ sim = [
     "msgpack",
     "msgpack-numpy",
     "opencv-python",
+    "scipy",
+    "pyarrow",
 ]
 # Data collection: Sonic VLA data exporter with LeRobot dataset output
 # Usage: pip install -e "gear_sonic[data_collection]"
