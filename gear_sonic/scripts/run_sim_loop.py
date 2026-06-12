@@ -57,6 +57,8 @@ def main(config: ArgsConfig):
             "(depth/seg are rendered offscreen and shipped over the camera stream)"
         )
         wbc_config["render_depth_seg"] = True
+        wbc_config["fp_render_scale"] = config.fp_render_scale
+        wbc_config["fp_render_every"] = config.fp_render_every
 
     if config.enable_image_publish:
         assert (

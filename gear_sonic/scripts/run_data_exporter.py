@@ -243,8 +243,11 @@ class GrootDataCollector:
         self._keyboard_listener = ZMQKeyboardSubscriber()
 
         # FoundationPose export: active only when the sim streams ego depth/seg
-        # (i.e. run_sim_loop launched with --render-depth-seg).
+        # (i.e. run_sim_loop launched with --render-depth-seg). Depth/seg arrive at a
+        # reduced rate, so track whether the stream exists at all and de-dupe by timestamp.
         self._fp_writer = FoundationPoseWriter(self.data_exporter.meta.root)
+        self._fp_enabled = False
+        self._fp_last_written_ts = None
 
         self._image_subscriber = ComposedCameraClientSensor(server_ip=camera_host, port=camera_port)
 
@@ -329,8 +332,9 @@ class GrootDataCollector:
             self._episode_state.change_state()
             if self._episode_state.get_state() == self._episode_state.RECORDING:
                 self._initial_yaw = None
-                if self._fp_active():
+                if self._fp_enabled:
                     self._fp_writer.start_episode(self.current_episode_index)
+                    self._fp_last_written_ts = None
                 self._print_and_say(
                     f"Started recording {self.current_episode_index}", blocking=False
                 )
@@ -535,18 +539,24 @@ class GrootDataCollector:
             if parts:
                 print(f"[Latency] {', '.join(parts)}")
 
-    def _fp_active(self) -> bool:
-        """True when the sim is streaming ego depth/seg (--render-depth-seg)."""
-        if self.latest_image_msg is None:
-            return False
-        return "ego_view_depth" in self.latest_image_msg.get("images", {})
-
     def _write_foundation_pose_frame(self) -> None:
-        """Save one FoundationPose frame (rgb+depth, plus mask/cam_K on frame 0)."""
+        """Save one FoundationPose frame (rgb+depth, plus mask/cam_K on frame 0).
+
+        Self-guards: only writes when the current message carries a *fresh* depth frame
+        (depth/seg arrive at a reduced rate, and the loop polls faster than they arrive).
+        """
+        if self.latest_image_msg is None:
+            return
         images = self.latest_image_msg["images"]
-        fp_meta = self.latest_image_msg.get("fp_meta") or {}
         if "ego_view_depth" not in images or "ego_view_seg" not in images:
             return
+
+        ts = self.latest_image_msg.get("timestamps", {}).get("ego_view")
+        if ts is not None and ts == self._fp_last_written_ts:
+            return
+        self._fp_last_written_ts = ts
+
+        fp_meta = self.latest_image_msg.get("fp_meta") or {}
         self._fp_writer.write_frame(
             rgb=images["ego_view"],
             depth=images["ego_view_depth"],
@@ -646,7 +656,7 @@ class GrootDataCollector:
 
         self.data_exporter.add_frame(frame_data)
 
-        if self._fp_active():
+        if self._fp_enabled:
             self._write_foundation_pose_frame()
 
         return self._finalize_frame(t_start)
@@ -911,6 +921,8 @@ class GrootDataCollector:
                         img_msg = self._image_subscriber.read()
                         if img_msg is not None:
                             self.latest_image_msg = img_msg
+                            if "ego_view_depth" in img_msg.get("images", {}):
+                                self._fp_enabled = True
 
                     with self.telemetry.timer("add_frame"):
                         self._add_data_frame()

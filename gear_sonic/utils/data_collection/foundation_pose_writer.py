@@ -48,6 +48,13 @@ class FoundationPoseWriter:
         if self._episode_dir is None:
             return
 
+        # Depth/seg are rendered at reduced resolution; upscale (nearest) to match RGB.
+        h, w = rgb.shape[:2]
+        if depth.shape[:2] != (h, w):
+            depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_NEAREST)
+        if mask.shape[:2] != (h, w):
+            mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+
         if self._frame == 0:
             K = np.asarray(cam_K, dtype=np.float64).reshape(3, 3)
             np.savetxt(self._episode_dir / "cam_K.txt", K)

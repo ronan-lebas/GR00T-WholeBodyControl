@@ -53,6 +53,11 @@ class ImagePublishProcess:
         self.stop_event.clear()
         self.data_ready_event.clear()
 
+        # Sequence counter bumped each time extra (depth/seg) buffers are freshly written.
+        # Lets the worker publish them only on fresh frames (they render at a reduced rate),
+        # so stale depth is never paired with fresh RGB.
+        self.fp_seq = self.mp_context.Value("L", 0) if self.extra_buffers else None
+
         for camera_name, camera_config in camera_configs.items():
             height = camera_config["height"]
             width = camera_config["width"]
@@ -94,6 +99,7 @@ class ImagePublishProcess:
                 self.verbose,
                 set(self.extra_buffers.keys()),
                 self.fp_meta,
+                self.fp_seq,
             ),
         )
         self.process.start()
@@ -120,6 +126,7 @@ class ImagePublishProcess:
                 images_updated += 1
 
         # Extra (non-RGB) streams already carry the correct dtype/shape; copy verbatim.
+        extras_updated = False
         for buffer_name in self.extra_buffers.keys():
             if buffer_name in render_caches:
                 info = self.shared_memory_info[buffer_name]
@@ -130,6 +137,11 @@ class ImagePublishProcess:
                 )
                 np.copyto(shared_array, render_caches[buffer_name].astype(info["dtype"]))
                 images_updated += 1
+                extras_updated = True
+
+        if extras_updated and self.fp_seq is not None:
+            with self.fp_seq.get_lock():
+                self.fp_seq.value += 1
 
         if images_updated > 0:
             self.data_ready_event.set()
@@ -166,8 +178,10 @@ class ImagePublishProcess:
         verbose,
         extra_buffer_names=frozenset(),
         fp_meta=None,
+        fp_seq=None,
     ):
         """Worker function that runs in the subprocess"""
+        last_fp_seq = -1
         try:
             sensor_server = SensorServer()
             sensor_server.start_server(port=zmq_port)
@@ -207,6 +221,16 @@ class ImagePublishProcess:
                         from gear_sonic.utils.mujoco_sim.sensor_server import ImageUtils
 
                         image_copies = {name: arr.copy() for name, arr in shared_arrays.items()}
+
+                        # Only ship depth/seg when freshly rendered (they update at a reduced
+                        # rate); otherwise drop them so stale depth never pairs with fresh RGB.
+                        if extra_buffer_names:
+                            seq = fp_seq.value if fp_seq is not None else 0
+                            if seq == last_fp_seq:
+                                for name in extra_buffer_names:
+                                    image_copies.pop(name, None)
+                            else:
+                                last_fp_seq = seq
 
                         message_dict = {
                             "images": image_copies,

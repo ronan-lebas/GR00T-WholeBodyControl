@@ -352,3 +352,11 @@ class SimLoopConfig(BaseConfig):
 
     render_depth_seg: bool = False
     """Render ego-view depth + box segmentation and publish them (for FoundationPose export)."""
+
+    fp_render_scale: float = 0.5
+    """Resolution scale for depth/seg rendering relative to the ego camera (cuts render cost;
+    the collector upscales back to the RGB resolution). 1.0 = full res."""
+
+    fp_render_every: int = 2
+    """Render depth/seg only every Nth image frame (1 = every frame). Lowers the FoundationPose
+    sequence fps to reduce per-frame render cost."""
