@@ -12,9 +12,12 @@ Data sources for a recording folder ``outputs/<ts>/``:
     (``foundation_pose/pose_estimation.py``).
   - object mesh  : ``foundation_pose_data/box.obj``.
 
-The robot base is held at the model's default standing pose (the recording stores no base
-world position). The object is placed relative to the **live head_camera FK pose**, so the
-hand/object geometry stays consistent regardless of the fixed base.
+The robot base keeps the model's default standing *position* (the recording stores no base
+world position) but uses the recorded base *orientation* (`observation.root_orientation`,
+yaw-zeroed). Getting the orientation right matters: the head camera is pitched down, so a few
+degrees of base pitch levers the camera-anchored object by several cm in height — without it the
+object visibly sinks into the floor. The object is placed relative to the **live head_camera FK
+pose**, so the hand/object geometry stays consistent.
 
 The robot trajectory (50 Hz) and the object trajectory (lower rate) generally differ in
 length; with no stored frame map they are aligned by uniform nearest-neighbour
@@ -109,6 +112,27 @@ def load_robot_states(parquet: Path) -> np.ndarray:
     return states
 
 
+def load_base_quats(parquet: Path) -> np.ndarray | None:
+    """Return (N, 4) base world orientation (wxyz, yaw-zeroed), or None if unavailable.
+
+    Only pitch/roll are kept (yaw is arbitrary/drifting and irrelevant to a fixed-origin
+    replay). Pitch/roll are what align the head camera correctly so the object rests on
+    the floor instead of sinking into it.
+    """
+    names = pq.read_table(parquet).column_names
+    if "observation.root_orientation" not in names:
+        return None
+    quats = np.asarray(
+        pq.read_table(parquet, columns=["observation.root_orientation"])
+        .column(0)
+        .to_pylist(),
+        dtype=np.float64,
+    )
+    euler = R.from_quat(quats, scalar_first=True).as_euler("ZYX")
+    euler[:, 0] = 0.0  # zero yaw
+    return R.from_euler("ZYX", euler).as_quat(scalar_first=True)
+
+
 def load_object_poses(ob_dir: Path) -> np.ndarray:
     """Return (M, 4, 4) object-in-camera poses, sorted by frame index."""
     files = sorted(ob_dir.glob("*.txt"))
@@ -188,9 +212,16 @@ def build_joint_map(model: mujoco.MjModel, robot_model) -> list[tuple[int, int]]
 
 
 class TrajectoryReplay:
-    def __init__(self, states: np.ndarray, obj_poses: np.ndarray, mesh_path: Path):
+    def __init__(
+        self,
+        states: np.ndarray,
+        obj_poses: np.ndarray,
+        mesh_path: Path,
+        base_quats: np.ndarray | None = None,
+    ):
         self.states = states
         self.obj_poses = obj_poses
+        self.base_quats = base_quats
         self.n = states.shape[0]
         self.m = obj_poses.shape[0]
 
@@ -218,6 +249,10 @@ class TrajectoryReplay:
         whole_q = self.states[i]
         for adr, didx in self.joint_map:
             self.data.qpos[adr] = whole_q[didx]
+        # Recorded base orientation (pitch/roll) — keeps the camera correctly tilted so
+        # the object rests on the floor. Base position stays at the default qpos0.
+        if self.base_quats is not None:
+            self.data.qpos[3:7] = self.base_quats[i]
         # Camera FK depends on the robot pose set above.
         mujoco.mj_forward(self.model, self.data)
 
@@ -294,6 +329,7 @@ def main() -> None:
 
     traj, parquet, mesh, ob_dir = resolve_paths(args)
     states = load_robot_states(parquet)
+    base_quats = load_base_quats(parquet)
     obj_poses = load_object_poses(ob_dir)
     fps = read_fps(traj)
 
@@ -301,7 +337,7 @@ def main() -> None:
     print(f"[info] parquet    : {parquet.relative_to(traj)} ({states.shape[0]} frames)")
     print(f"[info] object     : {ob_dir.relative_to(traj)} ({obj_poses.shape[0]} frames)")
 
-    replay = TrajectoryReplay(states, obj_poses, mesh)
+    replay = TrajectoryReplay(states, obj_poses, mesh, base_quats)
 
     if args.check:
         for i in (0, replay.n - 1):
