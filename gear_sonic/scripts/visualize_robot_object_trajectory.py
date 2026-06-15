@@ -92,7 +92,14 @@ def resolve_paths(args) -> tuple[Path, Path, Path, Path]:
 
     fp_data = traj / "foundation_pose_data"
     mesh = fp_data / "box.obj"
-    ob_dir = fp_data / f"episode_{args.episode:06d}" / "ob_in_cam"
+    episode_dir = fp_data / f"episode_{args.episode:06d}"
+    sub = "ob_in_world_filtered" if getattr(args, "filtered", False) else "ob_in_cam"
+    ob_dir = episode_dir / sub
+    if getattr(args, "filtered", False) and not ob_dir.is_dir():
+        sys.exit(
+            f"[error] no filtered poses in {ob_dir}\n"
+            "        Run foundation_pose/filter_object_pose.py on this recording first."
+        )
     if not mesh.is_file():
         sys.exit(f"[error] object mesh not found: {mesh}")
     if not ob_dir.is_dir() or not any(ob_dir.glob("*.txt")):
@@ -242,11 +249,15 @@ class TrajectoryReplay:
         mesh_path: Path,
         base_quats: np.ndarray | None = None,
         obj_to_robot: np.ndarray | None = None,
+        obj_in_world: bool = False,
     ):
         self.states = states
         self.obj_poses = obj_poses
         self.base_quats = base_quats
         self.obj_to_robot = obj_to_robot
+        # If True, obj_poses are already 4x4 world poses (filtered) and are placed
+        # directly; otherwise they are object-in-camera and go through camera FK.
+        self.obj_in_world = obj_in_world
         self.n = states.shape[0]
         self.m = obj_poses.shape[0]
 
@@ -286,10 +297,16 @@ class TrajectoryReplay:
         # Camera FK depends on the robot pose set above.
         mujoco.mj_forward(self.model, self.data)
 
-        t_wc = np.eye(4)
-        t_wc[:3, :3] = self.data.cam_xmat[self.cam_id].reshape(3, 3)
-        t_wc[:3, 3] = self.data.cam_xpos[self.cam_id]
-        t_wo = t_wc @ GL_FROM_CV @ self.obj_poses[self.object_index(i)]
+        obj = self.obj_poses[self.object_index(i)]
+        if self.obj_in_world:
+            # Filtered poses are already world 4x4 — place directly, NOT through the
+            # per-frame camera FK (which would re-inject the camera wobble).
+            t_wo = obj
+        else:
+            t_wc = np.eye(4)
+            t_wc[:3, :3] = self.data.cam_xmat[self.cam_id].reshape(3, 3)
+            t_wc[:3, 3] = self.data.cam_xpos[self.cam_id]
+            t_wo = t_wc @ GL_FROM_CV @ obj
 
         self.data.qpos[self.obj_qadr : self.obj_qadr + 3] = t_wo[:3, 3]
         self.data.qpos[self.obj_qadr + 3 : self.obj_qadr + 7] = R.from_matrix(
@@ -352,6 +369,10 @@ def main() -> None:
     )
     parser.add_argument("--episode", type=int, default=0, help="episode index (default: 0)")
     parser.add_argument(
+        "--filtered", action="store_true",
+        help="use ob_in_world_filtered/ (from filter_object_pose.py) instead of raw ob_in_cam/",
+    )
+    parser.add_argument(
         "--check", action="store_true",
         help="headless sanity check (no viewer): print stats for the first/last frame",
     )
@@ -368,8 +389,9 @@ def main() -> None:
     print(f"[info] parquet    : {parquet.relative_to(traj)} ({states.shape[0]} frames)")
     print(f"[info] object     : {ob_dir.relative_to(traj)} ({obj_poses.shape[0]} frames)")
     print(f"[info] frame map  : {'exact (frame_map.txt)' if obj_to_robot is not None else 'uniform resampling (no map)'}")
+    print(f"[info] object pose: {'world frame, placed directly (filtered)' if args.filtered else 'camera frame, via FK'}")
 
-    replay = TrajectoryReplay(states, obj_poses, mesh, base_quats, obj_to_robot)
+    replay = TrajectoryReplay(states, obj_poses, mesh, base_quats, obj_to_robot, args.filtered)
 
     if args.check:
         for i in (0, replay.n - 1):
