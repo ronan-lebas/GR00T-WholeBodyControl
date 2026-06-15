@@ -139,6 +139,29 @@ def load_object_poses(ob_dir: Path) -> np.ndarray:
     return np.stack([np.loadtxt(f).reshape(4, 4) for f in files], axis=0)
 
 
+def load_frame_map(ob_dir: Path, n_obj: int) -> np.ndarray | None:
+    """Return (M,) proprio/parquet row index per object frame, or None if absent.
+
+    FP frames are recorded sparser than the proprio stream, so this exact map
+    (written by FoundationPoseWriter) replaces uniform nearest-neighbour pairing.
+    Old recordings without ``frame_map.txt`` fall back to uniform resampling.
+    """
+    path = ob_dir.parent / "frame_map.txt"
+    if not path.is_file():
+        return None
+    rows = np.loadtxt(path, comments="#", ndmin=2)
+    if rows.size == 0:
+        return None
+    proprio = rows[:, 1].astype(int)
+    if proprio.shape[0] != n_obj:
+        print(
+            f"[warn] frame_map has {proprio.shape[0]} rows but {n_obj} object poses; "
+            "ignoring map and falling back to uniform resampling"
+        )
+        return None
+    return proprio
+
+
 def read_fps(traj: Path, default: float = 50.0) -> float:
     info = traj / "meta" / "info.json"
     if info.is_file():
@@ -218,10 +241,12 @@ class TrajectoryReplay:
         obj_poses: np.ndarray,
         mesh_path: Path,
         base_quats: np.ndarray | None = None,
+        obj_to_robot: np.ndarray | None = None,
     ):
         self.states = states
         self.obj_poses = obj_poses
         self.base_quats = base_quats
+        self.obj_to_robot = obj_to_robot
         self.n = states.shape[0]
         self.m = obj_poses.shape[0]
 
@@ -240,6 +265,11 @@ class TrajectoryReplay:
         self.obj_qadr = int(self.model.jnt_qposadr[obj_jnt])
 
     def object_index(self, i: int) -> int:
+        if self.obj_to_robot is not None:
+            # Hold-last: the latest object frame whose proprio row is <= i. This
+            # uses the exact FP<->proprio map instead of uniform resampling.
+            j = int(np.searchsorted(self.obj_to_robot, i, side="right")) - 1
+            return int(np.clip(j, 0, self.m - 1))
         if self.n <= 1 or self.m <= 1:
             return 0
         return int(round(i * (self.m - 1) / (self.n - 1)))
@@ -331,13 +361,15 @@ def main() -> None:
     states = load_robot_states(parquet)
     base_quats = load_base_quats(parquet)
     obj_poses = load_object_poses(ob_dir)
+    obj_to_robot = load_frame_map(ob_dir, obj_poses.shape[0])
     fps = read_fps(traj)
 
     print(f"[info] trajectory : {traj}")
     print(f"[info] parquet    : {parquet.relative_to(traj)} ({states.shape[0]} frames)")
     print(f"[info] object     : {ob_dir.relative_to(traj)} ({obj_poses.shape[0]} frames)")
+    print(f"[info] frame map  : {'exact (frame_map.txt)' if obj_to_robot is not None else 'uniform resampling (no map)'}")
 
-    replay = TrajectoryReplay(states, obj_poses, mesh, base_quats)
+    replay = TrajectoryReplay(states, obj_poses, mesh, base_quats, obj_to_robot)
 
     if args.check:
         for i in (0, replay.n - 1):

@@ -557,12 +557,19 @@ class GrootDataCollector:
         self._fp_last_written_ts = ts
 
         fp_meta = self.latest_image_msg.get("fp_meta") or {}
+        # Row of the proprio/parquet frame added in this same loop iteration
+        # (add_frame already incremented "size", so the just-added row is size-1).
+        # FP frames are sparser than proprio, so this is what links each object
+        # pose to the exact robot state for camera FK downstream.
+        proprio_frame_index = max(0, self.data_exporter.episode_buffer.get("size", 1) - 1)
         self._fp_writer.write_frame(
             rgb=images["ego_view"],
             depth=images["ego_view_depth"],
             mask=images["ego_view_seg"],
             cam_K=fp_meta.get("cam_K"),
             box_half_extents=fp_meta.get("box_half_extents"),
+            proprio_frame_index=proprio_frame_index,
+            timestamp=ts,
         )
 
     def _add_images_to_frame_data(self, frame_data: dict) -> None:
