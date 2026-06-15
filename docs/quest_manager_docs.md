@@ -564,6 +564,12 @@ Subtleties:
 - Disabled walking / pause / below-deadband all yield IDLE with a zero
   movement vector — **exactly the pre-walk behavior** (robot still turns in
   place via `facing`).
+- `--static-base` goes one step further than `--disable-walk`: it forces IDLE
+  **and** pins `facing` to neutral `[1, 0, 0]`, so the base never translates
+  *or* turns. Only the arms and hands move; the head/torso row of
+  `vr_position` is already a fixed reset pose, so the robot's head holds its
+  reset position. The operator should keep their own head motion limited in
+  this mode (the robot won't follow head rotation).
 - Note: the **head ROW** of `vr_position` stays fixed; walking is a separate
   planner command, *not* a moving torso target.
 
@@ -604,6 +610,7 @@ closes sockets.
 | `--calib-delay-sec` | 3.0 | countdown after `s`/`r` before capturing the calibration frame (live only) |
 | `--resume-ramp-sec` | 1.0 | ease-in duration from frozen to live pose on resume |
 | `--disable-walk` | off | robot only turns in place; never translates |
+| `--static-base` | off | freeze the base: only arms/hands move, head/torso held at reset pose (no walk **and** no turn-in-place) |
 | `--walk-mode` | slow | `slow` (SLOW_WALK) or `walk` (WALK) |
 | `--walk-deadband` | 0.08 | head speed (m/s) above which walking starts |
 | `--walk-speed-scale` | 1.0 | scale from operator head speed to robot walk speed |
@@ -620,6 +627,9 @@ python quest_manager_thread_server.py
 
 # Turn-in-place only, no base translation
 python quest_manager_thread_server.py --disable-walk
+
+# Static base: only arms/hands move, head/torso fixed at reset pose
+python quest_manager_thread_server.py --static-base
 
 # Replay a recorded trajectory
 python quest_manager_thread_server.py --replay data/quest/traj_xxx.npz
