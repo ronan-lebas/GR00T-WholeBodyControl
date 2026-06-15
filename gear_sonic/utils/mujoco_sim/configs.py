@@ -350,6 +350,11 @@ class SimLoopConfig(BaseConfig):
     box: bool = False
     """Add a box object to the simulation scene"""
 
+    held_box: bool = False
+    """Spawn the box held in the robot's hands: it is kinematically anchored to the
+    two-hand FK midpoint each sim step (collision disabled) and sways with the arms,
+    instead of resting on the floor. Implies --box."""
+
     render_depth_seg: bool = False
     """Render ego-view depth + box segmentation and publish them (for FoundationPose export)."""
 

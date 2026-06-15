@@ -4,9 +4,11 @@ Parses a YAML-based WBC config via tyro CLI, instantiates the G1 robot model,
 and launches the simulator (optionally with offscreen image publishing).
 """
 
+from pathlib import Path
 from typing import Dict
 
 import tyro
+import yaml
 
 from gear_sonic.utils.mujoco_sim.simulator_factory import SimulatorFactory, init_channel
 from gear_sonic.utils.mujoco_sim.configs import SimLoopConfig
@@ -17,10 +19,20 @@ from gear_sonic.data.robot_model.robot_model import RobotModel
 
 ArgsConfig = SimLoopConfig
 
-# Box parameters — edit these to change the box in the simulation
+# Box parameters — edit these to change the (free, floor-resting) box in the simulation
 BOX_SIZE = (0.2, 0.2, 0.2)   # half-extents in meters (x, y, z)
 BOX_POS  = (1.5, 0.0, 0.1)   # position in meters (x, y, z); z = half-height to rest on floor
 BOX_MASS = 1.0                # mass in kg
+
+# Held-box parameters live in this shared YAML (single source of truth, also read
+# by generate_hold_box_quest.py and iter_reset_pose.py). See load_held_box_params().
+HELD_BOX_PARAMS_PATH = Path(__file__).resolve().parent / "hold_box_params.yaml"
+
+
+def load_held_box_params() -> dict:
+    """Load the shared held-box params YAML (box size + root-frame anchor offset)."""
+    with open(HELD_BOX_PARAMS_PATH) as f:
+        return yaml.safe_load(f)
 
 
 class SimWrapper:
@@ -43,15 +55,30 @@ def main(config: ArgsConfig):
     # NOTE: we will override the interface to local if it is not specified
     wbc_config["ENV_NAME"] = config.env_name
 
-    if config.box:
-        wbc_config["box_config"] = {
-            "size": BOX_SIZE,
-            "pos": BOX_POS,
-            "mass": BOX_MASS,
-        }
+    # --held-box implies --box (the held object is the same injected box body).
+    spawn_box = config.box or config.held_box
+
+    if spawn_box:
+        if config.held_box:
+            held = load_held_box_params()
+            wbc_config["box_config"] = {
+                "size": tuple(held["box"]["size"]),
+                # Initial pos is irrelevant — _update_held_box() overrides it every
+                # step — but a sensible spawn near the chest avoids a first-frame jump.
+                "pos": (0.2, 0.0, 1.0),
+                "mass": BOX_MASS,
+                "held": True,
+                "anchor_offset": tuple(held["box"]["anchor_offset"]),
+            }
+        else:
+            wbc_config["box_config"] = {
+                "size": BOX_SIZE,
+                "pos": BOX_POS,
+                "mass": BOX_MASS,
+            }
 
     if config.render_depth_seg:
-        assert config.box, "render_depth_seg requires --box (the segmented object is the box)"
+        assert spawn_box, "render_depth_seg requires --box or --held-box (the segmented object is the box)"
         assert config.enable_image_publish and config.enable_offscreen, (
             "render_depth_seg requires --enable_image_publish and --enable_offscreen "
             "(depth/seg are rendered offscreen and shipped over the camera stream)"
