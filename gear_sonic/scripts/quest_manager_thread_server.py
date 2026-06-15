@@ -30,7 +30,9 @@ Output ("planner" topic, robot ROOT frame, X-forward, Y-left, Z-up):
                        fixed calibration frame, same frame as facing) drives a
                        SLOW_WALK/WALK command so the robot walks when the
                        operator walks. Disable with --disable-walk (robot then
-                       only turns in place via facing).
+                       only turns in place via facing). --static-base goes
+                       further: no walk AND facing pinned to neutral, so the
+                       base stays put and only the arms/hands move.
 
 Usage:
     # Live Quest (relay container must be running, see run_quest_relay.py)
@@ -38,6 +40,9 @@ Usage:
 
     # Turn in place only, no base translation
     python quest_manager_thread_server.py --disable-walk
+
+    # Static base: only arms/hands move, head/torso fixed at reset pose
+    python quest_manager_thread_server.py --static-base
 
     # Replay a recorded trajectory (record_quest_data.py NPZ format)
     python quest_manager_thread_server.py --replay data/quest/traj_xxx.npz
@@ -1082,7 +1087,7 @@ class QuestManager:
         is IDLE with a zero movement vector, i.e. exactly the previous
         stationary behavior (the robot still turns via the facing command).
         """
-        if self.args.disable_walk or self.teleop_paused:
+        if self.args.disable_walk or self.args.static_base or self.teleop_paused:
             self._walking = False
             return LOCOMOTION_IDLE, [0.0, 0.0, 0.0], -1.0
 
@@ -1142,11 +1147,17 @@ class QuestManager:
                     )
                     self.last_facing_yaw = facing_yaw
                     mode, movement, speed = self._walk_command(head_vel)
+                    # --static-base pins the base heading: never turn the robot.
+                    facing = (
+                        [1.0, 0.0, 0.0]
+                        if self.args.static_base
+                        else [float(np.cos(facing_yaw)), float(np.sin(facing_yaw)), 0.0]
+                    )
                     self.pub.send(
                         build_planner_message(
                             mode=mode,
                             movement=movement,
-                            facing=[float(np.cos(facing_yaw)), float(np.sin(facing_yaw)), 0.0],
+                            facing=facing,
                             speed=speed,
                             height=-1.0,
                             left_hand_position=hands["left"],
@@ -1177,9 +1188,13 @@ class QuestManager:
                     )
                     data = "ok" if frame is not None else "waiting"
                     walk = (
-                        "off"
-                        if self.args.disable_walk
-                        else ("walk" if self._walking else "idle")
+                        "static"
+                        if self.args.static_base
+                        else (
+                            "off"
+                            if self.args.disable_walk
+                            else ("walk" if self._walking else "idle")
+                        )
                     )
                     print(
                         f"[QuestManager] {state} | quest={data} | "
@@ -1246,6 +1261,13 @@ def main() -> None:
         action="store_true",
         help="disable head-position walking; robot only turns in place (facing) "
         "and never translates, reproducing the pre-walk behavior",
+    )
+    parser.add_argument(
+        "--static-base",
+        action="store_true",
+        help="freeze the robot base: only arms/hands move, the head/torso stays at "
+        "its reset pose (no walking AND no turn-in-place). Implies --disable-walk "
+        "and forces facing to neutral. Operator should keep head motion limited.",
     )
     parser.add_argument(
         "--walk-mode",
