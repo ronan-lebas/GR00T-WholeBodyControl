@@ -308,7 +308,7 @@ def main(args) -> None:
                 mj_data.qpos[r4_base+3:r4_base+7] = data_dict["root_rot_measured"][time_idx]
                 mj_data.qpos[r4_base+7:r4_base+36] = data_dict["dof_measured"][time_idx]
 
-            mujoco.mj_forward(mj_model, mj_data)
+            mujoco.mj_kinematics(mj_model, mj_data)
             if not paused:
                 frame_idx += 1
             
