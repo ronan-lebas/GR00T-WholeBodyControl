@@ -4,3 +4,6 @@
 [submodule "third_party/ROS-TCP-Endpoint"]
 	path = third_party/ROS-TCP-Endpoint
 	url = git@github.com:leggedrobotics/ROS-TCP-Endpoint.git
+[submodule "gear_sonic_deploy/thirdparty/brainco_hand_service"]
+	path = gear_sonic_deploy/thirdparty/brainco_hand_service
+	url = git@github.com:unitreerobotics/brainco_hand_service.git
