@@ -12,12 +12,14 @@ Data sources for a recording folder ``outputs/<ts>/``:
     (``foundation_pose/pose_estimation.py``).
   - object mesh  : ``foundation_pose_data/box.obj``.
 
-The robot base keeps the model's default standing *position* (the recording stores no base
-world position) but uses the recorded base *orientation* (`observation.root_orientation`,
-yaw-zeroed). Getting the orientation right matters: the head camera is pitched down, so a few
-degrees of base pitch levers the camera-anchored object by several cm in height — without it the
-object visibly sinks into the floor. The object is placed relative to the **live head_camera FK
-pose**, so the hand/object geometry stays consistent.
+The recording stores no base world *position*, so the base translation is solved each frame to
+keep the feet planted on the floor (during recording the feet — not the pelvis — are fixed). The
+base *orientation* comes from the recording (`observation.root_orientation`) with only the
+initial yaw removed: the yaw *variation* is real camera azimuth motion and must be kept, or the
+static object appears to swing in azimuth as the robot turns. Orientation accuracy matters: the
+head camera is pitched down, so a few degrees of base pitch levers the camera-anchored object by
+several cm. The object is placed relative to the **live head_camera FK pose**, so the
+hand/object geometry stays consistent.
 
 The robot trajectory (50 Hz) and the object trajectory (lower rate) generally differ in
 length; with no stored frame map they are aligned by uniform nearest-neighbour
@@ -120,11 +122,15 @@ def load_robot_states(parquet: Path) -> np.ndarray:
 
 
 def load_base_quats(parquet: Path) -> np.ndarray | None:
-    """Return (N, 4) base world orientation (wxyz, yaw-zeroed), or None if unavailable.
+    """Return (N, 4) base world orientation (wxyz), with only the INITIAL yaw removed.
 
-    Only pitch/roll are kept (yaw is arbitrary/drifting and irrelevant to a fixed-origin
-    replay). Pitch/roll are what align the head camera correctly so the object rests on
-    the floor instead of sinking into it.
+    The *absolute* yaw is arbitrary (the recording has no world frame), but its *variation*
+    over the trajectory is real camera azimuth motion: when the robot turns, the head camera
+    sweeps and a stationary object sweeps across the image with it. That rotation must be
+    reproduced here so it cancels when the object is projected back to world — otherwise the
+    (truly static) object appears to swing in azimuth. So we subtract only frame 0's yaw (a
+    constant offset that merely orients the replay) and keep the per-frame yaw delta. Pitch/roll
+    are kept as-is (they also tilt the head camera so the object rests on the floor).
     """
     names = pq.read_table(parquet).column_names
     if "observation.root_orientation" not in names:
@@ -136,7 +142,7 @@ def load_base_quats(parquet: Path) -> np.ndarray | None:
         dtype=np.float64,
     )
     euler = R.from_quat(quats, scalar_first=True).as_euler("ZYX")
-    euler[:, 0] = 0.0  # zero yaw
+    euler[:, 0] -= euler[0, 0]  # remove only the initial yaw; keep the yaw *variation*
     return R.from_euler("ZYX", euler).as_quat(scalar_first=True)
 
 
@@ -275,6 +281,38 @@ class TrajectoryReplay:
         obj_jnt = int(self.model.body_jntadr[obj_body])
         self.obj_qadr = int(self.model.jnt_qposadr[obj_jnt])
 
+        # During recording the feet are planted on the floor while the pelvis translates;
+        # the recording stores no base world position, so we keep the feet planted by solving
+        # the (only) free base DOF — translation — to hold the feet midpoint at its frame-0
+        # location (see set_frame). Anchoring to the feet rather than pinning the pelvis is what
+        # stops the feet sliding and the object drifting with the unmodelled pelvis sway. The
+        # target is taken from frame 0 so it is identical for the visualizer and the filter
+        # (which both go through set_frame), keeping their world frames aligned.
+        self.foot_ids = [
+            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, n)
+            for n in ("left_ankle_roll_link", "right_ankle_roll_link")
+        ]
+        self.foot_target: np.ndarray | None = None
+        if all(fid >= 0 for fid in self.foot_ids):
+            self._apply_robot_pose(0)
+            self.foot_target = 0.5 * (
+                self.data.xpos[self.foot_ids[0]] + self.data.xpos[self.foot_ids[1]]
+            ).copy()
+        else:
+            self.foot_ids = None
+
+    def _apply_robot_pose(self, i: int) -> None:
+        """Set robot joints + base orientation for frame i and run FK (no foot anchor/object)."""
+        i = int(np.clip(i, 0, self.n - 1))
+        whole_q = self.states[i]
+        for adr, didx in self.joint_map:
+            self.data.qpos[adr] = whole_q[didx]
+        # Recorded base orientation (pitch/roll + relative yaw) reproduces how the head camera
+        # actually swept during recording, so the static object cancels out on reprojection.
+        if self.base_quats is not None:
+            self.data.qpos[3:7] = self.base_quats[i]
+        mujoco.mj_forward(self.model, self.data)
+
     def object_index(self, i: int) -> int:
         if self.obj_to_robot is not None:
             # Hold-last: the latest object frame whose proprio row is <= i. This
@@ -287,15 +325,15 @@ class TrajectoryReplay:
 
     def set_frame(self, i: int) -> None:
         i = int(np.clip(i, 0, self.n - 1))
-        whole_q = self.states[i]
-        for adr, didx in self.joint_map:
-            self.data.qpos[adr] = whole_q[didx]
-        # Recorded base orientation (pitch/roll) — keeps the camera correctly tilted so
-        # the object rests on the floor. Base position stays at the default qpos0.
-        if self.base_quats is not None:
-            self.data.qpos[3:7] = self.base_quats[i]
-        # Camera FK depends on the robot pose set above.
-        mujoco.mj_forward(self.model, self.data)
+        self._apply_robot_pose(i)
+
+        # Keep the feet planted: translate the (only) free base DOF so the feet midpoint
+        # returns to its frame-0 world location. Pinning the pelvis instead would let the feet
+        # slide and inject the pelvis's unmodelled translation into the camera (hence object) pose.
+        if self.foot_target is not None:
+            mid = 0.5 * (self.data.xpos[self.foot_ids[0]] + self.data.xpos[self.foot_ids[1]])
+            self.data.qpos[0:3] += self.foot_target - mid
+            mujoco.mj_forward(self.model, self.data)
 
         obj = self.obj_poses[self.object_index(i)]
         if self.obj_in_world:
