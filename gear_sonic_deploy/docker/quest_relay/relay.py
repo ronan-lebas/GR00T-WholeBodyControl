@@ -65,10 +65,10 @@ class QuestRelayNode:
             "timestamp": 0.0,
         }
 
-        rospy.Subscriber(head_topic, PoseStamped, self._on_headset, queue_size=10)
-        rospy.Subscriber("/tf", TFMessage, self._on_tf, queue_size=10)
-        rospy.Subscriber(left_hand_topic, ManoLandmarks, self._on_left_hand, queue_size=10)
-        rospy.Subscriber(right_hand_topic, ManoLandmarks, self._on_right_hand, queue_size=10)
+        rospy.Subscriber(head_topic, PoseStamped, self._on_headset, queue_size=1)
+        rospy.Subscriber("/tf", TFMessage, self._on_tf, queue_size=1)
+        rospy.Subscriber(left_hand_topic, ManoLandmarks, self._on_left_hand, queue_size=1)
+        rospy.Subscriber(right_hand_topic, ManoLandmarks, self._on_right_hand, queue_size=1)
 
         rospy.loginfo(f"Subscribed to: {head_topic}, /tf, {left_hand_topic}, {right_hand_topic}")
 
