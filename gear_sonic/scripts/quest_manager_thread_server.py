@@ -48,7 +48,10 @@ Usage:
     python quest_manager_thread_server.py --replay data/quest/traj_xxx.npz
 
 Keyboard:
-    s          start policy + enter VR_3PT mode (countdown on live Quest)
+    s          two-stage start (live Quest): 1st press starts the policy and ramps
+               the robot from its current pose up to the calibration pose (the FK
+               reference the operator will mirror); 2nd press runs a countdown,
+               calibrates, and enters live VR_3PT teleop. (Replay: single press.)
     r          recalibrate (countdown; uses measured robot joints as FK ref)
     f          toggle finger retargeting
     p          pause / resume teleop (freeze robot, smooth resume)
@@ -103,6 +106,15 @@ except ImportError:
 STREAM_MODE_OFF = 0
 STREAM_MODE_PLANNER_VR_3PT = 5
 
+# Manager teleop phase (live Quest two-stage start):
+#   OFF    — policy stopped, nothing streamed.
+#   RAMP   — policy started; VR targets are ramped from the robot's current pose
+#            to the calibration pose, then held there until the 2nd 's'.
+#   TELEOP — calibrated; live VR_3PT targets streamed.
+PHASE_OFF = 0
+PHASE_RAMP = 1
+PHASE_TELEOP = 2
+
 # LocomotionMode values (see localmotion_kplanner.hpp). IDLE keeps the robot
 # stationary (only turning via the facing command); SLOW_WALK / WALK translate
 # the base along the planner movement_direction.
@@ -147,6 +159,12 @@ def _rz(yaw: float) -> sRot:
 
 def _wrap(angle: float) -> float:
     return float(np.arctan2(np.sin(angle), np.cos(angle)))
+
+
+def _smoothstep(x: float) -> float:
+    """Clamp x to [0, 1] and apply cubic smoothstep easing (0->0, 1->1, flat ends)."""
+    x = max(0.0, min(1.0, float(x)))
+    return x * x * (3.0 - 2.0 * x)
 
 
 def _slerp(q0: np.ndarray, q1: np.ndarray, alpha: float) -> np.ndarray:
@@ -420,6 +438,28 @@ class QuestThreePointTracker:
         for side in _SIDES:
             v = self._v_cal[side]
             print(f"  {side}: head->wrist cal vector [{v[0]:+.3f}, {v[1]:+.3f}, {v[2]:+.3f}]")
+
+    def target_from_fk(
+        self, body_q_29: np.ndarray | None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """VR 3-point target (pos (9,), quat (12,)) for a static robot pose.
+
+        Built with the exact same formula compute() uses at calibration, so the
+        target for ``body_q_29=None`` (the model default / calibration pose) is
+        identical to the first live teleop target once the operator is
+        calibrated in the rest pose — the ramp can hand off to teleop seamlessly.
+        Needs no calibration; used to drive the pre-teleop ramp to pose.
+        """
+        fk = self._robot_ref.compute(body_q_29)
+        pos = np.zeros((3, 3), dtype=np.float64)
+        quat = np.zeros((3, 4), dtype=np.float64)
+        for i, side in enumerate(_SIDES):
+            link, rot = fk[side]
+            pos[i] = link + rot.apply(self._WRIST_OFFSET[side])
+            quat[i] = _quat(rot)
+        pos[2] = fk["torso_pos"] + self._HEAD_OFFSET
+        quat[2] = np.array([1.0, 0.0, 0.0, 0.0])
+        return pos.flatten(), quat.flatten()
 
     def _update_head_velocity(self, head_pos: np.ndarray, ts: float) -> None:
         """Low-pass head planar velocity in the fixed R0 frame.
@@ -901,6 +941,17 @@ class QuestManager:
         print(f"[QuestManager] ZMQ PUB bound to port {args.port}")
 
         self.stream_mode = STREAM_MODE_OFF
+        self.phase = PHASE_OFF
+        # Pre-teleop ramp state (live Quest): captured lazily once the first
+        # robot feedback arrives after START, since body_q_measured is only
+        # published while the deploy is in CONTROL.
+        self.ramp_started = False
+        self.ramp_wait_start = 0.0
+        self.ramp_start_t = 0.0
+        self.ramp_from_pos: np.ndarray | None = None
+        self.ramp_from_quat: np.ndarray | None = None
+        self.ramp_to_pos: np.ndarray | None = None
+        self.ramp_to_quat: np.ndarray | None = None
         self.finger_tracking = True
         self.teleop_paused = False
         # monotonic time of the previous filtered compute(), for the pose filter dt
@@ -962,13 +1013,84 @@ class QuestManager:
         if kind == "start":
             self.yaw_offset = 0.0
             self.last_facing_yaw = 0.0
+            # START is already sent when the ramp begins (live); re-sending is a
+            # no-op once the deploy is in CONTROL, and it is required for replay
+            # (which skips the ramp), so send it here too.
             self.pub.send(build_command_message(start=True, stop=False, planner=True))
             self.stream_mode = STREAM_MODE_PLANNER_VR_3PT
-            print("[QuestManager] Policy START sent — entering VR_3PT mode")
+            self.phase = PHASE_TELEOP
+            print("[QuestManager] Calibrated — entering live VR_3PT teleop")
         else:
             # Recalibration zeroes yaw_rel; keep the commanded facing continuous
             # so the robot does not turn back to its start heading.
             self.yaw_offset = _wrap(-self.last_facing_yaw)
+
+    def _begin_calib_ramp(self) -> None:
+        """1st 's' (live): start the policy and ramp the robot to the calibration
+        pose instead of snapping to live teleop targets.
+
+        Sends START (deploy WAIT_FOR_CONTROL -> CONTROL) and enters PHASE_RAMP.
+        The ramp endpoints are captured lazily in _run_ramp() once the first
+        robot feedback arrives, because body_q_measured is only published while
+        the deploy is in CONTROL.
+        """
+        self.pub.send(build_command_message(start=True, stop=False, planner=True))
+        self.stream_mode = STREAM_MODE_PLANNER_VR_3PT
+        self.phase = PHASE_RAMP
+        self.ramp_started = False
+        self.ramp_wait_start = time.monotonic()
+        print(
+            "[QuestManager] Policy START sent — ramping to the calibration pose "
+            f"over {self.args.calib_ramp_sec:.1f}s. Press 's' again once the robot "
+            "is settled to calibrate and begin teleop."
+        )
+
+    def _run_ramp(self) -> None:
+        """Stream VR targets that ease the robot from its current pose to the
+        calibration pose (FK of the default config), then hold there.
+
+        Runs every loop while in PHASE_RAMP. The endpoints are captured on the
+        first available robot feedback after START; if no feedback arrives within
+        a short timeout, the ramp falls back to holding the calibration pose.
+        """
+        now = time.monotonic()
+        if not self.ramp_started:
+            body_q = self.feedback.measured_body_q()
+            if body_q is None:
+                if now - self.ramp_wait_start <= self.args.ramp_feedback_timeout:
+                    return  # keep waiting for the first CONTROL-state feedback
+                print(
+                    "[QuestManager] WARNING: no g1_debug feedback — ramping from "
+                    "the default pose (robot may move abruptly if it is not there)"
+                )
+            self.ramp_from_pos, self.ramp_from_quat = self.tracker.target_from_fk(body_q)
+            self.ramp_to_pos, self.ramp_to_quat = self.tracker.target_from_fk(None)
+            self.ramp_start_t = now
+            self.ramp_started = True
+
+        alpha = _smoothstep((now - self.ramp_start_t) / max(self.args.calib_ramp_sec, 1e-3))
+        pos = (1.0 - alpha) * self.ramp_from_pos + alpha * self.ramp_to_pos
+        quat = np.concatenate(
+            [
+                _slerp(
+                    self.ramp_from_quat[4 * i : 4 * i + 4],
+                    self.ramp_to_quat[4 * i : 4 * i + 4],
+                    alpha,
+                )
+                for i in range(3)
+            ]
+        )
+        self.pub.send(
+            build_planner_message(
+                mode=LOCOMOTION_IDLE,
+                movement=[0.0, 0.0, 0.0],
+                facing=[1.0, 0.0, 0.0],
+                speed=-1.0,
+                height=-1.0,
+                vr_3pt_position=pos.tolist(),
+                vr_3pt_orientation=quat.tolist(),
+            )
+        )
 
     # -- keyboard handling ------------------------------------------------------
 
@@ -978,16 +1100,33 @@ class QuestManager:
         if key == "q":
             return True, False, False
         elif key == "s":
-            if self.stream_mode == STREAM_MODE_OFF:
-                self._arm_calibration("start")
+            if self.source.is_replay:
+                # Replay has no robot to ramp; single press starts teleop.
+                if self.phase == PHASE_OFF:
+                    self._arm_calibration("start")
+                else:
+                    print("[QuestManager] Already started ('q' to stop)")
+            elif self.phase == PHASE_OFF:
+                self._begin_calib_ramp()
+            elif self.phase == PHASE_RAMP:
+                if self.ramp_started:
+                    self._arm_calibration("start")
+                else:
+                    print("[QuestManager] Waiting for robot feedback before calibrating...")
             else:
                 print("[QuestManager] Already started ('r' to recalibrate, 'q' to stop)")
         elif key == "r":
-            self._arm_calibration("recalib")
+            if self.phase == PHASE_TELEOP:
+                self._arm_calibration("recalib")
+            else:
+                print("[QuestManager] Recalibrate is only available during teleop")
         elif key == "f":
             self.finger_tracking = not self.finger_tracking
             print(f"[QuestManager] Finger retargeting {'ON' if self.finger_tracking else 'OFF'}")
         elif key == "p":
+            if self.phase != PHASE_TELEOP:
+                print("[QuestManager] Pause is only available during teleop")
+                return False, toggle_dc, toggle_da
             self.teleop_paused = not self.teleop_paused
             if self.teleop_paused:
                 self.frozen_pos = None  # captured from the next computed targets
@@ -1115,8 +1254,8 @@ class QuestManager:
     def run(self) -> None:
         period = 1.0 / max(1, self.args.target_fps)
         print(
-            "[QuestManager] Controls: s=start  r=recalibrate  f=fingers  p=pause  "
-            "c=collect  x=abort  q=quit"
+            "[QuestManager] Controls: s=ramp-to-calib / s-again=calibrate+teleop  "
+            "r=recalibrate  f=fingers  p=pause  c=collect  x=abort  q=quit"
             + ("  k=replay-pause  arrows=step" if self.source.is_replay else "")
         )
         last_report = time.time()
@@ -1136,7 +1275,10 @@ class QuestManager:
                 frame = self.source.get_frame()
                 self._update_countdown(frame)
 
-                if self.stream_mode == STREAM_MODE_PLANNER_VR_3PT and frame is not None:
+                if self.phase == PHASE_RAMP:
+                    self._run_ramp()
+                    sent += 1
+                elif self.phase == PHASE_TELEOP and frame is not None:
                     pos, quat, yaw_rel, head_vel = self.tracker.compute(frame)
                     dt = 0.0 if self._last_compute_t is None else t_start - self._last_compute_t
                     self._last_compute_t = t_start
@@ -1181,11 +1323,14 @@ class QuestManager:
 
                 now = time.time()
                 if now - last_report >= 5.0:
-                    state = (
-                        "OFF"
-                        if self.stream_mode == STREAM_MODE_OFF
-                        else ("PAUSED" if self.teleop_paused else "VR_3PT")
-                    )
+                    if self.phase == PHASE_OFF:
+                        state = "OFF"
+                    elif self.phase == PHASE_RAMP:
+                        state = "RAMP"
+                    elif self.teleop_paused:
+                        state = "PAUSED"
+                    else:
+                        state = "VR_3PT"
                     data = "ok" if frame is not None else "waiting"
                     walk = (
                         "static"
@@ -1249,6 +1394,20 @@ def main() -> None:
         type=float,
         default=3.0,
         help="countdown after 's'/'r' before the calibration frame is captured (live only)",
+    )
+    parser.add_argument(
+        "--calib-ramp-sec",
+        type=float,
+        default=3.0,
+        help="duration of the 1st-'s' ramp from the robot's current pose to the "
+        "calibration pose (live only)",
+    )
+    parser.add_argument(
+        "--ramp-feedback-timeout",
+        type=float,
+        default=2.0,
+        help="max time to wait for robot feedback after START before ramping from "
+        "the default pose instead of the measured current pose (live only)",
     )
     parser.add_argument(
         "--resume-ramp-sec",

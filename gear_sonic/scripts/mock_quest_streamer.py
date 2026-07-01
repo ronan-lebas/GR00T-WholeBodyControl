@@ -51,6 +51,45 @@ DEX3_LIMITS_RIGHT = [
     (0.0, 1.74533),       # middle_1
 ]
 
+# ---------------------------------------------------------------------------
+# VR 3-point wrist/head targets (root-normalized frame; X-forward, Y-left, Z-up).
+# Layout is 9 values: [L wrist xyz, R wrist xyz, head xyz], matching the wire order.
+# ---------------------------------------------------------------------------
+
+# Steady-state targets streamed once teleop is fully engaged.
+VR_3PT_NOMINAL = [
+    0.3,  0.2, 0.3,   # Left Wrist
+    0.3, -0.2, 0.3,   # Right Wrist
+    0.0,  0.0, 0.4,   # Head/Neck
+]
+
+# Pose to ramp *from* when the controller is first entered, so the arms ease
+# into the nominal pose instead of snapping to it. This mock is publish-only and
+# has no robot-state feedback, so this is an *assumed* rest pose (arms lowered
+# and pulled in toward the body). Set it close to the robot's actual pose at
+# calibration to keep the very start of the ramp gentle. Head is kept at nominal
+# (only the arms ramp).
+VR_3PT_START = [
+    0.15,  0.2, -0.2,  # Left Wrist
+    0.15, -0.2, -0.2,  # Right Wrist
+    0.0,   0.0, 0.4,  # Head/Neck (unchanged; does not ramp)
+]
+
+# Seconds to ramp from VR_3PT_START to VR_3PT_NOMINAL after entering VR_3PT mode.
+RAMP_DURATION_S = 3.0
+
+# Arm Z sine animation (toggled with 'a'): amplitude (m) and angular frequency (rad/s).
+ARM_ANIM_AMP = 0.1
+ARM_ANIM_OMEGA = 3.0
+# Seconds to smoothly decay the arm sine to 0 after it is toggled off (fast but not a snap).
+ARM_ANIM_FADE_OUT_S = 0.4
+
+
+def _smoothstep(x: float) -> float:
+    """Clamp x to [0, 1] and apply cubic smoothstep easing (0->0, 1->1, zero slope at ends)."""
+    x = max(0.0, min(1.0, x))
+    return x * x * (3.0 - 2.0 * x)
+
 
 def is_data():
     return select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], [])
@@ -164,6 +203,9 @@ def main():
 
     finger_tracking_enabled = False
     arm_z_animation_enabled = False
+    arm_anim_start_t = 0.0   # loop-clock time at which the arm sine was last (re)started
+    arm_anim_fade_t = 0.0    # loop-clock time at which the fade-out began
+    arm_anim_fading = False  # True while smoothly decaying the sine to 0 after deactivation
     print("Keyboard controls:")
     print("  c  - Toggle data collection (Left Grip + A)")
     print("  x  - Toggle data abort (Left Grip + B)")
@@ -197,19 +239,49 @@ def main():
                     print(f"Pressed 'f': Finger tracking {state}")
                 elif c == 'a':
                     arm_z_animation_enabled = not arm_z_animation_enabled
+                    if arm_z_animation_enabled:
+                        # Restart the sine clock so the animation begins at a zero
+                        # offset (from the deactivated position) rather than jumping.
+                        arm_anim_start_t = t
+                        arm_anim_fading = False
+                    else:
+                        # Begin a short, smooth fade-out from the current offset
+                        # instead of snapping back to center.
+                        arm_anim_fade_t = t
+                        arm_anim_fading = True
                     state = "ENABLED" if arm_z_animation_enabled else "DISABLED"
                     print(f"Pressed 'a': Arm Z animation {state}")
 
             # 3. Generate Mocked 3-Point VR Data
             # Coordinate System: X-forward, Y-left, Z-up
-            left_z  = 0.3 + (0.2 * math.sin(t * 3.0) if arm_z_animation_enabled else 0.0)
-            right_z = 0.3 + (0.2 * math.cos(t * 3.0) if arm_z_animation_enabled else 0.0)
-
+            # Ramp the wrist/head targets from VR_3PT_START to VR_3PT_NOMINAL over
+            # the first RAMP_DURATION_S seconds so the arms ease in instead of
+            # snapping when the controller is entered.
+            ramp = _smoothstep(t / RAMP_DURATION_S)
             vr_3pt_pos = [
-                0.3,  0.2, left_z,   # Left Wrist (X, Y, Z)
-                0.3, -0.2, right_z,  # Right Wrist (X, Y, Z)
-                0.0,  0.0, 0.4,      # Head/Neck (X, Y, Z)
+                start + ramp * (nominal - start)
+                for start, nominal in zip(VR_3PT_START, VR_3PT_NOMINAL)
             ]
+
+            # Optional arm Z sine, added on top of the ramped base. Its clock
+            # restarts from 0 on each activation so the motion always eases out of
+            # the current (neutral) position. When toggled off it fades out over
+            # ARM_ANIM_FADE_OUT_S: the phase keeps running (velocity stays
+            # continuous, no jerk) while the amplitude decays smoothly to 0, so it
+            # stops quickly without snapping. Left/right are anti-phase.
+            env = None
+            if arm_z_animation_enabled:
+                env = 1.0
+            elif arm_anim_fading:
+                frac = (t - arm_anim_fade_t) / ARM_ANIM_FADE_OUT_S
+                if frac >= 1.0:
+                    arm_anim_fading = False
+                else:
+                    env = 1.0 - _smoothstep(frac)
+            if env is not None:
+                off = env * ARM_ANIM_AMP * math.sin(ARM_ANIM_OMEGA * (t - arm_anim_start_t))
+                vr_3pt_pos[2] += off   # Left wrist Z
+                vr_3pt_pos[5] -= off   # Right wrist Z
 
             vr_3pt_quat = [
                 1.0, 0.0, 0.0, 0.0,  # Left Wrist (W, X, Y, Z)
