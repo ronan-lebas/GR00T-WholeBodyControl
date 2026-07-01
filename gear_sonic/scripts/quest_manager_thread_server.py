@@ -946,7 +946,7 @@ class QuestManager:
         # robot feedback arrives after START, since body_q_measured is only
         # published while the deploy is in CONTROL.
         self.ramp_started = False
-        self.ramp_wait_start = 0.0
+        self._ramp_warn_t = 0.0
         self.ramp_start_t = 0.0
         self.ramp_from_pos: np.ndarray | None = None
         self.ramp_from_quat: np.ndarray | None = None
@@ -1038,31 +1038,39 @@ class QuestManager:
         self.stream_mode = STREAM_MODE_PLANNER_VR_3PT
         self.phase = PHASE_RAMP
         self.ramp_started = False
-        self.ramp_wait_start = time.monotonic()
+        self._ramp_warn_t = 0.0
         print(
             "[QuestManager] Policy START sent — ramping to the calibration pose "
             f"over {self.args.calib_ramp_sec:.1f}s. Press 's' again once the robot "
             "is settled to calibrate and begin teleop."
         )
 
-    def _run_ramp(self) -> None:
+    def _run_ramp(self) -> bool:
         """Stream VR targets that ease the robot from its current pose to the
-        calibration pose (FK of the default config), then hold there.
+        calibration pose (FK of the default config), then hold there. Returns
+        True when a planner message was sent this call.
 
-        Runs every loop while in PHASE_RAMP. The endpoints are captured on the
-        first available robot feedback after START; if no feedback arrives within
-        a short timeout, the ramp falls back to holding the calibration pose.
+        Runs every loop while in PHASE_RAMP. The ramp endpoints are captured on
+        the first robot feedback after START (body_q_measured is only published
+        once the deploy is in CONTROL). If feedback never arrives we CANNOT ramp
+        safely — the robot's current pose is unknown, so any target we stream
+        would snap it. In that case we send nothing (the deploy keeps holding its
+        pose) and warn periodically; the 2nd 's' is likewise blocked until
+        feedback is seen, so teleop can never engage with a jump either.
         """
         now = time.monotonic()
         if not self.ramp_started:
             body_q = self.feedback.measured_body_q()
             if body_q is None:
-                if now - self.ramp_wait_start <= self.args.ramp_feedback_timeout:
-                    return  # keep waiting for the first CONTROL-state feedback
-                print(
-                    "[QuestManager] WARNING: no g1_debug feedback — ramping from "
-                    "the default pose (robot may move abruptly if it is not there)"
-                )
+                if now - self._ramp_warn_t >= 2.0:
+                    self._ramp_warn_t = now
+                    print(
+                        "[QuestManager] Waiting for g1_debug robot feedback "
+                        f"({self.args.feedback_host}:{self.args.feedback_port}) before "
+                        "ramping — the robot holds its current pose. Check the deploy "
+                        "is publishing g1_debug, or press 'q' to stop."
+                    )
+                return False  # never stream a target we can't ramp from
             self.ramp_from_pos, self.ramp_from_quat = self.tracker.target_from_fk(body_q)
             self.ramp_to_pos, self.ramp_to_quat = self.tracker.target_from_fk(None)
             self.ramp_start_t = now
@@ -1091,6 +1099,7 @@ class QuestManager:
                 vr_3pt_orientation=quat.tolist(),
             )
         )
+        return True
 
     # -- keyboard handling ------------------------------------------------------
 
@@ -1276,8 +1285,8 @@ class QuestManager:
                 self._update_countdown(frame)
 
                 if self.phase == PHASE_RAMP:
-                    self._run_ramp()
-                    sent += 1
+                    if self._run_ramp():
+                        sent += 1
                 elif self.phase == PHASE_TELEOP and frame is not None:
                     pos, quat, yaw_rel, head_vel = self.tracker.compute(frame)
                     dt = 0.0 if self._last_compute_t is None else t_start - self._last_compute_t
@@ -1401,13 +1410,6 @@ def main() -> None:
         default=3.0,
         help="duration of the 1st-'s' ramp from the robot's current pose to the "
         "calibration pose (live only)",
-    )
-    parser.add_argument(
-        "--ramp-feedback-timeout",
-        type=float,
-        default=2.0,
-        help="max time to wait for robot feedback after START before ramping from "
-        "the default pose instead of the measured current pose (live only)",
     )
     parser.add_argument(
         "--resume-ramp-sec",
