@@ -61,6 +61,24 @@ class DefaultEnv:
         self.unitree_bridge = None
         self.onscreen = onscreen
 
+        # FoundationPose export: render ego-view depth + box segmentation alongside RGB.
+        # Depth/seg are rendered with a dedicated lower-resolution renderer (segmentation is
+        # expensive at full res) and only every Nth image frame; the collector upscales them
+        # back to the RGB resolution. update_scene is essentially free, so a 2nd renderer is fine.
+        self.render_depth_seg = self.config.get("render_depth_seg", False)
+        self.fp_render_scale = float(self.config.get("fp_render_scale", 0.5))
+        self.fp_render_every = max(1, int(self.config.get("fp_render_every", 2)))
+        # Background/invalid depth (in meters) above this is zeroed out before saving.
+        self.fp_depth_max_m = 10.0
+        self.fp_cam_id = -1
+        self.fp_box_geom_id = -1
+        self.fp_cam_K = None
+        self.fp_box_half_extents = None
+        self.fp_render_h = 0
+        self.fp_render_w = 0
+        self.fp_renderer = None
+        self._fp_frame_counter = 0
+
         self.init_scene()
         self.last_reward = 0
 
@@ -79,12 +97,28 @@ class DefaultEnv:
             )
             return
         start_method = self.config.get("MP_START_METHOD", "spawn")
+
+        extra_buffers = {}
+        fp_meta = None
+        if self.render_depth_seg and self.fp_cam_K is not None:
+            h, w = self.fp_render_h, self.fp_render_w
+            extra_buffers = {
+                "ego_view_depth": {"shape": (h, w), "dtype": np.uint16},
+                "ego_view_seg": {"shape": (h, w), "dtype": np.uint8},
+            }
+            fp_meta = {
+                "cam_K": self.fp_cam_K.flatten().tolist(),
+                "box_half_extents": self.fp_box_half_extents,
+            }
+
         self.image_publish_process = ImagePublishProcess(
             camera_configs=self.camera_configs,
             image_dt=self.image_dt,
             zmq_port=camera_port,
             start_method=start_method,
             verbose=self.config.get("verbose", False),
+            extra_buffers=extra_buffers,
+            fp_meta=fp_meta,
         )
         self.image_publish_process.start_process()
 
@@ -162,6 +196,12 @@ class DefaultEnv:
         geom.set("type", "box")
         geom.set("size", f"{size[0]} {size[1]} {size[2]}")
         geom.set("mass", str(mass))
+        if box_config.get("held"):
+            # Held box is kinematically scripted onto the hands every step
+            # (_update_held_box); disabling collision keeps it purely visual so it
+            # never perturbs the robot or fights the physics it is overridden by.
+            geom.set("contype", "0")
+            geom.set("conaffinity", "0")
 
         # Write next to the original so relative <include> paths remain valid
         xml_dir = os.path.dirname(xml_path)
@@ -190,6 +230,11 @@ class DefaultEnv:
         self.torso_index = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
         self.root_body = "pelvis"
         self.root_body_id = self.mj_model.body(self.root_body).id
+
+        if self.render_depth_seg:
+            self._setup_foundation_pose(box_config)
+
+        self._setup_held_box(box_config)
 
         self.joint_class_map = self._get_dof_indices_by_class()
 
@@ -366,6 +411,128 @@ class DefaultEnv:
                 self.mj_model, height=camera_config["height"], width=camera_config["width"]
             )
             self.renderers[camera_name] = renderer
+
+        if self.render_depth_seg and self.fp_cam_K is not None:
+            self.fp_renderer = mujoco.Renderer(
+                self.mj_model, height=self.fp_render_h, width=self.fp_render_w
+            )
+
+    def _setup_foundation_pose(self, box_config: dict | None):
+        """Cache the ego-camera intrinsics and box geom id for FoundationPose export."""
+        ego_cfg = self.camera_configs.get("ego_view")
+        if ego_cfg is None:
+            print("[FoundationPose] No ego_view camera configured; depth/seg export disabled")
+            self.render_depth_seg = False
+            return
+        if box_config is None:
+            print("[FoundationPose] No box in scene; depth/seg export disabled")
+            self.render_depth_seg = False
+            return
+
+        cam_name = ego_cfg.get("mjcf_name", "ego_view")
+        self.fp_cam_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_CAMERA, cam_name)
+        box_body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "box")
+        self.fp_box_geom_id = int(self.mj_model.body_geomadr[box_body_id])
+
+        # Pinhole intrinsics from MuJoCo's vertical FOV (square pixels, principal point centered).
+        height = ego_cfg["height"]
+        width = ego_cfg["width"]
+        fovy_rad = np.deg2rad(float(self.mj_model.cam_fovy[self.fp_cam_id]))
+        fy = (height / 2.0) / np.tan(fovy_rad / 2.0)
+        fx = fy
+        cx = width / 2.0
+        cy = height / 2.0
+        self.fp_cam_K = np.array(
+            [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64
+        )
+        self.fp_box_half_extents = [float(s) for s in box_config["size"]]
+
+        # Reduced render resolution for depth/seg (>=16px, even dims).
+        self.fp_render_h = max(16, int(round(height * self.fp_render_scale)) & ~1)
+        self.fp_render_w = max(16, int(round(width * self.fp_render_scale)) & ~1)
+        print(
+            f"[FoundationPose] ego depth/seg enabled (cam '{cam_name}', box geom "
+            f"{self.fp_box_geom_id}, fovy {np.rad2deg(fovy_rad):.1f} deg, "
+            f"render {self.fp_render_w}x{self.fp_render_h} every {self.fp_render_every} frame(s))"
+        )
+
+    def _render_ego_depth_seg(self) -> tuple[np.ndarray, np.ndarray]:
+        """Render ego-view depth (uint16 mm) and box mask (uint8) at reduced resolution.
+
+        Uses the dedicated low-res ``fp_renderer`` (segmentation is expensive at full res).
+        The collector upscales both back to the RGB resolution before saving.
+        """
+        renderer = self.fp_renderer
+        renderer.update_scene(self.mj_data, camera="head_camera")
+
+        renderer.enable_depth_rendering()
+        depth_m = renderer.render()
+        renderer.disable_depth_rendering()
+
+        renderer.enable_segmentation_rendering()
+        seg = renderer.render()
+        renderer.disable_segmentation_rendering()
+
+        invalid = (depth_m <= 0.0) | (depth_m > self.fp_depth_max_m) | ~np.isfinite(depth_m)
+        depth_mm = np.where(invalid, 0.0, depth_m * 1000.0)
+        depth_mm = np.clip(depth_mm, 0, 65535).astype(np.uint16)
+
+        # Segmentation buffer is (H, W, 2): [..., 0] = object id, [..., 1] = object type.
+        is_box = (seg[..., 1] == mujoco.mjtObj.mjOBJ_GEOM) & (seg[..., 0] == self.fp_box_geom_id)
+        mask = (is_box.astype(np.uint8)) * 255
+        return depth_mm, mask
+
+    def _setup_held_box(self, box_config: dict | None):
+        """Cache ids for a kinematically-held box.
+
+        When ``box_config["held"]`` is set, the box is anchored every sim step to
+        the midpoint of the two wrist links (see ``_update_held_box``) so it moves
+        with the arms without any grasp physics. Sets ``self.held_box``.
+        """
+        self.held_box = False
+        if not (box_config and box_config.get("held")):
+            return
+        box_body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "box")
+        box_jnt_id = int(self.mj_model.body_jntadr[box_body_id])
+        self.held_box_qadr = int(self.mj_model.jnt_qposadr[box_jnt_id])
+        self.held_box_dofadr = int(self.mj_model.jnt_dofadr[box_jnt_id])
+        self.held_l_wrist_id = mujoco.mj_name2id(
+            self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "left_wrist_yaw_link"
+        )
+        self.held_r_wrist_id = mujoco.mj_name2id(
+            self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "right_wrist_yaw_link"
+        )
+        if self.held_l_wrist_id < 0 or self.held_r_wrist_id < 0:
+            raise RuntimeError(
+                "[HeldBox] left/right_wrist_yaw_link bodies not found; cannot anchor the held box"
+            )
+        self.held_anchor_offset = np.asarray(
+            box_config.get("anchor_offset", (0.1, 0.0, 0.0)), dtype=np.float64
+        )
+        self.held_box = True
+        print(
+            f"[HeldBox] box anchored to wrist midpoint, root-frame offset "
+            f"{self.held_anchor_offset.tolist()} (collision disabled)"
+        )
+
+    def _update_held_box(self):
+        """Script the held box onto the live two-hand FK midpoint (called after mj_step).
+
+        Box position = wrist midpoint + root-frame offset; orientation = robot root
+        orientation. The freejoint velocity is zeroed and forward kinematics is
+        re-run so the renderers see the updated box pose this frame. This pose is
+        exact ground truth for the held object.
+        """
+        d = self.mj_data
+        mid = 0.5 * (d.xpos[self.held_l_wrist_id] + d.xpos[self.held_r_wrist_id])
+        root_quat = d.xquat[self.root_body_id]  # scalar-first [w, x, y, z]
+        root_rot = d.xmat[self.root_body_id].reshape(3, 3)
+        qadr = self.held_box_qadr
+        d.qpos[qadr : qadr + 3] = mid + root_rot @ self.held_anchor_offset
+        d.qpos[qadr + 3 : qadr + 7] = root_quat
+        d.qvel[self.held_box_dofadr : self.held_box_dofadr + 6] = 0.0
+        # Propagate the new box qpos into body/geom frames for the renderers.
+        mujoco.mj_kinematics(self.mj_model, d)
 
     def compute_body_torques(self) -> np.ndarray:
         # PD control: tau = tau_ff + kp * (q_des - q) + kd * (dq_des - dq)
@@ -618,6 +785,9 @@ class DefaultEnv:
             self.mj_data.ctrl = self.torques
         mujoco.mj_step(self.mj_model, self.mj_data)
 
+        if self.held_box:
+            self._update_held_box()
+
         self.check_fall()
 
     def apply_perturbation(self, key):
@@ -687,6 +857,14 @@ class DefaultEnv:
             else:
                 renderer.update_scene(self.mj_data, camera=camera_name)
             render_caches[camera_name + "_image"] = renderer.render()
+
+        # Depth/seg are rendered separately (own low-res renderer) and only every Nth frame.
+        if self.render_depth_seg and self.fp_renderer is not None:
+            if self._fp_frame_counter % self.fp_render_every == 0:
+                depth_mm, mask = self._render_ego_depth_seg()
+                render_caches["ego_view_depth"] = depth_mm
+                render_caches["ego_view_seg"] = mask
+            self._fp_frame_counter += 1
 
         if self.image_publish_process is not None:
             self.image_publish_process.update_shared_memory(render_caches)

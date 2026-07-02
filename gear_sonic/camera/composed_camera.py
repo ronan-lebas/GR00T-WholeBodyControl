@@ -529,6 +529,9 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
         if message is not None:
             self.idx += 1
             self._latest_message = ImageMessageSchema.deserialize(message).asdict()
+            # Static FoundationPose metadata (intrinsics + box extents), if the sim
+            # was launched with --render-depth-seg. Absent (None) otherwise.
+            self._latest_message["fp_meta"] = message.get("fp_meta")
             self._last_new_message_time = current_time
 
             if self.idx % 10 == 0:

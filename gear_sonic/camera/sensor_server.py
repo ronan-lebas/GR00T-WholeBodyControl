@@ -129,7 +129,10 @@ class ImageMessageSchema:
         timestamps = data.get("timestamps", {})
         images = {}
         for key, value in data.get("images", {}).items():
-            if isinstance(value, bytes | bytearray):
+            # Depth/segmentation are PNG-encoded losslessly; decode raw (16-bit / single channel).
+            if (key.endswith("_depth") or key.endswith("_seg")) and isinstance(value, str):
+                images[key] = ImageUtils.decode_depth_image(value)
+            elif isinstance(value, bytes | bytearray):
                 mat = cv2.imdecode(np.frombuffer(value, dtype=np.uint8), cv2.IMREAD_COLOR)
                 images[key] = mat[..., ::-1]  # BGR -> RGB
             elif isinstance(value, str):

@@ -1,0 +1,42 @@
+# Shared parameters for the "robot holding a box" pose-estimation demo.
+#
+# Single source of truth read by:
+#   - gear_sonic/scripts/run_sim_loop.py             (box.size, box.anchor_offset)
+#   - gear_sonic/scripts/iter_reset_pose.py          (preview: poses arms + box)
+#   - gear_sonic/scripts/generate_hold_box_quest.py  (FK of the same joint pose -> NPZ)
+#
+# Everything is JOINT SPACE (no IK). The arm pose is set directly in the preview;
+# the generator runs forward kinematics on the same joint trajectory to get the
+# wrist targets the WBC policy tracks. Lengths in meters, angles in degrees,
+# robot ROOT (pelvis) frame: x = forward, y = left, z = up.
+
+box:
+  # Half-extents (m) of the box geom (baked at startup; restart the preview to change).
+  size: [0.06, 0.10, 0.06]
+  # Offset (m) of the box center from the two-wrist midpoint, in the root frame.
+  # Push it forward (+x) so it sits in the palms rather than at the wrists.
+  anchor_offset: [0.10, 0.0, 0.0]
+
+# Joint-space holding pose (degrees) for the LEFT arm, in this joint order:
+#   [shoulder_pitch, shoulder_roll, shoulder_yaw, elbow, wrist_roll, wrist_pitch, wrist_yaw]
+# The right arm is generated automatically as the mirror image (roll/yaw flip sign).
+# Tune in the preview until both hands are in front of the chest and the box looks held.
+arm_pose:
+  left_deg: [-40.0, 6.0, 0.0, 50.0, 0.0, -5.0, -5.0]
+
+# A sinusoid added to one arm joint per side gives motion, the box
+# moves as the arms move. joint_index indexes the 7-element arm pose above
+# (1 = shoulder_roll / frontal, 2 = shoulder_yaw / transverse). Set amplitude_deg = 0
+# for a static hold.
+motion:
+  joint_index: 1
+  amplitude_deg: 8.0
+  period: 4.0       # seconds per full back-and-forth cycle
+  mirror: false     # false: both joints move the same way -> box translates left/right;
+                    # true: opposite directions -> hands separate/converge. Tune by eye.
+  duration: 16.0    # seconds of generated trajectory
+  hz: 50.0          # frame rate
+  pos_scale: 0.8    # MUST equal the manager's --pos-scale (generator divides reach by it)
+
+grip:
+  curl: 0         # constant finger closure [0 = open, 1 = fist] (cosmetic) DOES NOT WORK

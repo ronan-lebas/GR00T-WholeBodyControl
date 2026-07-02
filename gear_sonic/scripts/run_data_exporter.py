@@ -41,6 +41,7 @@ from gear_sonic.data.features_sonic_vla import (
 )
 from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
 from gear_sonic.utils.data_collection.episode_state import EpisodeState
+from gear_sonic.utils.data_collection.foundation_pose_writer import FoundationPoseWriter
 from gear_sonic.utils.data_collection.keyboard_subscriber import ZMQKeyboardSubscriber
 from gear_sonic.utils.data_collection.telemetry import Telemetry
 from gear_sonic.utils.data_collection.text_to_speech import TextToSpeech
@@ -241,6 +242,13 @@ class GrootDataCollector:
         self._episode_state = EpisodeState()
         self._keyboard_listener = ZMQKeyboardSubscriber()
 
+        # FoundationPose export: active only when the sim streams ego depth/seg
+        # (i.e. run_sim_loop launched with --render-depth-seg). Depth/seg arrive at a
+        # reduced rate, so track whether the stream exists at all and de-dupe by timestamp.
+        self._fp_writer = FoundationPoseWriter(self.data_exporter.meta.root)
+        self._fp_enabled = False
+        self._fp_last_written_ts = None
+
         self._image_subscriber = ComposedCameraClientSensor(server_ip=camera_host, port=camera_port)
 
         self.obs_act_buffer = deque(maxlen=100)
@@ -324,6 +332,9 @@ class GrootDataCollector:
             self._episode_state.change_state()
             if self._episode_state.get_state() == self._episode_state.RECORDING:
                 self._initial_yaw = None
+                if self._fp_enabled:
+                    self._fp_writer.start_episode(self.current_episode_index)
+                    self._fp_last_written_ts = None
                 self._print_and_say(
                     f"Started recording {self.current_episode_index}", blocking=False
                 )
@@ -334,6 +345,7 @@ class GrootDataCollector:
         elif key == "x":
             if self._episode_state.get_state() == self._episode_state.RECORDING:
                 self.data_exporter.save_episode_as_discarded()
+                self._fp_writer.discard_episode()
                 self._episode_state.reset_state()
                 self._initial_yaw = None
                 self._print_and_say("Discarded episode", blocking=False)
@@ -527,6 +539,39 @@ class GrootDataCollector:
             if parts:
                 print(f"[Latency] {', '.join(parts)}")
 
+    def _write_foundation_pose_frame(self) -> None:
+        """Save one FoundationPose frame (rgb+depth, plus mask/cam_K on frame 0).
+
+        Self-guards: only writes when the current message carries a *fresh* depth frame
+        (depth/seg arrive at a reduced rate, and the loop polls faster than they arrive).
+        """
+        if self.latest_image_msg is None:
+            return
+        images = self.latest_image_msg["images"]
+        if "ego_view_depth" not in images or "ego_view_seg" not in images:
+            return
+
+        ts = self.latest_image_msg.get("timestamps", {}).get("ego_view")
+        if ts is not None and ts == self._fp_last_written_ts:
+            return
+        self._fp_last_written_ts = ts
+
+        fp_meta = self.latest_image_msg.get("fp_meta") or {}
+        # Row of the proprio/parquet frame added in this same loop iteration
+        # (add_frame already incremented "size", so the just-added row is size-1).
+        # FP frames are sparser than proprio, so this is what links each object
+        # pose to the exact robot state for camera FK downstream.
+        proprio_frame_index = max(0, self.data_exporter.episode_buffer.get("size", 1) - 1)
+        self._fp_writer.write_frame(
+            rgb=images["ego_view"],
+            depth=images["ego_view_depth"],
+            mask=images["ego_view_seg"],
+            cam_K=fp_meta.get("cam_K"),
+            box_half_extents=fp_meta.get("box_half_extents"),
+            proprio_frame_index=proprio_frame_index,
+            timestamp=ts,
+        )
+
     def _add_images_to_frame_data(self, frame_data: dict) -> None:
         if self.latest_image_msg is None:
             return
@@ -617,6 +662,10 @@ class GrootDataCollector:
         self._log_latency_periodic(sonic_latency_ms)
 
         self.data_exporter.add_frame(frame_data)
+
+        if self._fp_enabled:
+            self._write_foundation_pose_frame()
+
         return self._finalize_frame(t_start)
 
     def _add_cpp_state_features(self, frame_data: dict, proprio: dict) -> None:
@@ -879,6 +928,8 @@ class GrootDataCollector:
                         img_msg = self._image_subscriber.read()
                         if img_msg is not None:
                             self.latest_image_msg = img_msg
+                            if "ego_view_depth" in img_msg.get("images", {}):
+                                self._fp_enabled = True
 
                     with self.telemetry.timer("add_frame"):
                         self._add_data_frame()
@@ -903,6 +954,7 @@ class GrootDataCollector:
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
             if buffer_size > 0:
                 self.data_exporter.save_episode_as_discarded()
+                self._fp_writer.discard_episode()
 
         finally:
             self.save_and_cleanup()
