@@ -78,7 +78,7 @@ def latest_output_dir() -> Path:
     return sorted(subdirs)[-1]  # timestamp folders sort lexicographically
 
 
-def resolve_paths(args) -> tuple[Path, Path, Path, Path]:
+def resolve_paths(args) -> tuple[Path, Path, Path | None, Path | None]:
     traj = Path(args.trajectory).resolve() if args.trajectory else latest_output_dir()
     if not traj.is_dir():
         sys.exit(f"[error] trajectory folder does not exist: {traj}")
@@ -102,13 +102,13 @@ def resolve_paths(args) -> tuple[Path, Path, Path, Path]:
             f"[error] no filtered poses in {ob_dir}\n"
             "        Run foundation_pose/filter_object_pose.py on this recording first."
         )
-    if not mesh.is_file():
-        sys.exit(f"[error] object mesh not found: {mesh}")
-    if not ob_dir.is_dir() or not any(ob_dir.glob("*.txt")):
-        sys.exit(
-            f"[error] no FoundationPose poses in {ob_dir}\n"
-            "        Run foundation_pose/pose_estimation.py on this recording first."
+    if not mesh.is_file() or not ob_dir.is_dir() or not any(ob_dir.glob("*.txt")):
+        print(
+            "[info] no object data found "
+            f"(mesh={mesh.is_file()}, poses in {ob_dir}={ob_dir.is_dir() and any(ob_dir.glob('*.txt'))}); "
+            "replaying robot only"
         )
+        return traj, parquet, None, None
     return traj, parquet, mesh, ob_dir
 
 
@@ -190,27 +190,28 @@ def read_fps(traj: Path, default: float = 50.0) -> float:
 # --------------------------------------------------------------------------- #
 
 
-def build_model(mesh_path: Path) -> mujoco.MjModel:
-    """Inject the tracked object (mesh + freejoint) into the brainco scene."""
+def build_model(mesh_path: Path | None) -> mujoco.MjModel:
+    """Inject the tracked object (mesh + freejoint) into the brainco scene, if a mesh is given."""
     tree = ET.parse(SCENE_XML)
     root = tree.getroot()
 
-    asset = root.find("asset")
-    if asset is None:
-        asset = ET.SubElement(root, "asset")
-    mesh_el = ET.SubElement(asset, "mesh")
-    mesh_el.set("name", "tracked_object")
-    mesh_el.set("file", str(mesh_path.resolve()))
+    if mesh_path is not None:
+        asset = root.find("asset")
+        if asset is None:
+            asset = ET.SubElement(root, "asset")
+        mesh_el = ET.SubElement(asset, "mesh")
+        mesh_el.set("name", "tracked_object")
+        mesh_el.set("file", str(mesh_path.resolve()))
 
-    body = ET.SubElement(root.find("worldbody"), "body")
-    body.set("name", "tracked_object")
-    ET.SubElement(body, "freejoint")
-    geom = ET.SubElement(body, "geom")
-    geom.set("type", "mesh")
-    geom.set("mesh", "tracked_object")
-    geom.set("contype", "0")  # visual only — no collision (we never step physics)
-    geom.set("conaffinity", "0")
-    geom.set("rgba", "1 0.5 0 0.6")
+        body = ET.SubElement(root.find("worldbody"), "body")
+        body.set("name", "tracked_object")
+        ET.SubElement(body, "freejoint")
+        geom = ET.SubElement(body, "geom")
+        geom.set("type", "mesh")
+        geom.set("mesh", "tracked_object")
+        geom.set("contype", "0")  # visual only — no collision (we never step physics)
+        geom.set("conaffinity", "0")
+        geom.set("rgba", "1 0.5 0 0.6")
 
     # Write next to the scene so the relative <include> stays valid.
     with tempfile.NamedTemporaryFile(
@@ -251,8 +252,8 @@ class TrajectoryReplay:
     def __init__(
         self,
         states: np.ndarray,
-        obj_poses: np.ndarray,
-        mesh_path: Path,
+        obj_poses: np.ndarray | None,
+        mesh_path: Path | None,
         base_quats: np.ndarray | None = None,
         obj_to_robot: np.ndarray | None = None,
         obj_in_world: bool = False,
@@ -265,7 +266,8 @@ class TrajectoryReplay:
         # directly; otherwise they are object-in-camera and go through camera FK.
         self.obj_in_world = obj_in_world
         self.n = states.shape[0]
-        self.m = obj_poses.shape[0]
+        self.has_object = obj_poses is not None
+        self.m = obj_poses.shape[0] if self.has_object else 0
 
         self.model = build_model(mesh_path)
         self.data = mujoco.MjData(self.model)
@@ -277,9 +279,11 @@ class TrajectoryReplay:
         self.cam_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_CAMERA, "head_camera"
         )
-        obj_body = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "tracked_object")
-        obj_jnt = int(self.model.body_jntadr[obj_body])
-        self.obj_qadr = int(self.model.jnt_qposadr[obj_jnt])
+        self.obj_qadr: int | None = None
+        if self.has_object:
+            obj_body = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "tracked_object")
+            obj_jnt = int(self.model.body_jntadr[obj_body])
+            self.obj_qadr = int(self.model.jnt_qposadr[obj_jnt])
 
         # During recording the feet are planted on the floor while the pelvis translates;
         # the recording stores no base world position, so we keep the feet planted by solving
@@ -334,6 +338,10 @@ class TrajectoryReplay:
             mid = 0.5 * (self.data.xpos[self.foot_ids[0]] + self.data.xpos[self.foot_ids[1]])
             self.data.qpos[0:3] += self.foot_target - mid
             mujoco.mj_forward(self.model, self.data)
+
+        if not self.has_object:
+            mujoco.mj_forward(self.model, self.data)
+            return
 
         obj = self.obj_poses[self.object_index(i)]
         if self.obj_in_world:
@@ -419,28 +427,34 @@ def main() -> None:
     traj, parquet, mesh, ob_dir = resolve_paths(args)
     states = load_robot_states(parquet)
     base_quats = load_base_quats(parquet)
-    obj_poses = load_object_poses(ob_dir)
-    obj_to_robot = load_frame_map(ob_dir, obj_poses.shape[0])
+    obj_poses = load_object_poses(ob_dir) if ob_dir is not None else None
+    obj_to_robot = load_frame_map(ob_dir, obj_poses.shape[0]) if ob_dir is not None else None
     fps = read_fps(traj)
 
     print(f"[info] trajectory : {traj}")
     print(f"[info] parquet    : {parquet.relative_to(traj)} ({states.shape[0]} frames)")
-    print(f"[info] object     : {ob_dir.relative_to(traj)} ({obj_poses.shape[0]} frames)")
-    print(f"[info] frame map  : {'exact (frame_map.txt)' if obj_to_robot is not None else 'uniform resampling (no map)'}")
-    print(f"[info] object pose: {'world frame, placed directly (filtered)' if args.filtered else 'camera frame, via FK'}")
+    if obj_poses is not None:
+        print(f"[info] object     : {ob_dir.relative_to(traj)} ({obj_poses.shape[0]} frames)")
+        print(f"[info] frame map  : {'exact (frame_map.txt)' if obj_to_robot is not None else 'uniform resampling (no map)'}")
+        print(f"[info] object pose: {'world frame, placed directly (filtered)' if args.filtered else 'camera frame, via FK'}")
+    else:
+        print("[info] object     : none — replaying robot body only")
 
     replay = TrajectoryReplay(states, obj_poses, mesh, base_quats, obj_to_robot, args.filtered)
 
     if args.check:
         for i in (0, replay.n - 1):
             replay.set_frame(i)
-            obj_pos = replay.data.qpos[replay.obj_qadr : replay.obj_qadr + 3].copy()
             cam_pos = replay.data.cam_xpos[replay.cam_id].copy()
-            print(
-                f"[check] frame {i:4d} -> obj idx {replay.object_index(i):3d} | "
-                f"cam {np.round(cam_pos, 3)} | obj_world {np.round(obj_pos, 3)} | "
-                f"obj-cam dist {np.linalg.norm(obj_pos - cam_pos):.3f} m"
-            )
+            if replay.has_object:
+                obj_pos = replay.data.qpos[replay.obj_qadr : replay.obj_qadr + 3].copy()
+                print(
+                    f"[check] frame {i:4d} -> obj idx {replay.object_index(i):3d} | "
+                    f"cam {np.round(cam_pos, 3)} | obj_world {np.round(obj_pos, 3)} | "
+                    f"obj-cam dist {np.linalg.norm(obj_pos - cam_pos):.3f} m"
+                )
+            else:
+                print(f"[check] frame {i:4d} | cam {np.round(cam_pos, 3)} | no object data")
         applied = sum(
             replay.data.qpos[adr] != replay.model.qpos0[adr] for adr, _ in replay.joint_map
         )
