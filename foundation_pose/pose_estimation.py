@@ -195,7 +195,15 @@ def main():
         default=1,
         help="run_demo.py debug level (1 = show/overlay; 0 = headless, only ob_in_cam).",
     )
+    parser.add_argument(
+        "--no-gui",
+        action="store_true",
+        help="Disable GUI feedback (cv2.imshow windows) by forcing debug level to 0.",
+    )
     args = parser.parse_args()
+
+    if args.no_gui:
+        args.debug = 0
 
     fp_dir = Path(args.fp_dir).resolve()
     if not (fp_dir / "run_demo.py").is_file():
