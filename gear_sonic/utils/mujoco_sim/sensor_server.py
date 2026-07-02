@@ -23,7 +23,11 @@ class ImageMessageSchema:
     def serialize(self) -> Dict[str, Any]:
         serialized_msg = {"timestamps": self.timestamps, "images": {}}
         for key, image in self.images.items():
-            serialized_msg["images"][key] = ImageUtils.encode_image(image)
+            # Depth/segmentation must be lossless (16-bit depth, exact mask); use PNG.
+            if key.endswith("_depth") or key.endswith("_seg"):
+                serialized_msg["images"][key] = ImageUtils.encode_png_image(image)
+            else:
+                serialized_msg["images"][key] = ImageUtils.encode_image(image)
         return serialized_msg
 
     @staticmethod
@@ -75,6 +79,12 @@ class ImageUtils:
     def encode_image(image: np.ndarray) -> str:
         _, color_buffer = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         return base64.b64encode(color_buffer).decode("utf-8")
+
+    @staticmethod
+    def encode_png_image(image: np.ndarray) -> str:
+        """Lossless PNG encode (supports 16-bit single-channel depth and uint8 masks)."""
+        _, buffer = cv2.imencode(".png", image)
+        return base64.b64encode(buffer).decode("utf-8")
 
     @staticmethod
     def decode_image(image: str) -> np.ndarray:
