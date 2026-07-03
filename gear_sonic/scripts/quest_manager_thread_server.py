@@ -388,9 +388,22 @@ class QuestThreePointTracker:
     }
     _HEAD_OFFSET = np.asarray(G1_KEY_FRAME_OFFSETS["torso"], dtype=np.float64)
 
-    def __init__(self, robot_ref: RobotRestReference, pos_scale: float = 0.8):
+    def __init__(
+        self,
+        robot_ref: RobotRestReference,
+        pos_scale: float = 0.8,
+        static_base: bool = False,
+    ):
         self._robot_ref = robot_ref
         self.pos_scale = float(pos_scale)
+        # When the base heading is pinned (--static-base), wrist targets must be
+        # expressed in the FIXED calibration frame R0 rather than the live head
+        # heading frame Rh(t). Otherwise turning only the head rotates Rh(t),
+        # which rotates v and r_cmd and makes the hands drift even though the
+        # operator's hands are still. With a live base the facing command turns
+        # the robot to cancel that rotation; with static_base facing is pinned,
+        # so the rotation must be removed here instead.
+        self.static_base = bool(static_base)
         self._calibrated = False
         self._yaw_cal = 0.0
         self._r0 = sRot.identity()
@@ -509,7 +522,13 @@ class QuestThreePointTracker:
             raise RuntimeError("compute() called before calibrate()")
 
         yaw_rel = _wrap(_yaw_of(frame["head_quat"]) - self._yaw_cal)
-        rh_inv = _rz(self._yaw_cal + yaw_rel).inv()  # current heading frame
+        # Frame the wrist targets are expressed in. Normally the live head
+        # heading frame Rh(t) (body-relative targets; the facing command turns
+        # the robot to follow). Under static_base the base heading is pinned, so
+        # we use the fixed calibration frame R0 instead — head-only rotation then
+        # leaves the hand targets unchanged. yaw_rel is still returned (harmless;
+        # facing is pinned downstream).
+        rh_inv = self._r0_inv if self.static_base else _rz(self._yaw_cal + yaw_rel).inv()
 
         pos = np.zeros((3, 3), dtype=np.float64)
         quat = np.zeros((3, 4), dtype=np.float64)
@@ -919,7 +938,9 @@ class QuestManager:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.robot_ref = RobotRestReference()
-        self.tracker = QuestThreePointTracker(self.robot_ref, pos_scale=args.pos_scale)
+        self.tracker = QuestThreePointTracker(
+            self.robot_ref, pos_scale=args.pos_scale, static_base=args.static_base
+        )
         self.pose_filter = PoseLowPass(args.smooth_tau)
         self.retargeter = FingerRetargeting(force_np=args.np_retarget)
         self.feedback = RobotFeedback(args.feedback_host, args.feedback_port)
