@@ -116,6 +116,17 @@ def port_mappings(args: argparse.Namespace) -> list[str]:
     ]
 
 
+def env_args(args: argparse.Namespace) -> list[str]:
+    """Docker ``-e`` env vars. CAMERA_HOST gates the optional image relay
+    (entrypoint.sh starts image_relay.py only when it is set)."""
+    if args.camera_host is None:
+        return []
+    env = ["-e", f"CAMERA_HOST={args.camera_host}", "-e", f"CAMERA_PORT={args.camera_port}"]
+    if args.image_fps is not None:
+        env += ["-e", f"IMAGE_RELAY_FPS={args.image_fps}"]
+    return env
+
+
 def wait_for_zmq(port: int, timeout: float = 60.0) -> bool:
     """Poll the host ZMQ port until the relay is accepting connections."""
     deadline = time.time() + timeout
@@ -142,7 +153,7 @@ def print_next_steps(args: argparse.Namespace) -> None:
 
 def run_detached(tag: str, args: argparse.Namespace) -> int:
     cmd = ["docker", "run", "-d", "--rm", "--name", args.name]
-    cmd += [*port_mappings(args), tag, *relay_args(args)]
+    cmd += [*port_mappings(args), *env_args(args), tag, *relay_args(args)]
     result = _run(cmd)
     if result.returncode != 0:
         return result.returncode
@@ -164,7 +175,7 @@ def run_detached(tag: str, args: argparse.Namespace) -> int:
 
 def run_attached(tag: str, args: argparse.Namespace) -> int:
     cmd = ["docker", "run", "--rm", "--name", args.name]
-    cmd += [*port_mappings(args), tag, *relay_args(args)]
+    cmd += [*port_mappings(args), *env_args(args), tag, *relay_args(args)]
     print(f"\033[0;34m$ {' '.join(cmd)}\033[0m", flush=True)
     print_next_steps(args)
     print("[run_quest_relay] Starting relay (Ctrl-C to stop)...\n")
@@ -222,6 +233,18 @@ def main() -> int:
     parser.add_argument("--left-hand-topic", default=None, help="ROS1 left ManoLandmarks topic.")
     parser.add_argument("--right-hand-topic", default=None, help="ROS1 right ManoLandmarks topic.")
     parser.add_argument("--hz", type=float, default=None, help="Relay publish rate in Hz.")
+    # Optional robot ego-view -> Quest image relay (see image_relay.py). Passing
+    # --camera-host starts it inside the container; it must be an address the
+    # container can reach (the robot's IP, or host.docker.internal for a server
+    # on this same host).
+    parser.add_argument(
+        "--camera-host", default=None,
+        help="Enable the ego-view image relay, subscribing to the camera ZMQ server at this host.",
+    )
+    parser.add_argument("--camera-port", type=int, default=5555, help="Camera server ZMQ port.")
+    parser.add_argument(
+        "--image-fps", type=float, default=None, help="Max image relay publish rate (default 30)."
+    )
     args = parser.parse_args()
 
     preflight()
