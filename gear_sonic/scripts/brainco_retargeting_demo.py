@@ -84,6 +84,20 @@ from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorCmd_, MotorCmds_, MotorS
 
 NUM_MOTORS = 6  # BrainCo Revo2: 6 DOF per hand
 
+
+def _swap_thumb(q: np.ndarray) -> np.ndarray:
+    """Return a copy of a 6-vector with thumb slots 0<->1 exchanged.
+
+    The physical BrainCo hand wires motors 0/1 in the opposite order to our
+    slot convention [thumb_metacarpal, thumb_proximal, index, middle, ring,
+    pinky]. We swap only at the DDS wire (outgoing cmd + incoming state), so
+    everything above stays in our convention. This mirrors the deploy binary's
+    fix in gear_sonic_deploy/.../brainco_hands.hpp (setThumbSwap).
+    """
+    out = np.asarray(q, dtype=float).copy()
+    out[[0, 1]] = out[[1, 0]]
+    return out
+
 # np_retargeting joint order, used only for the --np-retarget path (mirrors live_camera.py).
 _NP_JOINT_ORDER = [
     "thumb_metacarpal", "thumb_proximal",
@@ -140,6 +154,14 @@ def parse_args():
         help="Normalized finger speed dq commanded to the bridge [0..1].",
     )
     p.add_argument(
+        "--thumb-swap",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Swap thumb motors 0/1 at the DDS wire to match the physical BrainCo "
+        "hand (on by default, like the deploy binary on real hardware). Use "
+        "--no-thumb-swap if driving a hand/bridge that does not need it.",
+    )
+    p.add_argument(
         "--keep-on-loss",
         action="store_true",
         help="Hold the last command when no hand is detected (matches live_camera). "
@@ -163,10 +185,14 @@ class BrainCoHandPublisher:
     the last published value otherwise), so the fingers cannot jump.
     """
 
-    def __init__(self, rate_hz: float, max_delta_q: float, speed: float):
+    def __init__(self, rate_hz: float, max_delta_q: float, speed: float, thumb_swap: bool = True):
         self._rate_hz = rate_hz
         self._max_delta_q = float(max_delta_q)
         self._speed = float(np.clip(speed, 0.0, 1.0))
+        # Swap thumb motors 0/1 at the DDS wire for real hardware (see
+        # _swap_thumb). Everything above (targets, published, smoothing) stays
+        # in our slot convention.
+        self._thumb_swap = bool(thumb_swap)
 
         self._lock = threading.Lock()
         # Targets and last-published positions per side. Start fully open.
@@ -193,6 +219,10 @@ class BrainCoHandPublisher:
                 q = np.array([msg.states[i].q for i in range(NUM_MOTORS)], dtype=float)
             except (IndexError, AttributeError):
                 return
+            # Bring the hardware's motor 0/1 back into our slot convention so the
+            # delta-q smoothing (target vs. measured) compares matching slots.
+            if self._thumb_swap:
+                q = _swap_thumb(q)
             with self._lock:
                 self._measured[side] = q
         return handler
@@ -234,7 +264,9 @@ class BrainCoHandPublisher:
             # Delta-q smoothing relative to the reference (measured state if available).
             delta = np.clip(target - reference, -self._max_delta_q, self._max_delta_q)
             q = np.clip(reference + delta, 0.0, 1.0)
-            self._pubs[side].Write(self._build_cmd(q))
+            # Swap thumb 0/1 only on the wire; keep _published in our convention.
+            wire_q = _swap_thumb(q) if self._thumb_swap else q
+            self._pubs[side].Write(self._build_cmd(wire_q))
             with self._lock:
                 self._published[side] = q
 
@@ -306,7 +338,9 @@ def main():
     if not args.dry_run:
         print(f"Initializing DDS on interface '{args.network_interface}' (domain {args.domain_id})...")
         ChannelFactoryInitialize(args.domain_id, args.network_interface)
-        publisher = BrainCoHandPublisher(args.command_rate, args.max_delta_q, args.speed)
+        publisher = BrainCoHandPublisher(
+            args.command_rate, args.max_delta_q, args.speed, thumb_swap=args.thumb_swap
+        )
         publisher.start()
         print("Publishing rt/brainco/{left,right}/cmd. Make sure brainco_hand_service is running.")
     else:
