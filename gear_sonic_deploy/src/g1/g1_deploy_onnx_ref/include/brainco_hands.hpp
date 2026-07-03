@@ -122,9 +122,15 @@ public:
      * to prevent sudden jumps.
      */
     void writeOnce() {
-        // Max position change per tick in normalized units.
-        // 0.05 / 500 Hz = 0.1 normalized/s → ~10 s to fully close (conservative).
-        constexpr double MAX_DELTA_Q = 0.05;
+        // Max the command may lead the *measured* position per tick, in
+        // normalized units. This is not a simple speed cap: the firmware drives
+        // the motor toward the command at its own dq speed, so a too-small lead
+        // starves the firmware of a far-enough target and throttles the finger
+        // well below its capable speed (the observed ~0.4 s open<->close). 0.1
+        // lets the command stay far enough ahead for the firmware to run near
+        // its dq rate. Compile-time for now; a hardware-tunable value next
+        // session may want 0.1-0.15. Called at 500 Hz from LowCommandWriter.
+        constexpr double MAX_DELTA_Q = 0.1;
 
         for (bool is_left : {true, false}) {
             HandCtx& ctx = is_left ? left_ : right_;
