@@ -544,34 +544,34 @@ else
     echo -e "${YELLOW}📋 This will start the simulation control system.${NC}"
 fi
 echo ""
-read -p "$(echo -e ${GREEN}Proceed with deployment? [Y/n]: ${NC})" confirm
+# read -p "$(echo -e ${GREEN}Proceed with deployment? [Y/n]: ${NC})" confirm
 
-if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
-    echo ""
-    echo -e "${GREEN}🚀 Starting deployment...${NC}"
-    echo ""
-    
-    # Build the command with optional extra args
-    if [[ -n "$EXTRA_ARGS" ]]; then
-        just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
-            --obs-config "$OBS_CONFIG" \
-            --encoder-file "$CHECKPOINT_ENCODER" \
-            --planner-file "$PLANNER" \
-            --input-type "$INPUT_TYPE" \
-            --output-type "$OUTPUT_TYPE" \
-            --zmq-host "$ZMQ_HOST" \
-            $EXTRA_ARGS
-    else
-        just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
-            --obs-config "$OBS_CONFIG" \
-            --encoder-file "$CHECKPOINT_ENCODER" \
-            --planner-file "$PLANNER" \
-            --input-type "$INPUT_TYPE" \
-            --output-type "$OUTPUT_TYPE" \
-            --zmq-host "$ZMQ_HOST"
-    fi
+# if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
+echo ""
+echo -e "${GREEN}🚀 Starting deployment...${NC}"
+echo ""
+
+# Build the command with optional extra args
+if [[ -n "$EXTRA_ARGS" ]]; then
+    just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
+        --obs-config "$OBS_CONFIG" \
+        --encoder-file "$CHECKPOINT_ENCODER" \
+        --planner-file "$PLANNER" \
+        --input-type "$INPUT_TYPE" \
+        --output-type "$OUTPUT_TYPE" \
+        --zmq-host "$ZMQ_HOST" \
+        $EXTRA_ARGS
 else
-    echo ""
-    echo -e "${YELLOW}Deployment cancelled.${NC}"
-    exit 0
+    just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
+        --obs-config "$OBS_CONFIG" \
+        --encoder-file "$CHECKPOINT_ENCODER" \
+        --planner-file "$PLANNER" \
+        --input-type "$INPUT_TYPE" \
+        --output-type "$OUTPUT_TYPE" \
+        --zmq-host "$ZMQ_HOST"
 fi
+# else
+#     echo ""
+#     echo -e "${YELLOW}Deployment cancelled.${NC}"
+#     exit 0
+# fi
