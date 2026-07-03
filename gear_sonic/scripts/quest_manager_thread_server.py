@@ -1431,8 +1431,9 @@ def main() -> None:
     parser.add_argument(
         "--pos-scale",
         type=float,
-        default=0.8,
-        help="scale on operator arm reach (orientation unaffected)",
+        default=1.0,
+        help="scale on operator arm reach (orientation unaffected); 1.0 = 1:1 with "
+        "operator motion. Lower under-reaches and feels sluggish.",
     )
     parser.add_argument(
         "--smooth-tau",
