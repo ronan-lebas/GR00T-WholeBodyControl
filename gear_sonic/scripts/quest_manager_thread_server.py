@@ -1290,6 +1290,7 @@ class QuestManager:
         )
         last_report = time.time()
         sent = 0
+        lat_sum, lat_max, lat_n = 0.0, 0.0, 0  # frame-age stats for --log-latency
         with KeyboardListener() as kb:
             while True:
                 t_start = time.monotonic()
@@ -1303,6 +1304,20 @@ class QuestManager:
                     break
 
                 frame = self.source.get_frame()
+                # End-to-end frame age at the manager input. Only meaningful for
+                # a live relay (its timestamp is relay wall-clock time.time());
+                # replay timestamps are media-relative, so skip them.
+                if (
+                    self.args.log_latency
+                    and frame is not None
+                    and not self.source.is_replay
+                ):
+                    ts = float(frame.get("timestamp", 0.0))
+                    if ts > 0.0:
+                        age = time.time() - ts
+                        lat_sum += age
+                        lat_max = max(lat_max, age)
+                        lat_n += 1
                 self._update_countdown(frame)
 
                 if self.phase == PHASE_RAMP:
@@ -1371,13 +1386,20 @@ class QuestManager:
                             else ("walk" if self._walking else "idle")
                         )
                     )
+                    latency = (
+                        f" | frame-age avg={1e3 * lat_sum / lat_n:.0f}ms "
+                        f"max={1e3 * lat_max:.0f}ms"
+                        if lat_n > 0
+                        else ""
+                    )
                     print(
                         f"[QuestManager] {state} | quest={data} | "
                         f"{sent / (now - last_report):.1f} planner msg/s | "
                         f"fingers={'on' if self.finger_tracking else 'off'} | "
-                        f"walk={walk}"
+                        f"walk={walk}{latency}"
                     )
                     last_report = now
+                    lat_sum, lat_max, lat_n = 0.0, 0.0, 0
                     sent = 0
 
                 elapsed = time.monotonic() - t_start
@@ -1415,9 +1437,11 @@ def main() -> None:
     parser.add_argument(
         "--smooth-tau",
         type=float,
-        default=0.05,
+        default=0.02,
         help="EMA time constant (s) for the 3-point wrist/head pos+quat targets; "
-        "higher = smoother but laggier, 0 disables",
+        "higher = smoother but laggier, 0 disables. Lowered from 0.05 now that the "
+        "upstream ZMQ queueing is fixed (conflate + publish-on-receipt), so less "
+        "filtering is needed to hide jitter.",
     )
     parser.add_argument(
         "--calib-delay-sec",
@@ -1437,6 +1461,12 @@ def main() -> None:
         type=float,
         default=1.0,
         help="ease-in duration from frozen to live pose when resuming after pause",
+    )
+    parser.add_argument(
+        "--log-latency",
+        action="store_true",
+        help="log end-to-end frame age (relay timestamp -> manager input) in the "
+        "periodic status line; live relay only (replay timestamps are media-relative)",
     )
     parser.add_argument(
         "--disable-walk",
