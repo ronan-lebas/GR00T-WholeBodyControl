@@ -79,6 +79,22 @@ public:
     BraincoHands() = default;
 
     /**
+     * @brief Enable the physical thumb motor 0<->1 swap (hardware only).
+     *
+     * The physical BrainCo hand wires motor 0/1 in the opposite order to the
+     * rest of our stack: everything above this DDS driver (retargeter, MJCF
+     * sim, g1_supplemental_info) uses slot order
+     * [thumb_metacarpal, thumb_proximal, index, middle, ring, pinky], but the
+     * real hand's motors 0 and 1 are exchanged relative to that. We therefore
+     * swap slots 0<->1 exactly at the DDS wire: on the outgoing command
+     * (writeOnce) and the incoming state (onState). Everything above stays in
+     * sim convention, so the MuJoCo sim -- whose rt/brainco state topic already
+     * uses the MJCF order -- must NOT enable this. Default off; deploy.sh turns it on
+     * only for real hardware (ENV_TYPE=real).
+     */
+    void setThumbSwap(bool enable) { thumb_swap_ = enable; }
+
+    /**
      * @brief Initialize DDS channels for both hands.
      * @param networkInterface  Network interface name (e.g. "eth0").
      *                          Pass an empty string to skip ChannelFactory init
@@ -155,6 +171,14 @@ public:
                     const double delta   = std::clamp(desired - current, -MAX_DELTA_Q, MAX_DELTA_Q);
                     smoothedCmd.cmds()[i].q(static_cast<float>(current + delta));
                 }
+            }
+
+            // Hardware thumb fix: exchange motor 0/1 at the wire only. Everything
+            // above stays in sim convention (see setThumbSwap). Smoothing above
+            // ran in sim convention against the (un-swapped) state buffer, so it
+            // stays consistent; we swap only the final outgoing message.
+            if (thumb_swap_) {
+                std::swap(smoothedCmd.cmds()[0], smoothedCmd.cmds()[1]);
             }
 
             ctx.publisher->Write(smoothedCmd);
@@ -248,13 +272,26 @@ private:
         ctx.cmd_buffer.SetData(std::move(cmd));
     }
 
-    /** @brief DDS subscriber callback – stores incoming state in the buffer. */
+    /** @brief DDS subscriber callback – stores incoming state in the buffer.
+     *
+     * When thumb_swap_ is set, exchange the hardware's motor 0/1 back into sim
+     * convention here (see setThumbSwap), so the state buffer -- and everything
+     * that reads it (getState, delta smoothing, the recorded g1_debug feedback)
+     * -- is in sim convention.
+     */
     void onState(bool is_left, const void* message) {
         HandCtx& ctx = is_left ? left_ : right_;
         const auto* incoming = static_cast<const MotorStates_*>(message);
-        ctx.state_buffer.SetData(*incoming);
+        if (thumb_swap_ && incoming->states().size() >= 2) {
+            MotorStates_ swapped = *incoming;
+            std::swap(swapped.states()[0], swapped.states()[1]);
+            ctx.state_buffer.SetData(std::move(swapped));
+        } else {
+            ctx.state_buffer.SetData(*incoming);
+        }
     }
 
+    bool thumb_swap_ = false;  ///< Hardware motor 0/1 swap; off for sim.
     HandCtx left_;
     HandCtx right_;
 };

@@ -112,6 +112,10 @@ public:
     // Get current max close ratio
     double GetMaxCloseRatio() const { return max_close_ratio_; }
 
+    // No-op: the thumb motor 0/1 swap is a BrainCo-hardware-only fix (Dex3 uses
+    // its native joint order). Present for HandDriver call-site compatibility.
+    void setThumbSwap(bool) {}
+
     // Perform one publish tick; call this at your own cadence from the main class/thread.
     void writeOnce()
     {

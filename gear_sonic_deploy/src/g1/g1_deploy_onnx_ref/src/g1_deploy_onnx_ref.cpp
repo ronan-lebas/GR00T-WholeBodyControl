@@ -2166,7 +2166,8 @@ class G1Deploy {
       std::string zmq_out_topic = "g1_debug",
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
-      double initial_max_close_ratio = 1.0)
+      double initial_max_close_ratio = 1.0,
+      bool brainco_thumb_swap = false)
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2193,6 +2194,10 @@ class G1Deploy {
 
       // Initialize Dex3 hands (ChannelFactory already initialized above)
       hand_.initialize("");
+      // Real BrainCo hardware wires thumb motors 0/1 opposite to our stack;
+      // enable the wire-level swap on real hardware only (off for MuJoCo sim).
+      // No-op for the Dex3 driver. Set before the command-writer thread starts.
+      hand_.setThumbSwap(brainco_thumb_swap);
 
       audio_thread_ = std::make_unique<AudioThread>();
 
@@ -4171,6 +4176,7 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --zmq-out-port <port>: ZMQ port for output (default: 5557)" << std::endl;
     std::cout << "  --zmq-out-topic <topic>: ZMQ topic/prefix for output (default: g1_debug)" << std::endl;
     std::cout << "  --logs-dir <path>: optional logs output base directory (default: logs/<timestamp>/)" << std::endl;
+    std::cout << "  --brainco-thumb-swap: swap BrainCo thumb motors 0/1 at the DDS wire (REAL hardware only; do NOT use in sim)" << std::endl;
     std::cout << "  --enable-csv-logs: enable writing CSV logs (default: OFF)" << std::endl;
     std::cout << "  --enable-motion-recording: enable motion recording for ZMQ/planner (default: OFF)" << std::endl;
     std::cout << "  --set-compliance <value>: set initial VR 3-point compliance (0.01=rigid, 0.5=compliant; default: [0.5, 0.5, 0.0])" << std::endl;
@@ -4218,6 +4224,7 @@ int main(int argc, char const* argv[]) {
   bool zmq_conflate = false;  // default off; enable with --zmq-conflate
   bool zmq_verbose = false;
   bool enableMotionRecording = false;  // default off; enable with --enable-motion-recording
+  bool braincoThumbSwap = false;  // default off; enable with --brainco-thumb-swap (real hw only)
   int zmq_out_port = 5557;
   std::string zmq_out_topic = "g1_debug";
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
@@ -4399,6 +4406,9 @@ int main(int argc, char const* argv[]) {
     } else if (std::string(argv[i]) == "--enable-motion-recording") {
       enableMotionRecording = true;
       std::cout << "[INFO] Motion recording enabled" << std::endl;
+    } else if (std::string(argv[i]) == "--brainco-thumb-swap") {
+      braincoThumbSwap = true;
+      std::cout << "[INFO] BrainCo thumb motor 0/1 swap enabled (real hardware)" << std::endl;
     } else if (std::string(argv[i]) == "--set-compliance") {
       if (i + 1 < argc) {
         // Parse compliance values (can be 1 or 3 values)
@@ -4483,7 +4493,8 @@ int main(int argc, char const* argv[]) {
     zmq_out_topic,
     enableMotionRecording,
     initial_compliance,
-    initial_max_close_ratio
+    initial_max_close_ratio,
+    braincoThumbSwap
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   

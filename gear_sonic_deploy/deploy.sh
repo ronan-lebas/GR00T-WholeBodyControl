@@ -385,6 +385,13 @@ if [[ "$ENV_TYPE" == "sim" ]]; then
     EXTRA_ARGS="--disable-crc-check"
     echo -e "${YELLOW}📋 Simulation mode: CRC check will be disabled${NC}"
     echo ""
+else
+    # Real BrainCo hardware wires thumb motors 0/1 opposite to our stack; the
+    # deploy binary swaps them at the DDS wire. Sim must NOT get this flag (its
+    # MuJoCo hand already uses the correct joint order).
+    EXTRA_ARGS="--brainco-thumb-swap"
+    echo -e "${YELLOW}🔧 Real mode: BrainCo thumb motor 0/1 swap enabled${NC}"
+    echo ""
 fi
 
 # ============================================================================
