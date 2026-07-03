@@ -22,6 +22,18 @@ ROS_ENDPOINT_PID=$!
 sleep 2
 
 echo "[quest-relay] ros_tcp_endpoint started (PID $ROS_ENDPOINT_PID)"
+
+# Optional: robot ego-view camera → Quest. Started only when CAMERA_HOST is set,
+# so the default relay is unchanged. Subscribes ZMQ to the composed camera server
+# and republishes the ego_view JPEG as a ROS1 CompressedImage the Quest can show.
+if [ -n "$CAMERA_HOST" ]; then
+    echo "[quest-relay] CAMERA_HOST=$CAMERA_HOST — starting image relay..."
+    python3 -u /image_relay.py --camera-host "$CAMERA_HOST" \
+        ${CAMERA_PORT:+--camera-port "$CAMERA_PORT"} \
+        ${IMAGE_RELAY_FPS:+--fps "$IMAGE_RELAY_FPS"} &
+    echo "[quest-relay] image relay started (PID $!)"
+fi
+
 echo "[quest-relay] Starting ZMQ relay..."
 
 # -u = unbuffered stdout/stderr so relay logs stream live under `docker run`

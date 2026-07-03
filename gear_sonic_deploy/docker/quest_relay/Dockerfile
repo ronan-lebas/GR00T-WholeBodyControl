@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-catkin-tools \
     ros-noetic-geometry-msgs \
     ros-noetic-tf2-msgs \
+    ros-noetic-sensor-msgs \
     && rm -rf /var/lib/apt/lists/*
 
 # Build vr_haptic_msgs and ros_tcp_endpoint in a catkin workspace.
@@ -40,6 +41,8 @@ RUN . /opt/ros/noetic/setup.sh \
 RUN pip3 install --no-cache-dir pyzmq msgpack
 
 COPY gear_sonic_deploy/docker/quest_relay/relay.py /relay.py
+# Optional robot ego-view -> Quest image relay; started by entrypoint.sh when CAMERA_HOST is set.
+COPY gear_sonic_deploy/docker/quest_relay/image_relay.py /image_relay.py
 COPY gear_sonic_deploy/docker/quest_relay/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
