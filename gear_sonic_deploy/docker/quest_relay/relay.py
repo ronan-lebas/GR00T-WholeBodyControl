@@ -51,6 +51,10 @@ class QuestRelayNode:
 
     def __init__(self, head_topic, left_hand_topic, right_hand_topic):
         self._lock = threading.Lock()
+        # Set by the headset callback so the publish loop can wake and emit
+        # immediately on a fresh pose instead of sampling on a fixed timer
+        # (publish-on-receipt); the timer remains a fallback for stalled streams.
+        self._new_pose = threading.Event()
         self._state = {
             "head_pos": list(_ZERO_POS),
             "head_quat": list(_IDENTITY_QUAT),
@@ -79,6 +83,17 @@ class QuestRelayNode:
             # geometry_msgs quaternion is scalar-last [x,y,z,w]; convert to scalar-first [w,x,y,z]
             self._state["head_quat"] = [o.w, o.x, o.y, o.z]
             self._state["timestamp"] = time.time()
+        self._new_pose.set()  # wake the publish loop (headset paces publishing)
+
+    def wait_for_pose(self, timeout: float) -> bool:
+        """Block until a fresh headset pose arrives or ``timeout`` s elapse.
+
+        Returns True if woken by a pose (publish-on-receipt), False on the
+        fallback timeout. Clears the flag so the next call blocks again.
+        """
+        fired = self._new_pose.wait(timeout)
+        self._new_pose.clear()
+        return fired
 
     def _on_tf(self, msg: TFMessage) -> None:
         updates = {}
@@ -154,7 +169,9 @@ def main():
         "--hz",
         type=float,
         default=90.0,
-        help="ZMQ publish rate in Hz (default: 90, matches Quest frame rate)",
+        help="Fallback ZMQ publish rate in Hz when the headset stream stalls "
+        "(default: 90). Normally the relay publishes on-receipt of each headset "
+        "pose, so this only bounds the idle republish rate.",
     )
     args = parser.parse_args()
 
@@ -174,14 +191,18 @@ def main():
     # automatically — no explicit spin thread is needed to receive messages.
     print("[relay] ROS1 node up. Waiting for Quest data...")
 
-    period = 1.0 / max(1.0, args.hz)
+    # Fallback period: publish at least this often even if the headset stream
+    # stalls. Normally we publish-on-receipt, driven by wait_for_pose() below.
+    fallback_period = 1.0 / max(1.0, args.hz)
     topic_bytes = b"quest_data"
     last_log = time.time()
     published = 0
 
     try:
         while True:
-            t_start = time.time()
+            # Block until a fresh headset pose arrives (publish immediately, no
+            # sample-and-hold quantization) or the fallback period elapses.
+            node.wait_for_pose(fallback_period)
 
             snap = node.snapshot()
             pub.send_multipart([topic_bytes, msgpack.packb(snap, use_bin_type=True)])
@@ -209,10 +230,6 @@ def main():
                 )
                 last_log = now
                 published = 0
-
-            elapsed = time.time() - t_start
-            if elapsed < period:
-                time.sleep(period - elapsed)
 
     except KeyboardInterrupt:
         print("\n[relay] Shutting down...")

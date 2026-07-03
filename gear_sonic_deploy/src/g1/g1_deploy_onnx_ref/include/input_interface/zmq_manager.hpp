@@ -110,10 +110,13 @@ class ZMQManager : public InputInterface {
         zmq_host_, zmq_port_, command_topic_,
         /*timeout_ms=*/100,
         zmq_verbose_,
-        /*use_conflate=*/false,
-        /*rcv_hwm=*/3
+        // Latest-wins: each message is a single ZMQ part (see
+        // zmq_packed_message_subscriber.hpp header), so conflate is safe and
+        // avoids up to ~60 ms of queued backlog at 50 Hz from a 3-deep HWM.
+        /*use_conflate=*/true,
+        /*rcv_hwm=*/-1
       );
-      
+
       command_subscriber_->SetOnDecodedMessage(
         [this](const std::string& topic,
                const ZMQPackedMessageSubscriber::DecodedHeader& hdr,
@@ -129,10 +132,12 @@ class ZMQManager : public InputInterface {
         zmq_host_, zmq_port_, planner_topic_,
         /*timeout_ms=*/100,
         zmq_verbose_,
-        /*use_conflate=*/false, 
-        /*rcv_hwm=*/3
+        // Latest-wins (see command_subscriber_ above): drop stale planner
+        // frames instead of queuing them, so control acts on the freshest pose.
+        /*use_conflate=*/true,
+        /*rcv_hwm=*/-1
       );
-      
+
       planner_subscriber_->SetOnDecodedMessage(
         [this](const std::string& topic,
                const ZMQPackedMessageSubscriber::DecodedHeader& hdr,
