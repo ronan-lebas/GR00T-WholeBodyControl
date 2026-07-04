@@ -1,34 +1,50 @@
 # Deployment Setup — Laptop-cabled-to-Robot Topology
 
-This is a practical setup guide for **your specific layout**:
+This is a practical setup guide for **your specific layout**: the robot cabled to
+your **laptop over ethernet**, and you `ssh` into the robot.
 
-- You connect the robot to your **laptop with an ethernet cable**, and `ssh` into
-  the robot.
-- You run **almost everything on the laptop**: the deploy binary
-  (`g1_deploy_onnx_ref`), the Quest relay, the Quest manager, and the data
-  recorder.
-- You run **only two things on the robot** (over your ssh session): the
-  **camera server** and the **BrainCo hand service**.
+**Standard topology (Option B — recommended): everything on the robot except
+teleop + recording.** The robot runs the deploy binary, the camera server, and
+the BrainCo hand service (the 500 Hz control loop closes on-board). The laptop
+runs only the Quest relay, the Quest manager (state-switching + control), and the
+data recorder/viewer. The robot's ego-view camera is streamed **into the Quest**
+so the operator sees the robot's POV.
+
+> The relay stays on the **laptop** for now: the Quest is on Wi-Fi and reaches the
+> laptop, but cannot reach the robot's `192.168.123.x` subnet with the current
+> layout. See **"Future: three-way wired Quest"** near the end for the planned
+> fix. The older **Option A** (deploy on the laptop) is kept below as a fallback.
+
+**Fastest path: the launch scripts.** `scripts/launch_robot_side.sh` and
+`scripts/launch_laptop_side.sh` bake in every host flag for Option B (see
+**Part 2 — Quick start**). The manual, flag-by-flag walkthroughs (Options A and B)
+follow for reference and troubleshooting.
 
 For the full conceptual reference (architecture, ports, troubleshooting), see
-`deployment_report.md`. This file is the "just tell me what to type" companion,
-plus the one piece of networking you need to set up by hand: **giving your
-laptop an address on the robot's network (the "NIC" thing).**
+`deployment_report.md`. The one piece of networking you must set up by hand is
+**giving your laptop an address on the robot's network (the "NIC" thing)** —
+Part 1 — required for both options.
 
 ---
 
 ## 0. Your topology at a glance
 
 ```
-        LAPTOP (you run these)                         ROBOT  (you ssh in,
-   ┌───────────────────────────────┐                   run these)
-   │ quest_relay (Docker)          │              ┌─────────────────────────┐
-   │ quest_manager_thread_server   │   ETHERNET   │ brainco_hand_service     │
-   │ g1_deploy_onnx_ref  (deploy)  │◀════CABLE═══▶│ camera server            │
-   │ run_data_exporter (recorder)  │   192.168.   │ (G1 body firmware + IMU) │
-   │ run_camera_viewer (optional)  │    123.x     │                          │
-   └───────────────────────────────┘              └─────────────────────────┘
+   Quest ──Wi-Fi──▶ LAPTOP (teleop + recording)          ROBOT (control + sensing)
+                 ┌───────────────────────────────┐      ┌─────────────────────────┐
+                 │ quest_relay (Docker)          │      │ brainco_hand_service     │
+                 │  + image_relay (ego-view→Quest)│ ETH  │ camera server (ZMQ 5555) │
+                 │ quest_manager_thread_server   │◀CABLE▶│ g1_deploy_onnx_ref       │
+                 │ run_data_exporter (recorder)  │ 192.  │ (G1 body firmware + IMU) │
+                 │ run_camera_viewer (optional)  │ 168.  │                          │
+                 └───────────────────────────────┘ 123.x └─────────────────────────┘
 ```
+
+This is **Option B**: the deploy binary lives on the robot; the ZMQ links
+(manager⇄deploy feedback, recorder⇄camera/state, image relay⇄camera) cross the
+cable, so **Part 1's NIC setup is still required**. The relay's `image_relay`
+subscribes to the robot camera (ZMQ 5555) and republishes the ego-view as a ROS1
+`CompressedImage` the Quest's Unity `ImageView` head-locks.
 
 Two kinds of traffic run over that **one ethernet cable** (SSH is just a third,
 unrelated thing also riding the cable — it does **not** carry your robot data):
@@ -136,6 +152,68 @@ the cable is in the robot's network port, and that the robot is powered.
 > **Tip:** From now on, the robot's address is whatever you `ssh` to. Find it
 > any time with `ip -br addr` *on the robot* (look for the `192.168.123.x`
 > line). The examples below call it `<ROBOT_IP>`.
+
+---
+
+## Part 2 — Quick start with the launch scripts (recommended: Option B)
+
+After Part 1's NIC setup, the two launch scripts bake in every host flag. Run
+with **no argument** and each script starts all of its components at once in one
+`tmux` window split into tiled **panes** (one per component, each border labelled
+with the component name), launched in the correct order — so you see everything
+side by side — then attaches you to it. Add `--print` to any call to see the exact
+commands without running them.
+
+Set the two IPs once (both scripts read these from the environment; defaults are
+`ROBOT_IP=192.168.123.164`, `LAPTOP_IP=192.168.123.222`):
+
+```bash
+export ROBOT_IP=192.168.123.164     # what you ssh to (verify: ip -br addr on the robot)
+export LAPTOP_IP=192.168.123.222    # your laptop's static addr from Part 1
+```
+
+**On the ROBOT** (ssh in — one command brings up hand → camera → deploy in order):
+
+```bash
+# safety: robot suspended, e-stop in hand — deploy commands the robot immediately
+./scripts/launch_robot_side.sh            # tmux session 'g1_robot': hand + camera + deploy
+```
+
+The camera defaults to the RealSense (`EGO_VIEW_CAMERA=oak` / `OAK_SERIAL` to
+switch). The hand service is launched **manually** by default (the binary picks
+its own DDS interface); set `ROBOT_IFACE=<iface>` to force one, or
+`HAND_USE_SYSTEMD=1` to (re)start it via systemd instead.
+
+**On the LAPTOP** (one command brings up relay → manager → recorder → viewer in order):
+
+```bash
+./scripts/launch_laptop_side.sh   # tmux session 'g1_laptop': relay + manager + recorder + viewer
+```
+
+Point the Quest Unity app at **the laptop's Wi-Fi/LAN IP : 10000**. Tune the
+manager with `MANAGER_EXTRA` (e.g. `MANAGER_EXTRA="--static-base --log-latency"`),
+and the recorder with `TASK_PROMPT` / `DATASET_NAME`.
+
+**tmux basics**: move between panes with `Ctrl-b <arrow>` (or `Ctrl-b o` to cycle);
+`Ctrl-b z` zooms the focused pane to full screen (again to un-zoom). Detach with
+`Ctrl-b d`, re-attach with `tmux attach -t g1_robot` (or `g1_laptop`). Tear a
+session down with `./scripts/launch_robot_side.sh kill` (or `... laptop ... kill`).
+A pane whose component exits stays open showing `[… exited]` so you can read the
+error; press Enter there to close it.
+
+**Single-component / debug mode.** Each script still accepts one component name to
+run it alone in the foreground of the current terminal (handy for restarting one
+piece, or on a host without tmux). Run either script with no valid component (or
+`-h`) to print its usage and the resolved config:
+
+```bash
+# robot: hand | camera | deploy        laptop: relay | manager | recorder | viewer
+./scripts/launch_robot_side.sh deploy    # just (re)start deploy here
+./scripts/launch_laptop_side.sh manager  # just (re)start the manager here
+```
+
+The rest of this document is the manual, flag-by-flag reference the scripts
+automate — read it to understand or debug what a component actually runs.
 
 ---
 
@@ -359,10 +437,22 @@ on the robot. Confirm the resolved interface in the banner, wait for
 > Quest pipeline only needs the ZMQ `g1_debug` feed. Use it if the Jetson doesn't
 > have ROS2 set up.
 
-### B.3 — [LAPTOP] Quest relay
+### B.3 — [LAPTOP] Quest relay (+ ego-view into the Quest)
 
-Identical to §2.4 — runs on the laptop; the Quest app still targets the
-**laptop's** LAN/Wi-Fi IP : `10000`.
+Runs on the laptop; the Quest app still targets the **laptop's** LAN/Wi-Fi IP :
+`10000`. Pass `--camera-host $ROBOT_IP` to also start the **image relay** inside
+the container — it subscribes to the robot camera (ZMQ 5555) and republishes the
+ego-view as a ROS1 `CompressedImage` on `/robot/ego_view/image/compressed`, which
+the Unity `ImageView` auto-discovers and can head-lock:
+
+```bash
+# [LAPTOP] — from repo root
+python gear_sonic_deploy/docker/quest_relay/run_quest_relay.py \
+    --camera-host $ROBOT_IP --camera-port 5555 --image-fps 30
+```
+
+Omit `--camera-host` for the plain relay (no camera in the headset). On the Quest
+side, set the `ImageView` `DebayerMode` to `None`.
 
 ### B.4 — [LAPTOP] Quest manager (feedback now comes from the robot)
 
@@ -419,6 +509,32 @@ from the **deploy or camera** (`--feedback-host`, `--state-zmq-host`,
 > Jetson too — then every flag is `localhost`, but the Quest app must target the
 > **robot's** IP:`10000` and your datasets live on the Jetson. Simpler flags, less
 > convenient for teleop and dataset review.
+
+---
+
+## Future: three-way wired Quest (moving the relay onto the robot)
+
+The remaining thing on the laptop only because of networking is the **Quest
+relay**. Today the Quest reaches the laptop over Wi-Fi but cannot reach the
+robot's `192.168.123.x` subnet, so the relay (which the Quest connects to on TCP
+`10000`) must stay on the laptop.
+
+The planned fix is a **wired three-way layout** where the Quest can reach the
+robot directly, letting the relay + image relay move onto the robot (the
+supervisor's "everything on the robot" goal). Options, easiest first:
+
+- **IP forwarding on the laptop** (no new hardware): keep the current cabling but
+  enable IPv4 forwarding + a NAT/route so the Quest's Wi-Fi packets to the robot's
+  `10000` are forwarded across the cable. The relay runs on the robot; the Quest
+  targets `LAPTOP_IP:10000` and the laptop forwards to `ROBOT_IP:10000`.
+- **A small ethernet switch / robot Wi-Fi**: put the Quest (via a Wi-Fi bridge or
+  the robot's own AP) and the robot on the same subnet, so the Quest targets the
+  **robot** directly and the laptop is only for dataset review.
+
+Until one of these exists, **keep the relay on the laptop** (Part 2 / §B.3) — the
+`launch_laptop_side.sh relay` path. When the wired setup lands, move the relay to
+`launch_robot_side.sh` (add a `relay` component pointing `--camera-host localhost`)
+and point the Quest at the robot's IP.
 
 ---
 
