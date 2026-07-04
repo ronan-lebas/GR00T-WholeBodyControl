@@ -116,6 +116,17 @@ def port_mappings(args: argparse.Namespace) -> list[str]:
     ]
 
 
+def network_args(args: argparse.Namespace) -> list[str]:
+    """Docker networking: either host networking (no NAT hop — preferred on the
+    robot/Jetson) or explicit port mapping. With --network host the container
+    binds directly on the host's interfaces, so 10000/5559 avoid the Docker-NAT
+    hop and ``localhost`` inside the container reaches host services (e.g. the
+    on-board camera server)."""
+    if getattr(args, "network_host", False):
+        return ["--network", "host"]
+    return port_mappings(args)
+
+
 def env_args(args: argparse.Namespace) -> list[str]:
     """Docker ``-e`` env vars. CAMERA_HOST gates the optional image relay
     (entrypoint.sh starts image_relay.py only when it is set)."""
@@ -153,7 +164,7 @@ def print_next_steps(args: argparse.Namespace) -> None:
 
 def run_detached(tag: str, args: argparse.Namespace) -> int:
     cmd = ["docker", "run", "-d", "--rm", "--name", args.name]
-    cmd += [*port_mappings(args), *env_args(args), tag, *relay_args(args)]
+    cmd += [*network_args(args), *env_args(args), tag, *relay_args(args)]
     result = _run(cmd)
     if result.returncode != 0:
         return result.returncode
@@ -175,7 +186,7 @@ def run_detached(tag: str, args: argparse.Namespace) -> int:
 
 def run_attached(tag: str, args: argparse.Namespace) -> int:
     cmd = ["docker", "run", "--rm", "--name", args.name]
-    cmd += [*port_mappings(args), *env_args(args), tag, *relay_args(args)]
+    cmd += [*network_args(args), *env_args(args), tag, *relay_args(args)]
     print(f"\033[0;34m$ {' '.join(cmd)}\033[0m", flush=True)
     print_next_steps(args)
     print("[run_quest_relay] Starting relay (Ctrl-C to stop)...\n")
@@ -215,6 +226,11 @@ def main() -> int:
     parser.add_argument(
         "--zmq-port", type=int, default=5559,
         help="Host port the manager subscribes to for relayed quest_data.",
+    )
+    parser.add_argument(
+        "--network-host", action="store_true",
+        help="Use Docker host networking instead of port mapping (preferred on the "
+             "robot: no NAT hop, and 'localhost' reaches the on-board camera server).",
     )
     parser.add_argument(
         "--rebuild", action="store_true", help="Force rebuild even if the image exists."
