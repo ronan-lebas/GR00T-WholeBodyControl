@@ -115,6 +115,9 @@ class ComposedCameraSensor(Sensor, SensorServer):
         self.error_events: dict[str, threading.Event] = {}
         self.error_messages: dict[str, str] = {}
         self._observation_spaces: dict[str, Any] = {}
+        # Static per-camera calibration (e.g. RealSense intrinsics/extrinsics), if the
+        # driver exposes get_calibration(). Published as "fp_meta" for the ego view camera.
+        self.calibration_data: dict[str, Any] = {}
 
         camera_configs = self._get_camera_configs()
 
@@ -274,6 +277,9 @@ class ComposedCameraSensor(Sensor, SensorServer):
                     self._observation_spaces[mount_position] = obs_space
                 else:
                     self._observation_spaces[mount_position] = True
+
+                if hasattr(camera, "get_calibration"):
+                    self.calibration_data[mount_position] = camera.get_calibration()
 
                 consecutive_failures = 0
                 max_consecutive_failures = 10
@@ -455,7 +461,11 @@ class ComposedCameraSensor(Sensor, SensorServer):
             all_timestamps.update(camera_data.get("timestamps", {}))
             all_images.update(camera_data.get("images", {}))
         img_schema = ImageMessageSchema(timestamps=all_timestamps, images=all_images)
-        return img_schema.serialize()
+        serialized_message = img_schema.serialize()
+        ego_calibration = self.calibration_data.get(CameraMountPosition.EGO_VIEW.value)
+        if ego_calibration is not None:
+            serialized_message["fp_meta"] = ego_calibration
+        return serialized_message
 
     def run_server(self):
         """Main server loop — reads, serializes and publishes frames."""

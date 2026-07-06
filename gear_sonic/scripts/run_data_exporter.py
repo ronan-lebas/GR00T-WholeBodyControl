@@ -108,6 +108,15 @@ class SonicDataExporterConfig:
     hand_type: Literal["dex3", "brainco"] = "dex3"
     """Hand type: 'dex3' (7 DOF, Unitree DEX3) or 'brainco' (6 DOF, BrainCo Revo2)."""
 
+    skip_robot_state: bool = False
+    """Skip waiting for robot proprioception (robot_config + g1_debug state); use zero-filled
+    dummy state instead. For testing camera/depth recording without the robot's C++ deploy
+    process running."""
+
+    auto_record: bool = False
+    """Skip keyboard/ZMQ recording toggle controls and start recording immediately at launch.
+    Stop with Ctrl+C to save the episode."""
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -232,12 +241,16 @@ class GrootDataCollector:
         sonic_data_zmq_port: int = 5556,
         state_zmq_host: str = "localhost",
         state_zmq_port: int = 5557,
+        skip_robot_state: bool = False,
+        auto_record: bool = False,
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
         self.loop_period = 1.0 / frequency
         self.data_exporter = data_exporter
         self.robot_model = robot_model
+        self._skip_robot_state = skip_robot_state
+        self._auto_record = auto_record
 
         self._episode_state = EpisodeState()
         self._keyboard_listener = ZMQKeyboardSubscriber()
@@ -296,6 +309,13 @@ class GrootDataCollector:
 
         print(f"Recording to {self.data_exporter.meta.root}")
 
+        if self._auto_record:
+            self._episode_state.change_state()  # IDLE -> RECORDING
+            self._print_and_say(
+                f"Auto-record enabled, started recording {self.current_episode_index}",
+                blocking=False,
+            )
+
     @property
     def current_episode_index(self):
         return self.data_exporter.episode_buffer["episode_index"]
@@ -319,6 +339,8 @@ class GrootDataCollector:
 
     def _check_recording_commands(self):
         """Check keyboard + ZMQ toggle flags for recording commands."""
+        if self._auto_record:
+            return
         key = self._keyboard_listener.read_msg()
 
         if self._manager_toggle_da:
@@ -332,9 +354,7 @@ class GrootDataCollector:
             self._episode_state.change_state()
             if self._episode_state.get_state() == self._episode_state.RECORDING:
                 self._initial_yaw = None
-                if self._fp_enabled:
-                    self._fp_writer.start_episode(self.current_episode_index)
-                    self._fp_last_written_ts = None
+                self._fp_last_written_ts = None
                 self._print_and_say(
                     f"Started recording {self.current_episode_index}", blocking=False
                 )
@@ -540,15 +560,16 @@ class GrootDataCollector:
                 print(f"[Latency] {', '.join(parts)}")
 
     def _write_foundation_pose_frame(self) -> None:
-        """Save one FoundationPose frame (rgb+depth, plus mask/cam_K on frame 0).
+        """Save one FoundationPose frame (rgb+depth, plus cam_K/extrinsics on frame 0).
 
         Self-guards: only writes when the current message carries a *fresh* depth frame
-        (depth/seg arrive at a reduced rate, and the loop polls faster than they arrive).
+        (on the sim renderer depth arrives at a reduced rate; on the real RealSense every
+        frame has a matching depth frame, so this just de-dupes on timestamp).
         """
         if self.latest_image_msg is None:
             return
         images = self.latest_image_msg["images"]
-        if "ego_view_depth" not in images or "ego_view_seg" not in images:
+        if "ego_view_depth" not in images:
             return
 
         ts = self.latest_image_msg.get("timestamps", {}).get("ego_view")
@@ -559,15 +580,15 @@ class GrootDataCollector:
         fp_meta = self.latest_image_msg.get("fp_meta") or {}
         # Row of the proprio/parquet frame added in this same loop iteration
         # (add_frame already incremented "size", so the just-added row is size-1).
-        # FP frames are sparser than proprio, so this is what links each object
+        # FP frames may be sparser than proprio, so this is what links each object
         # pose to the exact robot state for camera FK downstream.
         proprio_frame_index = max(0, self.data_exporter.episode_buffer.get("size", 1) - 1)
         self._fp_writer.write_frame(
             rgb=images["ego_view"],
             depth=images["ego_view_depth"],
-            mask=images["ego_view_seg"],
             cam_K=fp_meta.get("cam_K"),
-            box_half_extents=fp_meta.get("box_half_extents"),
+            cam_extrinsics_R=fp_meta.get("cam_extrinsics_R"),
+            cam_extrinsics_t=fp_meta.get("cam_extrinsics_t"),
             proprio_frame_index=proprio_frame_index,
             timestamp=ts,
         )
@@ -597,14 +618,35 @@ class GrootDataCollector:
                 self.data_exporter.save_episode()
                 self.sonic_timing_monitor.reset()
                 self._initial_yaw = None
+                self._fp_writer.close_episode()
                 self._print_and_say("Finished saving episode")
             else:
                 self._print_and_say("Skipping save: no frames collected", say=False)
             self._episode_state.change_state()
         return True
 
+    def _make_dummy_proprio(self) -> dict:
+        """Zero-filled proprio message used when --skip-robot-state bypasses the g1_debug stream."""
+        n_body = len(self.robot_model.get_body_actuated_joint_indices())
+        n_hand = len(self.robot_model.get_hand_actuated_joint_indices("left"))
+        zeros_body = np.zeros(n_body, dtype=np.float64)
+        zeros_hand = np.zeros(n_hand, dtype=np.float64)
+        return {
+            "body_q": zeros_body,
+            "left_hand_q": zeros_hand,
+            "right_hand_q": zeros_hand,
+            "last_action": zeros_body,
+            "last_left_hand_action": zeros_hand,
+            "last_right_hand_action": zeros_hand,
+            "base_quat": np.array([1.0, 0.0, 0.0, 0.0]),
+            "ros_timestamp": time.time(),
+        }
+
     def _add_data_frame(self):
         t_start = time.monotonic()
+
+        if self._skip_robot_state and self.latest_proprio_msg is None:
+            self.latest_proprio_msg = self._make_dummy_proprio()
 
         if self.latest_proprio_msg is None or self.latest_image_msg is None:
             self._print_and_say(
@@ -664,6 +706,8 @@ class GrootDataCollector:
         self.data_exporter.add_frame(frame_data)
 
         if self._fp_enabled:
+            if not self._fp_writer.is_active():
+                self._fp_writer.start_episode(self.current_episode_index)
             self._write_foundation_pose_frame()
 
         return self._finalize_frame(t_start)
@@ -953,8 +997,13 @@ class GrootDataCollector:
             print("Data exporter terminated by user")
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
             if buffer_size > 0:
-                self.data_exporter.save_episode_as_discarded()
-                self._fp_writer.discard_episode()
+                if self._auto_record:
+                    # No keyboard control to stop-and-save; Ctrl+C is the only way out.
+                    self.data_exporter.save_episode()
+                    self._fp_writer.close_episode()
+                else:
+                    self.data_exporter.save_episode_as_discarded()
+                    self._fp_writer.discard_episode()
 
         finally:
             self.save_and_cleanup()
@@ -983,9 +1032,13 @@ def main(config: SonicDataExporterConfig):
 
     text_to_speech = TextToSpeech() if config.text_to_speech else None
 
-    robot_config = poll_robot_config_zmq(
-        config.state_zmq_host, config.state_zmq_port, config.robot_config_timeout
-    )
+    if config.skip_robot_state:
+        print("[Config] --skip-robot-state set, not waiting for robot_config")
+        robot_config = {}
+    else:
+        robot_config = poll_robot_config_zmq(
+            config.state_zmq_host, config.state_zmq_port, config.robot_config_timeout
+        )
 
     data_exporter = Gr00tDataExporter.create(
         save_root=f"{config.root_output_dir}/{config.dataset_name}",
@@ -1007,6 +1060,8 @@ def main(config: SonicDataExporterConfig):
         sonic_data_zmq_port=config.sonic_zmq_port,
         state_zmq_host=config.state_zmq_host,
         state_zmq_port=config.state_zmq_port,
+        skip_robot_state=config.skip_robot_state,
+        auto_record=config.auto_record,
     )
     data_collector.run()
 
