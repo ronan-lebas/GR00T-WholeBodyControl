@@ -145,9 +145,9 @@ def parse_args():
         help="DDS publish rate (Hz) of the background command thread.",
     )
     p.add_argument(
-        "--max-delta-q", type=float, default=0.02,
-        help="Max per-tick normalized position change (delta-q smoothing), like brainco_hands.hpp. "
-        "At the default 100 Hz / 0.02 this is 2.0/s (~0.5 s to fully close).",
+        "--max-delta-q", type=float, default=0.15,
+        help="Max the command may LEAD the measured position per tick, in normalized units "
+        "(like brainco_hands.hpp)."
     )
     p.add_argument(
         "--speed", type=float, default=1.0,
@@ -261,7 +261,10 @@ class BrainCoHandPublisher:
                 reference = self._measured[side]
                 if reference is None:
                     reference = self._published[side].copy()
-            # Delta-q smoothing relative to the reference (measured state if available).
+            # Clamp how far the command may lead the reference (measured state if
+            # available) this tick. Not a hard speed cap: the firmware drives to
+            # the command at its own dq rate, so this only bounds the lead (see
+            # --max-delta-q / brainco_hands.hpp), preventing sudden jumps.
             delta = np.clip(target - reference, -self._max_delta_q, self._max_delta_q)
             q = np.clip(reference + delta, 0.0, 1.0)
             # Swap thumb 0/1 only on the wire; keep _published in our convention.
