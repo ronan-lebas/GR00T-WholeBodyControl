@@ -76,19 +76,47 @@ class RealSenseSensor(Sensor, SensorServer):
                 rs.format.z16,
                 config.fps,
             )
-            self.pipeline.start(self.config)
+            profile = self.pipeline.start(self.config)
         except Exception as e:
             raise RuntimeError(f"Failed to start RealSense pipeline: {e}")
 
         self._realsense_config = config
         self._run_as_server = run_as_server
         self.mount_position = mount_position
+        self._depth_scale_mm = profile.get_device().first_depth_sensor().get_depth_scale() * 1000.0
+        self._calibration = self._read_calibration(profile)
         if self._run_as_server:
             self.start_server(port)
         print(
             f"Done initializing RealSense sensor: "
             f"{devices[id].get_info(rs.camera_info.serial_number)}"
         )
+
+    def _read_calibration(self, profile) -> dict[str, Any]:
+        """Color intrinsics + depth->color extrinsics (depth/color are separate sensors)."""
+        color_intrinsics = (
+            profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+        )
+        depth_stream = profile.get_stream(rs.stream.depth).as_video_stream_profile()
+        extrinsics = depth_stream.get_extrinsics_to(profile.get_stream(rs.stream.color))
+
+        cam_K = np.array(
+            [
+                [color_intrinsics.fx, 0.0, color_intrinsics.ppx],
+                [0.0, color_intrinsics.fy, color_intrinsics.ppy],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        return {
+            "cam_K": cam_K,
+            "cam_extrinsics_R": np.array(extrinsics.rotation, dtype=np.float64).reshape(3, 3),
+            "cam_extrinsics_t": np.array(extrinsics.translation, dtype=np.float64),
+        }
+
+    def get_calibration(self) -> dict[str, Any]:
+        """Static camera calibration: color intrinsics + depth->color extrinsics."""
+        return self._calibration
 
     def read(self) -> dict[str, Any] | None:
         try:
@@ -107,6 +135,10 @@ class RealSenseSensor(Sensor, SensorServer):
         try:
             color_image = np.asanyarray(color_frame.get_data())
             depth_image = np.asanyarray(depth_frame.get_data())
+            if self._depth_scale_mm != 1.0:
+                depth_image = (depth_image.astype(np.float32) * self._depth_scale_mm).astype(
+                    np.uint16
+                )
         except Exception as e:
             print(f"ERROR! Failed to convert frames to numpy arrays: {e}")
             return None

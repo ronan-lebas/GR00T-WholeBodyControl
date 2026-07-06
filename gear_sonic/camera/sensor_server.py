@@ -120,6 +120,9 @@ class ImageMessageSchema:
         for key, image in self.images.items():
             if isinstance(image, bytes | bytearray):
                 serialized_msg["images"][key] = image
+            elif key.endswith("_depth") or key.endswith("_seg"):
+                # Lossless PNG: depth is 16-bit, JPEG would truncate it to 8-bit.
+                serialized_msg["images"][key] = ImageUtils.encode_depth_image(image)
             else:
                 serialized_msg["images"][key] = ImageUtils.encode_image(image)
         return serialized_msg
