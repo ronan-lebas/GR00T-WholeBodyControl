@@ -38,7 +38,11 @@ RUN . /opt/ros/noetic/setup.sh \
     && catkin_make \
     && rm -rf build
 
-RUN pip3 install --no-cache-dir pyzmq msgpack
+# The base image is Python 3.8 (EOL). Newer pyzmq (>=26) no longer ships cp38
+# aarch64 wheels, so pip would build from source and fail on a
+# scikit-build-core/numpy incompatibility. Pin to a version that still has a
+# prebuilt manylinux aarch64 cp38 wheel.
+RUN pip3 install --no-cache-dir "pyzmq==25.1.2" msgpack
 
 COPY gear_sonic_deploy/docker/quest_relay/relay.py /relay.py
 # Optional robot ego-view -> Quest image relay; started by entrypoint.sh when CAMERA_HOST is set.
