@@ -34,6 +34,27 @@ import tyro
 from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
 
 
+def to_display_bgr(img: np.ndarray) -> np.ndarray:
+    """Convert any camera stream to a 3-channel uint8 BGR image for display/recording.
+
+    RGB frames are color-converted. Single-channel frames (depth) are shown as
+    grayscale from their raw values, matching what ``FoundationPoseWriter`` stores on
+    disk (it writes the received depth array verbatim). The camera server's JPEG
+    encode path collapses depth to 8-bit [0, 255], so it is displayed directly; any
+    wider-range integer depth is scaled down to 8-bit so it stays visible.
+    """
+    if img.ndim == 2 or img.shape[2] == 1:
+        depth = img[..., 0] if img.ndim == 3 else img
+        if depth.dtype != np.uint8:
+            max_val = float(depth.max()) or 1.0
+            depth = np.clip(depth.astype(np.float32) * (255.0 / max_val), 0, 255)
+        gray = depth.astype(np.uint8)
+        return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    if img.shape[2] == 3:
+        return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    return img
+
+
 @dataclass
 class CameraViewerConfig:
     """CLI config for the ROS-free camera viewer."""
@@ -108,10 +129,7 @@ def main(config: CameraViewerConfig):
                 if img is None:
                     continue
 
-                if img.shape[2] == 3:
-                    img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                else:
-                    img_bgr = img
+                img_bgr = to_display_bgr(img)
 
                 if is_recording and name in video_writers:
                     video_writers[name].write(img_bgr)
