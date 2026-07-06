@@ -146,7 +146,7 @@ public:
         // lets the command stay far enough ahead for the firmware to run near
         // its dq rate. Compile-time for now; a hardware-tunable value next
         // session may want 0.1-0.15. Called at 500 Hz from LowCommandWriter.
-        constexpr double MAX_DELTA_Q = 0.1;
+        constexpr double MAX_DELTA_Q = 0.15;
 
         for (bool is_left : {true, false}) {
             HandCtx& ctx = is_left ? left_ : right_;
