@@ -551,9 +551,9 @@ else
     echo -e "${YELLOW}📋 This will start the simulation control system.${NC}"
 fi
 echo ""
-# read -p "$(echo -e ${GREEN}Proceed with deployment? [Y/n]: ${NC})" confirm
+read -p "$(echo -e ${GREEN}Proceed with deployment? [Y/n]: ${NC})" confirm
 
-# if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
+if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
 echo ""
 echo -e "${GREEN}🚀 Starting deployment...${NC}"
 echo ""
@@ -577,8 +577,8 @@ else
         --output-type "$OUTPUT_TYPE" \
         --zmq-host "$ZMQ_HOST"
 fi
-# else
-#     echo ""
-#     echo -e "${YELLOW}Deployment cancelled.${NC}"
-#     exit 0
-# fi
+else
+    echo ""
+    echo -e "${YELLOW}Deployment cancelled.${NC}"
+    exit 0
+fi
