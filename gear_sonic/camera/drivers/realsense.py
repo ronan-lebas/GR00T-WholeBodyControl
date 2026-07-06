@@ -100,18 +100,16 @@ class RealSenseSensor(Sensor, SensorServer):
         depth_stream = profile.get_stream(rs.stream.depth).as_video_stream_profile()
         extrinsics = depth_stream.get_extrinsics_to(profile.get_stream(rs.stream.color))
 
-        cam_K = np.array(
-            [
-                [color_intrinsics.fx, 0.0, color_intrinsics.ppx],
-                [0.0, color_intrinsics.fy, color_intrinsics.ppy],
-                [0.0, 0.0, 1.0],
-            ],
-            dtype=np.float64,
-        )
+        cam_K = [
+            [color_intrinsics.fx, 0.0, color_intrinsics.ppx],
+            [0.0, color_intrinsics.fy, color_intrinsics.ppy],
+            [0.0, 0.0, 1.0],
+        ]
+        # Plain lists, not ndarrays: msgpack.packb() (sensor_server.py) has no numpy hook.
         return {
             "cam_K": cam_K,
-            "cam_extrinsics_R": np.array(extrinsics.rotation, dtype=np.float64).reshape(3, 3),
-            "cam_extrinsics_t": np.array(extrinsics.translation, dtype=np.float64),
+            "cam_extrinsics_R": list(extrinsics.rotation),
+            "cam_extrinsics_t": list(extrinsics.translation),
         }
 
     def get_calibration(self) -> dict[str, Any]:
