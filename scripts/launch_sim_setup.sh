@@ -37,6 +37,10 @@
 #   --print / -n   show the exact command(s) without running (safe to test).
 #   --mock-quest   full-stack modes: run mock_quest_streamer in place of relay+manager
 #                  (no headset needed — the mock drives canned teleop on 5556).
+#   --replay-quest [npz]  full-stack modes: run the manager in replay mode on the given
+#                  NPZ (default: data/quest/traj_20260605_182839_000.npz) and drop the
+#                  relay pane (no live Quest). Press 's' in the manager pane to play.
+#                  Mutually exclusive with --mock-quest.
 set -euo pipefail
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -55,6 +59,10 @@ SIM_EXTRA="${SIM_EXTRA:-}"                     # extra run_sim_loop.py flags, e.
 DEPLOY_ZMQ_HOST="${DEPLOY_ZMQ_HOST:-host.docker.internal}"
 DEPLOY_EXTRA="${DEPLOY_EXTRA:-}"              # extra deploy.sh flags (inside the container)
 MANAGER_EXTRA="${MANAGER_EXTRA:---static-base}"  # default: static base (robot doesn't walk)
+# Non-empty => start the manager in replay mode (reads this NPZ instead of the live
+# Quest); set by --replay-quest [path]. The relay pane is dropped in replay mode.
+REPLAY_QUEST="${REPLAY_QUEST:-}"
+REPLAY_QUEST_DEFAULT="$REPO/data/quest/traj_20260605_182839_000.npz"
 SIM_VENV="${SIM_VENV:-$REPO/.venv_sim}"
 TELEOP_VENV="${TELEOP_VENV:-$REPO/.venv_teleop}"
 DATA_VENV="${DATA_VENV:-$REPO/.venv_data_collection}"
@@ -62,21 +70,37 @@ SESSION="${SESSION:-g1_sim}"                   # tmux session name
 
 # Config vars propagated into each tmux window (so exported overrides survive).
 CONFIG_VARS=(REPO CAMERA_PORT IMAGE_FPS TASK_PROMPT RENDER_DEPTH_SEG \
-             SIM_EXTRA DEPLOY_ZMQ_HOST DEPLOY_EXTRA MANAGER_EXTRA SIM_VENV TELEOP_VENV \
+             SIM_EXTRA DEPLOY_ZMQ_HOST DEPLOY_EXTRA MANAGER_EXTRA REPLAY_QUEST SIM_VENV TELEOP_VENV \
              DATA_VENV SESSION)
 DEFAULT_COMPONENTS=(sim deploy relay manager recorder viewer teardown)
 
 DRYRUN=0
 MOCK_QUEST=0   # --mock-quest: swap relay+manager for the mock_quest_streamer
 POS=()
-for arg in "$@"; do
-    case "$arg" in
+while [ $# -gt 0 ]; do
+    case "$1" in
         -n|--print) DRYRUN=1 ;;
         --mock-quest) MOCK_QUEST=1 ;;
-        *) POS+=("$arg") ;;
+        # --replay-quest [path]: manager replays an NPZ instead of the live Quest.
+        # The path is optional; if the next token isn't an NPZ, use the default.
+        --replay-quest)
+            if [ $# -gt 1 ] && [[ "$2" == *.npz ]]; then
+                REPLAY_QUEST="$2"; shift
+            else
+                REPLAY_QUEST="$REPLAY_QUEST_DEFAULT"
+            fi
+            ;;
+        --replay-quest=*) REPLAY_QUEST="${1#*=}" ;;
+        *) POS+=("$1") ;;
     esac
+    shift
 done
 MODE="${POS[0]:-}"
+
+if [ "$MOCK_QUEST" -eq 1 ] && [ -n "$REPLAY_QUEST" ]; then
+    echo "ERROR: --mock-quest and --replay-quest are mutually exclusive." >&2
+    exit 2
+fi
 
 # emit <cmd...>: print the shell-quoted command, then run it unless --print.
 emit() {
@@ -201,11 +225,15 @@ run_single() {
             ;;
         manager)
             # 'b' = box reset, '0' = full sim reset (shipped via manager_state to the sim).
+            # With REPLAY_QUEST set, the manager replays that NPZ instead of the live
+            # Quest relay (press 's' to start playback once the policy is up).
+            manager_args=(--relay-host localhost --relay-port 5559
+                          --port 5556
+                          --feedback-host localhost --feedback-port 5557)
+            [ -n "$REPLAY_QUEST" ] && manager_args+=(--replay "$REPLAY_QUEST")
             # shellcheck disable=SC2086
             run "$TELEOP_VENV" - python "$REPO/gear_sonic/scripts/quest_manager_thread_server.py" \
-                --relay-host localhost --relay-port 5559 \
-                --port 5556 \
-                --feedback-host localhost --feedback-port 5557 $MANAGER_EXTRA
+                "${manager_args[@]}" $MANAGER_EXTRA
             ;;
         recorder)
             run "$DATA_VENV" - python "$REPO/gear_sonic/scripts/run_data_exporter.py" \
@@ -290,12 +318,14 @@ launch_tmux() {
 
 usage() {
     cat >&2 <<EOF
-Usage: $0 [all|sim|deploy|relay|manager|recorder|viewer|mock|teardown|kill] [--mock-quest] [--print]
+Usage: $0 [all|sim|deploy|relay|manager|recorder|viewer|mock|teardown|kill] [--mock-quest] [--replay-quest [npz]] [--print]
 
 Sim manipulation stack (no robot — everything on this machine):
   (no args)  start sim + deploy + relay + manager + recorder + viewer (+ teardown) as tiled panes
   all        same as no args
   --mock-quest  (with all/no-args) swap relay+manager for mock_quest_streamer
+  --replay-quest [npz]  (with all/no-args) manager replays the NPZ (default:
+                data/quest/traj_20260605_182839_000.npz), relay pane dropped
   sim        MuJoCo sim: table + box + ego-view publisher on ZMQ $CAMERA_PORT — single, foreground
   deploy     docker/run-ros2-dev.sh container; inside, sources setup_env.sh and runs
              './deploy.sh sim --input-type zmq_manager --zmq-host $DEPLOY_ZMQ_HOST --yes' (auto-typed in tmux)
@@ -349,6 +379,17 @@ case "$MODE" in
                     relay)   components+=(mock) ;;   # take relay's slot
                     manager) ;;                      # drop (mock covers it)
                     *)       components+=("$c") ;;
+                esac
+            done
+        elif [ -n "$REPLAY_QUEST" ]; then
+            # Replay reads the NPZ inside the manager; the live Quest relay (and its
+            # headset image relay) is unused — drop it. The manager keeps its slot
+            # and picks up --replay from REPLAY_QUEST.
+            components=()
+            for c in "${DEFAULT_COMPONENTS[@]}"; do
+                case "$c" in
+                    relay) ;;                        # drop (no live Quest in replay)
+                    *)     components+=("$c") ;;
                 esac
             done
         fi
