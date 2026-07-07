@@ -24,6 +24,10 @@
 #   ./scripts/launch_sim_setup.sh recorder   # dataset recorder (optional)
 #   ./scripts/launch_sim_setup.sh viewer     # camera viewer (optional)
 #   ./scripts/launch_sim_setup.sh mock       # mock_quest_streamer INSTEAD of relay+manager
+#   ./scripts/launch_sim_setup.sh teardown   # parking pane: press Enter to kill the whole stack
+#
+# To close everything: focus the 'teardown' pane and press Enter (or run the kill
+# command below from any shell).
 #
 # Scene resets during teleop (from the manager pane): 'b' puts the box back on the
 # table (between episodes); '0' full sim reset (recovery — pause with 'p' first).
@@ -60,7 +64,7 @@ SESSION="${SESSION:-g1_sim}"                   # tmux session name
 CONFIG_VARS=(REPO CAMERA_PORT IMAGE_FPS TASK_PROMPT RENDER_DEPTH_SEG \
              SIM_EXTRA DEPLOY_ZMQ_HOST DEPLOY_EXTRA MANAGER_EXTRA SIM_VENV TELEOP_VENV \
              DATA_VENV SESSION)
-DEFAULT_COMPONENTS=(sim deploy relay manager recorder viewer)
+DEFAULT_COMPONENTS=(sim deploy relay manager recorder viewer teardown)
 
 DRYRUN=0
 MOCK_QUEST=0   # --mock-quest: swap relay+manager for the mock_quest_streamer
@@ -227,6 +231,16 @@ run_single() {
             run "$TELEOP_VENV" "$REPO" python gear_sonic/scripts/mock_quest_streamer.py \
                 --hand brainco
             ;;
+        teardown)
+            # A parking pane: focus it and press Enter to tear the whole stack down.
+            # Runs the same 'kill' path (which removes the relay container, then kills
+            # the tmux session — including this pane).
+            echo "# [sim:teardown] focus this pane and press Enter to kill the '$SESSION' stack"
+            printf '%q ' "$SELF" kill; echo
+            if [ "$DRYRUN" -eq 1 ]; then return 0; fi
+            read -r -p ">>> Press Enter to KILL everything (sim, deploy, relay, manager, ...) <<< "
+            exec "$SELF" kill
+            ;;
         *)
             usage; exit 2 ;;
     esac
@@ -276,10 +290,10 @@ launch_tmux() {
 
 usage() {
     cat >&2 <<EOF
-Usage: $0 [all|sim|deploy|relay|manager|recorder|viewer|mock|kill] [--mock-quest] [--print]
+Usage: $0 [all|sim|deploy|relay|manager|recorder|viewer|mock|teardown|kill] [--mock-quest] [--print]
 
 Sim manipulation stack (no robot — everything on this machine):
-  (no args)  start sim + deploy + relay + manager + recorder + viewer as tiled panes
+  (no args)  start sim + deploy + relay + manager + recorder + viewer (+ teardown) as tiled panes
   all        same as no args
   --mock-quest  (with all/no-args) swap relay+manager for mock_quest_streamer
   sim        MuJoCo sim: table + box + ego-view publisher on ZMQ $CAMERA_PORT — single, foreground
@@ -290,7 +304,8 @@ Sim manipulation stack (no robot — everything on this machine):
   recorder   dataset recorder                                             — single, foreground
   viewer     camera viewer                                                — single, foreground
   mock       mock_quest_streamer (binds 5556) — run INSTEAD of relay+manager
-  kill       kill the '$SESSION' tmux session
+  teardown   parking pane: focus it and press Enter to kill the whole stack
+  kill       kill the '$SESSION' tmux session (+ remove the relay container)
 
 Resolved config: CAMERA_PORT=$CAMERA_PORT  RENDER_DEPTH_SEG=$RENDER_DEPTH_SEG
                  MANAGER_EXTRA='$MANAGER_EXTRA'  SIM_EXTRA='$SIM_EXTRA'  SESSION=$SESSION
@@ -300,7 +315,7 @@ EOF
 }
 
 case "$MODE" in
-    sim|deploy|relay|manager|recorder|viewer|mock)
+    sim|deploy|relay|manager|recorder|viewer|mock|teardown)
         run_single "$MODE"
         ;;
     kill)
@@ -309,13 +324,18 @@ case "$MODE" in
         # doesn't handle SIGHUP) are killed — so tearing down tmux leaks it and its
         # ports (10000/5559) stay bound. Force-remove it too. Both steps are
         # best-effort so cleanup runs even if one target is already gone.
+        #
+        # Remove the container FIRST, then kill the session: 'kill' may be invoked
+        # from a pane inside the session itself (the teardown pane), and killing the
+        # session takes that pane's shell down with it — so anything after
+        # kill-session would not run.
         if [ "$DRYRUN" -eq 1 ]; then
-            printf '%q ' tmux kill-session -t "$SESSION"; echo
             printf '%q ' docker rm -f quest-relay; echo
+            printf '%q ' tmux kill-session -t "$SESSION"; echo
         else
-            tmux kill-session -t "$SESSION" 2>/dev/null || true
             docker rm -f quest-relay 2>/dev/null || true
-            echo "killed tmux session '$SESSION'; removed quest-relay container (if present)"
+            echo "removed quest-relay container (if present); killing tmux session '$SESSION'..."
+            tmux kill-session -t "$SESSION" 2>/dev/null || true
         fi
         ;;
     ""|all|tmux)
