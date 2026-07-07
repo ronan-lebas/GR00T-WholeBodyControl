@@ -178,12 +178,34 @@ class DefaultEnv:
 
         return default_dof_properties
 
-    def _inject_box(self, xml_path: str, box_config: dict) -> str:
-        """Inject a free box body into the scene XML; returns path to temp file."""
-        tree = ET.parse(xml_path)
-        root = tree.getroot()
-        worldbody = root.find("worldbody")
+    @staticmethod
+    def _append_table(worldbody: ET.Element, table_config: dict) -> None:
+        """Append a static table body (box top + center leg, no joint) to the worldbody."""
+        x, y = table_config["pos"]
+        hx, hy = table_config["top_size"]
+        ht = table_config["top_thickness"]
+        top_z = table_config["height"]
 
+        table_body = ET.SubElement(worldbody, "body")
+        table_body.set("name", "table")
+        table_body.set("pos", f"{x} {y} 0")
+        top = ET.SubElement(table_body, "geom")
+        top.set("name", "table_top")
+        top.set("type", "box")
+        top.set("size", f"{hx} {hy} {ht}")
+        top.set("pos", f"0 0 {top_z - ht}")
+        top.set("rgba", "0.6 0.4 0.25 1")
+        leg_half = (top_z - 2 * ht) / 2
+        leg = ET.SubElement(table_body, "geom")
+        leg.set("name", "table_leg")
+        leg.set("type", "box")
+        leg.set("size", f"0.06 0.06 {leg_half}")
+        leg.set("pos", f"0 0 {leg_half}")
+        leg.set("rgba", "0.5 0.35 0.2 1")
+
+    @staticmethod
+    def _append_box(worldbody: ET.Element, box_config: dict) -> None:
+        """Append a free box body to the worldbody."""
         pos = box_config["pos"]
         size = box_config["size"]
         mass = box_config["mass"]
@@ -203,6 +225,19 @@ class DefaultEnv:
             geom.set("contype", "0")
             geom.set("conaffinity", "0")
 
+    def _inject_scene_objects(
+        self, xml_path: str, box_config: dict | None, table_config: dict | None
+    ) -> str:
+        """Inject table and/or box bodies into the scene XML; returns path to temp file."""
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        worldbody = root.find("worldbody")
+
+        if table_config:
+            self._append_table(worldbody, table_config)
+        if box_config:
+            self._append_box(worldbody, box_config)
+
         # Write next to the original so relative <include> paths remain valid
         xml_dir = os.path.dirname(xml_path)
         with tempfile.NamedTemporaryFile(
@@ -216,8 +251,9 @@ class DefaultEnv:
         xml_path = str(pathlib.Path(GEAR_SONIC_ROOT) / self.config["ROBOT_SCENE"])
 
         box_config = self.config.get("box_config", None)
-        if box_config:
-            tmp_xml = self._inject_box(xml_path, box_config)
+        table_config = self.config.get("table_config", None)
+        if box_config or table_config:
+            tmp_xml = self._inject_scene_objects(xml_path, box_config, table_config)
             try:
                 self.mj_model = mujoco.MjModel.from_xml_path(tmp_xml)
             finally:
@@ -235,6 +271,7 @@ class DefaultEnv:
             self._setup_foundation_pose(box_config)
 
         self._setup_held_box(box_config)
+        self._setup_box_reset(box_config)
 
         self.joint_class_map = self._get_dof_indices_by_class()
 
@@ -266,6 +303,9 @@ class DefaultEnv:
         # Enable the elastic band
         if self.config["ENABLE_ELASTIC_BAND"] and self.use_floating_root_link:
             self.elastic_band = ElasticBand()
+            # Optionally start detached (same as pressing '9' in the viewer once).
+            if self.config.get("detach_gantry", False):
+                self.elastic_band.enable = False
             if "g1" in self.config["ROBOT_TYPE"]:
                 if self.config["enable_waist"]:
                     self.band_attached_link = self.mj_model.body("pelvis").id
@@ -514,6 +554,35 @@ class DefaultEnv:
             f"[HeldBox] box anchored to wrist midpoint, root-frame offset "
             f"{self.held_anchor_offset.tolist()} (collision disabled)"
         )
+
+    def _setup_box_reset(self, box_config: dict | None):
+        """Cache the free box's joint addresses and spawn pose for ``reset_box``.
+
+        Only applies to a free (non-held) box: the held box is re-anchored to the
+        hands every step, so teleporting it back would be immediately overridden.
+        """
+        self.has_free_box = bool(box_config) and not box_config.get("held")
+        if not self.has_free_box:
+            return
+        box_body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "box")
+        box_jnt_id = int(self.mj_model.body_jntadr[box_body_id])
+        self.box_qadr = int(self.mj_model.jnt_qposadr[box_jnt_id])
+        self.box_dofadr = int(self.mj_model.jnt_dofadr[box_jnt_id])
+        # Identity quaternion matches the injected XML body (no orientation attr),
+        # so reset_box() and a full mj_resetData land the box in the same pose.
+        self.box_spawn_pose = np.array([*box_config["pos"], 1.0, 0.0, 0.0, 0.0])
+
+    def reset_box(self):
+        """Teleport the free box back to its spawn pose (robot state untouched)."""
+        if not self.has_free_box:
+            print("[Sim] reset_box ignored: no free box in the scene")
+            return
+        qadr = self.box_qadr
+        self.mj_data.qpos[qadr : qadr + 7] = self.box_spawn_pose
+        self.mj_data.qvel[self.box_dofadr : self.box_dofadr + 6] = 0.0
+        # Propagate so same-frame renders/observations see the reset pose.
+        mujoco.mj_forward(self.mj_model, self.mj_data)
+        print("[Sim] box reset to spawn pose")
 
     def _update_held_box(self):
         """Script the held box onto the live two-hand FK midpoint (called after mj_step).
@@ -877,6 +946,8 @@ class DefaultEnv:
 
         if key == "backspace":
             self.reset()
+        if key == "o":
+            self.reset_box()
         if key == "v":
             self.update_viewer_camera()
         if key in ["up", "down", "left", "right"]:
@@ -902,6 +973,9 @@ class DefaultEnv:
 
     def reset(self):
         mujoco.mj_resetData(self.mj_model, self.mj_data)
+        # mj_resetData zeroes derived quantities (xpos/xquat/sensordata); recompute
+        # them so the same-frame elastic band / observations don't see zero quaternions.
+        mujoco.mj_forward(self.mj_model, self.mj_data)
 
 
 class BaseSimulator:
@@ -960,7 +1034,82 @@ class BaseSimulator:
         self.sim_env.start_image_publish_subprocess(start_method, camera_port)
 
     def init_subscriber(self):
-        pass
+        """Listen for scene-reset commands from the teleop manager (manager_state topic).
+
+        The manager ships monotonic counters (reset_box_count / reset_sim_count) in
+        every manager_state message; a background thread stores the latest values and
+        the physics loop applies them between steps (_apply_pending_scene_commands).
+        """
+        # Latest counters seen on the wire (written by the listener thread; int
+        # attribute writes are GIL-atomic so no lock is needed) and the values
+        # already acted upon by the physics loop. None = no message seen yet.
+        self._mgr_reset_box_count: int | None = None
+        self._mgr_reset_sim_count: int | None = None
+        self._applied_reset_box_count: int | None = None
+        self._applied_reset_sim_count: int | None = None
+
+        reset_config = self.config.get("scene_reset_config", None)
+        if not reset_config:
+            return
+
+        def _listen():
+            import zmq
+
+            from gear_sonic.utils.teleop.zmq.zmq_planner_sender import unpack_pose_message
+
+            ctx = zmq.Context()
+            sock = ctx.socket(zmq.SUB)
+            sock.setsockopt(zmq.RCVTIMEO, 200)
+            sock.setsockopt_string(zmq.SUBSCRIBE, "manager_state")
+            sock.connect(f"tcp://{reset_config['host']}:{reset_config['port']}")
+            print(
+                f"[Sim] scene-reset listener connected to manager at "
+                f"tcp://{reset_config['host']}:{reset_config['port']}"
+            )
+            while self._running:
+                try:
+                    raw = sock.recv()
+                except zmq.Again:
+                    continue
+                # Drain to the most recent message; only the latest counters matter.
+                while True:
+                    try:
+                        raw = sock.recv(zmq.NOBLOCK)
+                    except zmq.Again:
+                        break
+                try:
+                    data = unpack_pose_message(raw, topic="manager_state")
+                except Exception:
+                    continue
+                if "reset_box_count" in data:
+                    self._mgr_reset_box_count = int(data["reset_box_count"][0])
+                if "reset_sim_count" in data:
+                    self._mgr_reset_sim_count = int(data["reset_sim_count"][0])
+            sock.close()
+            ctx.term()
+
+        Thread(target=_listen, daemon=True, name="scene_reset_listener").start()
+
+    def _apply_pending_scene_commands(self):
+        """Apply manager-requested scene resets (runs on the physics thread).
+
+        Counter semantics: act once per observed increase; the first message after
+        (re)start only records a baseline (a manager that already has counter > 0
+        must not reset a freshly started sim), and a decrease means the manager
+        restarted, so rebase silently.
+        """
+        box_count = self._mgr_reset_box_count
+        if box_count is not None:
+            if self._applied_reset_box_count is not None and box_count > self._applied_reset_box_count:
+                self.sim_env.reset_box()
+            self._applied_reset_box_count = box_count
+
+        sim_count = self._mgr_reset_sim_count
+        if sim_count is not None:
+            if self._applied_reset_sim_count is not None and sim_count > self._applied_reset_sim_count:
+                print("[Sim] full scene reset requested by manager")
+                self.sim_env.reset()
+            self._applied_reset_sim_count = sim_count
 
     def init_publisher(self):
         pass
@@ -984,6 +1133,7 @@ class BaseSimulator:
             ):
                 step_start = time.monotonic()
 
+                self._apply_pending_scene_commands()
                 self.sim_env.sim_step()
                 now = time.time()
                 if now - ts > 1 / 10.0 and self.redis_client is not None:

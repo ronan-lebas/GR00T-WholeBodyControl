@@ -347,6 +347,11 @@ class SimLoopConfig(BaseConfig):
     verbose: bool = False
     """Verbose output, override the base config verbose"""
 
+    detach_gantry: bool = False
+    """Start with the elastic-band gantry detached, i.e. as if '9' were pressed in the
+    viewer at startup (the robot is not held up by the virtual gantry). The band object
+    still exists, so '9' continues to toggle it on/off during the run."""
+
     box: bool = False
     """Add a box object to the simulation scene"""
 
@@ -365,3 +370,33 @@ class SimLoopConfig(BaseConfig):
     fp_render_every: int = 2
     """Render depth/seg only every Nth image frame (1 = every frame). Lowers the FoundationPose
     sequence fps to reduce per-frame render cost."""
+
+    table: bool = False
+    """Add a static table in front of the robot (manipulation setup). Combine with --box
+    to spawn a graspable box on the tabletop."""
+
+    table_pos: tuple[float, float] = (0.75, 0.0)
+    """Table center (x, y) in meters. Robot spawns at the origin facing +x."""
+
+    table_top_size: tuple[float, float] = (0.3, 0.5)
+    """Tabletop half-extents (x, y) in meters."""
+
+    table_height: float = 0.74
+    """Height of the tabletop top surface in meters."""
+
+    box_pos: Optional[tuple[float, float, float]] = None
+    """Explicit box spawn position override (x, y, z). Default: tabletop spawn with --table,
+    else the floor-box constant in run_sim_loop.py."""
+
+    box_size: Optional[tuple[float, float, float]] = None
+    """Explicit box half-extents override (x, y, z). Default: tabletop cube with --table,
+    else the floor-box constant in run_sim_loop.py."""
+
+    scene_reset: bool = True
+    """Listen for scene-reset commands from the teleop manager (manager_state topic)."""
+
+    manager_host: str = "localhost"
+    """Host of the teleop manager ZMQ publisher (for scene-reset commands)."""
+
+    manager_port: int = 5556
+    """Port of the teleop manager ZMQ publisher (for scene-reset commands)."""

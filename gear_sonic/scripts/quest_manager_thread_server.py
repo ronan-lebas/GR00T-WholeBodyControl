@@ -56,6 +56,8 @@ Keyboard:
     f          toggle finger retargeting
     p          pause / resume teleop (freeze robot, smooth resume)
     c          toggle data collection        x   toggle data abort
+    b          reset the sim box to its spawn pose (between episodes)
+    0          FULL sim reset (recovery; robot snaps to default pose — pause first)
     q          stop policy and exit
     k          (replay) pause / resume playback
     <- / ->    (replay) step one frame back / forward
@@ -985,6 +987,11 @@ class QuestManager:
         # Countdown state: (deadline, kind) with kind in {"start", "recalib"}
         self.pending_calib: tuple[float, str] | None = None
         self.last_countdown_print = 0
+        # Scene-reset commands for the sim, shipped as monotonic counters in
+        # manager_state (level-triggered: the sim acts on any observed increase,
+        # so a late-joining or briefly-stalled subscriber never misses one).
+        self.reset_box_count = 0
+        self.reset_sim_count = 0
 
         # Last commanded targets; reused while paused / blended on resume.
         self.frozen_pos: np.ndarray | None = None
@@ -1177,6 +1184,15 @@ class QuestManager:
         elif key == "x":
             toggle_da = True
             print("[QuestManager] Data abort toggle sent")
+        elif key == "b":
+            self.reset_box_count += 1
+            print("[QuestManager] Box reset sent (sim teleports the box back to spawn)")
+        elif key == "0":
+            self.reset_sim_count += 1
+            print(
+                "[QuestManager] FULL SIM RESET sent — robot snaps to default pose; "
+                "pause teleop ('p') first for a clean recovery"
+            )
         elif key == "k" and self.source.is_replay:
             self.source.toggle_pause()
         elif key == "LEFT" and self.source.is_replay:
@@ -1285,7 +1301,8 @@ class QuestManager:
         period = 1.0 / max(1, self.args.target_fps)
         print(
             "[QuestManager] Controls: s=ramp-to-calib / s-again=calibrate+teleop  "
-            "r=recalibrate  f=fingers  p=pause  c=collect  x=abort  q=quit"
+            "r=recalibrate  f=fingers  p=pause  c=collect  x=abort  "
+            "b=box-reset  0=FULL-sim-reset  q=quit"
             + ("  k=replay-pause  arrows=step" if self.source.is_replay else "")
         )
         last_report = time.time()
@@ -1361,6 +1378,8 @@ class QuestManager:
                             "stream_mode": np.array([self.stream_mode], dtype=np.int32),
                             "toggle_data_collection": np.array([toggle_dc], dtype=bool),
                             "toggle_data_abort": np.array([toggle_da], dtype=bool),
+                            "reset_box_count": np.array([self.reset_box_count], dtype=np.int32),
+                            "reset_sim_count": np.array([self.reset_sim_count], dtype=np.int32),
                         },
                         topic="manager_state",
                     )

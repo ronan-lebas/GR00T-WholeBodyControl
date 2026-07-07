@@ -222,3 +222,48 @@ def pack_pose_message(pose_data: dict, topic: str = "pose", version: int = 3) ->
 
     packed_message = topic_bytes + header_bytes + data_bytes
     return packed_message
+
+
+def unpack_pose_message(packed_data: bytes, topic: str = "pose") -> dict:
+    """Unpack a single-frame message packed by ``pack_pose_message``.
+
+    Wire format: [topic_prefix][HEADER_SIZE-byte JSON header][concatenated binary fields]
+    """
+    topic_bytes = topic.encode("utf-8")
+    if not packed_data.startswith(topic_bytes):
+        raise ValueError(f"Message does not start with expected topic '{topic}'")
+
+    offset = len(topic_bytes)
+    if len(packed_data) < offset + HEADER_SIZE:
+        raise ValueError(f"Packed data too small: {len(packed_data)} < {offset + HEADER_SIZE}")
+
+    header_bytes = packed_data[offset : offset + HEADER_SIZE]
+    null_idx = header_bytes.find(b"\x00")
+    if null_idx > 0:
+        header_bytes = header_bytes[:null_idx]
+
+    header = json.loads(header_bytes.decode("utf-8"))
+    fields = header.get("fields", [])
+
+    result = {"version": header.get("v", 0), "endian": header.get("endian", "le")}
+    current_offset = offset + HEADER_SIZE
+    dtype_map = {
+        "f32": np.float32,
+        "f64": np.float64,
+        "i32": np.int32,
+        "i64": np.int64,
+        "bool": bool,
+    }
+
+    for field in fields:
+        dtype = dtype_map.get(field["dtype"], np.float32)
+        shape = tuple(field["shape"])
+        n_bytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
+        result[field["name"]] = (
+            np.frombuffer(packed_data[current_offset : current_offset + n_bytes], dtype=dtype)
+            .reshape(shape)
+            .copy()
+        )
+        current_offset += n_bytes
+
+    return result
