@@ -51,6 +51,11 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 CAMERA_PORT="${CAMERA_PORT:-5555}"
 IMAGE_FPS="${IMAGE_FPS:-30}"                   # ego-view image relay cap (Quest passthrough)
+# The ego-view image relay runs INSIDE the quest-relay container, so it can't reach
+# the sim's camera server (on this host) via 'localhost'. Give it a host address the
+# container can route to — the same host-IP target the deploy container uses. Auto-
+# detected from this host's primary IP when empty; override if auto-detection is wrong.
+CAMERA_RELAY_HOST="${CAMERA_RELAY_HOST:-}"
 TASK_PROMPT="${TASK_PROMPT:-pick up the box}"
 RENDER_DEPTH_SEG="${RENDER_DEPTH_SEG:-0}"     # 1 = publish ego depth + box seg (FoundationPose)
 SIM_EXTRA="${SIM_EXTRA:-}"                     # extra run_sim_loop.py flags, e.g. "--table-height 0.8"
@@ -69,7 +74,7 @@ DATA_VENV="${DATA_VENV:-$REPO/.venv_data_collection}"
 SESSION="${SESSION:-g1_sim}"                   # tmux session name
 
 # Config vars propagated into each tmux window (so exported overrides survive).
-CONFIG_VARS=(REPO CAMERA_PORT IMAGE_FPS TASK_PROMPT RENDER_DEPTH_SEG \
+CONFIG_VARS=(REPO CAMERA_PORT IMAGE_FPS CAMERA_RELAY_HOST TASK_PROMPT RENDER_DEPTH_SEG \
              SIM_EXTRA DEPLOY_ZMQ_HOST DEPLOY_EXTRA MANAGER_EXTRA REPLAY_QUEST SIM_VENV TELEOP_VENV \
              DATA_VENV SESSION)
 DEFAULT_COMPONENTS=(sim deploy relay manager recorder viewer teardown)
@@ -219,9 +224,18 @@ run_single() {
             ;;
         relay)
             # No venv here — run_quest_relay.py drives Docker; use the system python3.
-            # --camera-host localhost: the sim publishes the ego view on this machine.
+            # The image relay runs INSIDE the container, so 'localhost' would point at
+            # the container, not this host's camera server. Route it to the host IP the
+            # container can reach (auto-detected, or CAMERA_RELAY_HOST). The sim binds
+            # its camera PUB on tcp://*:PORT, so the host IP is reachable. (On the real
+            # robot --camera-host is the robot's own IP; that path is unaffected.)
+            cam_host="$CAMERA_RELAY_HOST"
+            if [ -z "$cam_host" ]; then
+                cam_host="$(hostname -I 2>/dev/null | awk '{print $1}')"
+                [ -n "$cam_host" ] || cam_host="172.17.0.1"  # docker default-bridge → host
+            fi
             run - - python3 "$REPO/gear_sonic_deploy/docker/quest_relay/run_quest_relay.py" \
-                --camera-host localhost --camera-port "$CAMERA_PORT" --image-fps "$IMAGE_FPS"
+                --camera-host "$cam_host" --camera-port "$CAMERA_PORT" --image-fps "$IMAGE_FPS"
             ;;
         manager)
             # 'b' = box reset, '0' = full sim reset (shipped via manager_state to the sim).
