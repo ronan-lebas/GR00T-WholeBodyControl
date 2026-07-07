@@ -24,6 +24,12 @@ BOX_SIZE = (0.2, 0.2, 0.2)   # half-extents in meters (x, y, z)
 BOX_POS  = (1.5, 0.0, 0.1)   # position in meters (x, y, z); z = half-height to rest on floor
 BOX_MASS = 1.0                # mass in kg
 
+# Tabletop box defaults, used when --table and --box are combined (graspable cube)
+TABLE_BOX_SIZE = (0.04, 0.04, 0.04)  # half-extents in meters (8 cm cube)
+TABLE_BOX_MASS = 0.2                  # mass in kg
+
+TABLE_TOP_THICKNESS = 0.02  # tabletop half-thickness in meters
+
 # Held-box parameters live in this shared YAML (single source of truth, also read
 # by generate_hold_box_quest.py and iter_reset_pose.py). See load_held_box_params().
 HELD_BOX_PARAMS_PATH = Path(__file__).resolve().parent / "hold_box_params.yaml"
@@ -55,6 +61,17 @@ def main(config: ArgsConfig):
     # NOTE: we will override the interface to local if it is not specified
     wbc_config["ENV_NAME"] = config.env_name
 
+    # Start with the elastic-band gantry detached (same effect as pressing '9').
+    wbc_config["detach_gantry"] = config.detach_gantry
+
+    if config.table:
+        wbc_config["table_config"] = {
+            "pos": tuple(config.table_pos),
+            "top_size": tuple(config.table_top_size),
+            "top_thickness": TABLE_TOP_THICKNESS,
+            "height": config.table_height,
+        }
+
     # --held-box implies --box (the held object is the same injected box body).
     spawn_box = config.box or config.held_box
 
@@ -71,11 +88,39 @@ def main(config: ArgsConfig):
                 "anchor_offset": tuple(held["box"]["anchor_offset"]),
             }
         else:
+            if config.table:
+                # Tabletop spawn: graspable cube slightly toward the robot, 5 mm above
+                # the surface so it settles cleanly.
+                box_size = tuple(config.box_size) if config.box_size else TABLE_BOX_SIZE
+                if config.box_pos:
+                    box_pos = tuple(config.box_pos)
+                else:
+                    box_pos = (
+                        config.table_pos[0] - 0.1,
+                        config.table_pos[1],
+                        config.table_height + box_size[2] + 0.005,
+                    )
+                hx, hy = config.table_top_size
+                assert (
+                    abs(box_pos[0] - config.table_pos[0]) + box_size[0] <= hx
+                    and abs(box_pos[1] - config.table_pos[1]) + box_size[1] <= hy
+                ), f"box footprint at {box_pos} does not fit on the tabletop"
+                box_mass = TABLE_BOX_MASS
+            else:
+                box_size = tuple(config.box_size) if config.box_size else BOX_SIZE
+                box_pos = tuple(config.box_pos) if config.box_pos else BOX_POS
+                box_mass = BOX_MASS
             wbc_config["box_config"] = {
-                "size": BOX_SIZE,
-                "pos": BOX_POS,
-                "mass": BOX_MASS,
+                "size": box_size,
+                "pos": box_pos,
+                "mass": box_mass,
             }
+
+    if config.scene_reset:
+        wbc_config["scene_reset_config"] = {
+            "host": config.manager_host,
+            "port": config.manager_port,
+        }
 
     if config.render_depth_seg:
         assert spawn_box, "render_depth_seg requires --box or --held-box (the segmented object is the box)"
