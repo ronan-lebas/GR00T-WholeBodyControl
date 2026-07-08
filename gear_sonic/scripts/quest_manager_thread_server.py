@@ -52,7 +52,9 @@ Keyboard:
                the robot from its current pose up to the calibration pose (the FK
                reference the operator will mirror); 2nd press runs a countdown,
                calibrates, and enters live VR_3PT teleop. (Replay: single press.)
-    r          recalibrate (countdown; uses measured robot joints as FK ref)
+    r          recalibrate: pauses teleop and eases the robot back to the
+               reference pose, then runs the countdown and recalibrates (uses
+               measured robot joints as FK ref). (Replay: immediate, no ramp.)
     f          toggle finger retargeting
     p          pause / resume teleop (freeze robot, smooth resume)
     c          toggle data collection        x   toggle data abort
@@ -975,6 +977,12 @@ class QuestManager:
         self.ramp_from_quat: np.ndarray | None = None
         self.ramp_to_pos: np.ndarray | None = None
         self.ramp_to_quat: np.ndarray | None = None
+        # Recalibration re-uses the ramp to ease the robot back to the reference
+        # pose (instead of following live VR); `recalibrating` marks that the ramp
+        # should auto-arm the recalib countdown on completion, `_recalib_armed`
+        # ensures it is armed exactly once.
+        self.recalibrating = False
+        self._recalib_armed = False
         self.finger_tracking = True
         self.teleop_paused = False
         # monotonic time of the previous filtered compute(), for the pose filter dt
@@ -1047,11 +1055,20 @@ class QuestManager:
             self.pub.send(build_command_message(start=True, stop=False, planner=True))
             self.stream_mode = STREAM_MODE_PLANNER_VR_3PT
             self.phase = PHASE_TELEOP
+            self.recalibrating = False
+            self._recalib_armed = False
             print("[QuestManager] Calibrated — entering live VR_3PT teleop")
         else:
             # Recalibration zeroes yaw_rel; keep the commanded facing continuous
             # so the robot does not turn back to its start heading.
             self.yaw_offset = _wrap(-self.last_facing_yaw)
+            # The recalib ramp left us in PHASE_RAMP holding the reference pose;
+            # re-enter live teleop and clear the recalib-ramp latches. (For replay,
+            # which skips the ramp, phase is already TELEOP and the flags are unset.)
+            self.phase = PHASE_TELEOP
+            self.recalibrating = False
+            self._recalib_armed = False
+            print("[QuestManager] Recalibrated — resuming live VR_3PT teleop")
 
     def _begin_calib_ramp(self) -> None:
         """1st 's' (live): start the policy and ramp the robot to the calibration
@@ -1071,6 +1088,30 @@ class QuestManager:
             "[QuestManager] Policy START sent — ramping to the calibration pose "
             f"over {self.args.calib_ramp_sec:.1f}s. Press 's' again once the robot "
             "is settled to calibrate and begin teleop."
+        )
+
+    def _begin_recalib_ramp(self) -> None:
+        """'r' during teleop: stop following the operator and ease the robot back
+        to the reference (calibration) pose, then auto-run the countdown and
+        recalibrate.
+
+        Re-enters PHASE_RAMP (so live VR targets stop streaming and _run_ramp
+        drives the robot to the reference pose instead). _run_ramp arms the
+        recalib countdown once the robot has settled at the reference pose; when
+        the countdown fires, _do_calibration('recalib') re-enters teleop. The
+        policy stays in CONTROL throughout — no START/STOP is sent.
+        """
+        self.phase = PHASE_RAMP
+        self.ramp_started = False
+        self._ramp_warn_t = 0.0
+        self.recalibrating = True
+        self._recalib_armed = False
+        self.pending_calib = None  # (re)armed by _run_ramp once settled at reference
+        self.teleop_paused = False
+        print(
+            "[QuestManager] Recalibrating — easing the robot back to the reference "
+            f"pose over {self.args.calib_ramp_sec:.1f}s (teleop paused), then a "
+            f"{self.args.calib_delay_sec:.0f}s countdown. Assume the rest pose."
         )
 
     def _run_ramp(self) -> bool:
@@ -1127,6 +1168,13 @@ class QuestManager:
                 vr_3pt_orientation=quat.tolist(),
             )
         )
+        # Recalibration path: once the robot has eased all the way back to the
+        # reference pose, hold it there and start the calibration countdown (armed
+        # exactly once). The robot keeps streaming this held reference pose through
+        # the countdown, so it no longer follows the operator while they re-settle.
+        if self.recalibrating and not self._recalib_armed and alpha >= 1.0:
+            self._recalib_armed = True
+            self._arm_calibration("recalib")
         return True
 
     # -- keyboard handling ------------------------------------------------------
@@ -1153,8 +1201,16 @@ class QuestManager:
             else:
                 print("[QuestManager] Already started ('r' to recalibrate, 'q' to stop)")
         elif key == "r":
-            if self.phase == PHASE_TELEOP:
-                self._arm_calibration("recalib")
+            if self.source.is_replay:
+                # Replay has no operator to re-settle; recalibrate immediately.
+                if self.phase == PHASE_TELEOP:
+                    self._arm_calibration("recalib")
+                else:
+                    print("[QuestManager] Recalibrate is only available during teleop")
+            elif self.phase == PHASE_TELEOP:
+                self._begin_recalib_ramp()
+            elif self.phase == PHASE_RAMP and self.recalibrating:
+                print("[QuestManager] Already recalibrating — easing back to the reference pose")
             else:
                 print("[QuestManager] Recalibrate is only available during teleop")
         elif key == "f":
@@ -1450,7 +1506,7 @@ def main() -> None:
     parser.add_argument(
         "--pos-scale",
         type=float,
-        default=1.0,
+        default=0.7,
         help="scale on operator arm reach (orientation unaffected); 1.0 = 1:1 with "
         "operator motion. Lower under-reaches and feels sluggish.",
     )
@@ -1473,8 +1529,8 @@ def main() -> None:
         "--calib-ramp-sec",
         type=float,
         default=3.0,
-        help="duration of the 1st-'s' ramp from the robot's current pose to the "
-        "calibration pose (live only)",
+        help="duration of the ramp from the robot's current pose to the calibration "
+        "pose, used by the 1st-'s' start ramp and the 'r' recalib ramp (live only)",
     )
     parser.add_argument(
         "--resume-ramp-sec",
