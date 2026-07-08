@@ -32,6 +32,8 @@ import shutil
 import cv2
 import numpy as np
 
+from gear_sonic.utils.box_appearance import write_colored_box_obj
+
 
 class FoundationPoseWriter:
     """Incrementally writes FoundationPose scene folders, one per recorded episode."""
@@ -141,31 +143,17 @@ class FoundationPoseWriter:
         (self._episode_dir / "frame_map.txt").write_text("\n".join(lines) + "\n")
 
     def _ensure_box_mesh(self, box_half_extents) -> None:
-        """Write a centered axis-aligned box mesh (meters) once, shared across episodes.
+        """Write the box CAD mesh (meters) once, shared across episodes.
 
         No-op when ``box_half_extents`` is None (real camera: the CAD mesh is supplied
-        separately) or the mesh already exists.
+        separately) or the mesh already exists. The mesh carries a distinct color per
+        face (see :mod:`gear_sonic.utils.box_appearance`) so FoundationPose's photometric
+        term has orientation signal instead of falling back to flat gray.
         """
         out = self.base / "box.obj"
         if out.exists() or box_half_extents is None:
             return
-        hx, hy, hz = (float(s) for s in box_half_extents)
-        verts = [
-            (-hx, -hy, -hz), (hx, -hy, -hz), (hx, hy, -hz), (-hx, hy, -hz),
-            (-hx, -hy, hz), (hx, -hy, hz), (hx, hy, hz), (-hx, hy, hz),
-        ]
-        # 1-indexed triangles, outward winding.
-        faces = [
-            (1, 3, 2), (1, 4, 3),  # bottom (-z)
-            (5, 6, 7), (5, 7, 8),  # top (+z)
-            (1, 2, 6), (1, 6, 5),  # -y
-            (3, 4, 8), (3, 8, 7),  # +y
-            (1, 5, 8), (1, 8, 4),  # -x
-            (2, 3, 7), (2, 7, 6),  # +x
-        ]
-        lines = [f"v {x:.6f} {y:.6f} {z:.6f}" for x, y, z in verts]
-        lines += [f"f {a} {b} {c}" for a, b, c in faces]
-        out.write_text("\n".join(lines) + "\n")
+        write_colored_box_obj(out, box_half_extents)
 
     def discard_episode(self) -> None:
         """Remove the current (partial) episode folder, e.g. after an abort."""

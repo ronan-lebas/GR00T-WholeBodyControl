@@ -94,6 +94,19 @@ def resolve_paths(args) -> tuple[Path, Path, Path | None, Path | None]:
 
     fp_data = traj / "foundation_pose_data"
     mesh = fp_data / "box.obj"
+
+    # Ground truth (sim-only): poses come from a single object_gt parquet, not the
+    # FoundationPose per-frame txt folders. The mesh stays the shared box.obj.
+    if getattr(args, "ground_truth", False):
+        gt_parquet = traj / "object_gt" / f"episode_{args.episode:06d}.parquet"
+        if not mesh.is_file() or not gt_parquet.is_file():
+            print(
+                "[info] no ground-truth object data "
+                f"(mesh={mesh.is_file()}, gt={gt_parquet.is_file()}); replaying robot only"
+            )
+            return traj, parquet, None, None
+        return traj, parquet, mesh, gt_parquet
+
     episode_dir = fp_data / f"episode_{args.episode:06d}"
     sub = "ob_in_world_filtered" if getattr(args, "filtered", False) else "ob_in_cam"
     ob_dir = episode_dir / sub
@@ -150,6 +163,19 @@ def load_object_poses(ob_dir: Path) -> np.ndarray:
     """Return (M, 4, 4) object-in-camera poses, sorted by frame index."""
     files = sorted(ob_dir.glob("*.txt"))
     return np.stack([np.loadtxt(f).reshape(4, 4) for f in files], axis=0)
+
+
+def load_object_gt(parquet: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Return ((M, 4, 4) object-in-head-camera poses, (M,) proprio-row indices).
+
+    Ground truth recorded by ObjectGtWriter: exact MuJoCo box poses in the head_camera
+    frame, one row per recorded frame. The proprio_frame_index column *is* the object->
+    robot frame map (rows are dense and monotonic), so it feeds object_index directly.
+    """
+    table = pq.read_table(parquet, columns=["proprio_frame_index", "ob_in_cam"])
+    idx = np.asarray(table.column("proprio_frame_index").to_pylist(), dtype=int)
+    poses = np.asarray(table.column("ob_in_cam").to_pylist(), dtype=np.float64).reshape(-1, 4, 4)
+    return poses, idx
 
 
 def load_frame_map(ob_dir: Path, n_obj: int) -> np.ndarray | None:
@@ -257,6 +283,7 @@ class TrajectoryReplay:
         base_quats: np.ndarray | None = None,
         obj_to_robot: np.ndarray | None = None,
         obj_in_world: bool = False,
+        obj_gt_cam: bool = False,
     ):
         self.states = states
         self.obj_poses = obj_poses
@@ -265,6 +292,9 @@ class TrajectoryReplay:
         # If True, obj_poses are already 4x4 world poses (filtered) and are placed
         # directly; otherwise they are object-in-camera and go through camera FK.
         self.obj_in_world = obj_in_world
+        # If True, obj_poses are ground-truth object-in-camera in MuJoCo camera frame
+        # (no OpenCV-optical conversion) — placed via camera FK without GL_FROM_CV.
+        self.obj_gt_cam = obj_gt_cam
         self.n = states.shape[0]
         self.has_object = obj_poses is not None
         self.m = obj_poses.shape[0] if self.has_object else 0
@@ -352,7 +382,9 @@ class TrajectoryReplay:
             t_wc = np.eye(4)
             t_wc[:3, :3] = self.data.cam_xmat[self.cam_id].reshape(3, 3)
             t_wc[:3, 3] = self.data.cam_xpos[self.cam_id]
-            t_wo = t_wc @ GL_FROM_CV @ obj
+            # Ground truth is already in the MuJoCo camera frame; FoundationPose poses are
+            # in the OpenCV optical frame and need GL_FROM_CV first.
+            t_wo = t_wc @ obj if self.obj_gt_cam else t_wc @ GL_FROM_CV @ obj
 
         self.data.qpos[self.obj_qadr : self.obj_qadr + 3] = t_wo[:3, 3]
         self.data.qpos[self.obj_qadr + 3 : self.obj_qadr + 7] = R.from_matrix(
@@ -419,28 +451,50 @@ def main() -> None:
         help="use ob_in_world_filtered/ (from filter_object_pose.py) instead of raw ob_in_cam/",
     )
     parser.add_argument(
+        "--ground-truth", dest="ground_truth", action="store_true",
+        help="use the sim ground-truth object pose (object_gt/episode_*.parquet) instead of "
+        "the FoundationPose estimate — sim-only, for comparison / exact replay",
+    )
+    parser.add_argument(
         "--check", action="store_true",
         help="headless sanity check (no viewer): print stats for the first/last frame",
     )
     args = parser.parse_args()
 
-    traj, parquet, mesh, ob_dir = resolve_paths(args)
+    if args.ground_truth and args.filtered:
+        sys.exit("[error] --ground-truth and --filtered are mutually exclusive")
+
+    traj, parquet, mesh, ob_src = resolve_paths(args)
     states = load_robot_states(parquet)
     base_quats = load_base_quats(parquet)
-    obj_poses = load_object_poses(ob_dir) if ob_dir is not None else None
-    obj_to_robot = load_frame_map(ob_dir, obj_poses.shape[0]) if ob_dir is not None else None
+    if ob_src is None:
+        obj_poses, obj_to_robot = None, None
+    elif args.ground_truth:
+        obj_poses, obj_to_robot = load_object_gt(ob_src)
+    else:
+        obj_poses = load_object_poses(ob_src)
+        obj_to_robot = load_frame_map(ob_src, obj_poses.shape[0])
     fps = read_fps(traj)
 
     print(f"[info] trajectory : {traj}")
     print(f"[info] parquet    : {parquet.relative_to(traj)} ({states.shape[0]} frames)")
     if obj_poses is not None:
-        print(f"[info] object     : {ob_dir.relative_to(traj)} ({obj_poses.shape[0]} frames)")
-        print(f"[info] frame map  : {'exact (frame_map.txt)' if obj_to_robot is not None else 'uniform resampling (no map)'}")
-        print(f"[info] object pose: {'world frame, placed directly (filtered)' if args.filtered else 'camera frame, via FK'}")
+        print(f"[info] object     : {ob_src.relative_to(traj)} ({obj_poses.shape[0]} frames)")
+        if args.ground_truth:
+            print("[info] frame map  : exact (object_gt proprio_frame_index)")
+            print("[info] object pose: ground truth, camera frame, via FK")
+        else:
+            fmap = "exact (frame_map.txt)" if obj_to_robot is not None else "uniform resampling (no map)"
+            pose = "world frame, placed directly (filtered)" if args.filtered else "camera frame, via FK"
+            print(f"[info] frame map  : {fmap}")
+            print(f"[info] object pose: {pose}")
     else:
         print("[info] object     : none — replaying robot body only")
 
-    replay = TrajectoryReplay(states, obj_poses, mesh, base_quats, obj_to_robot, args.filtered)
+    replay = TrajectoryReplay(
+        states, obj_poses, mesh, base_quats, obj_to_robot,
+        obj_in_world=args.filtered, obj_gt_cam=args.ground_truth,
+    )
 
     if args.check:
         for i in (0, replay.n - 1):

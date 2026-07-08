@@ -60,6 +60,11 @@ TASK_PROMPT="${TASK_PROMPT:-pick up the box}"
 RENDER_DEPTH_SEG="${RENDER_DEPTH_SEG:-1}"     # 1 = publish ego depth + box seg (FoundationPose).
                                               # On by default: this setup records FoundationPose-ready
                                               # data (RGB-D + box mask). Set 0 for RGB-only (faster sim).
+RECORD_BOX_GT="${RECORD_BOX_GT:-1}"           # 1 = sim publishes the box's exact pose and the recorder
+                                              # stores it (object_gt/*.parquet), in parallel to
+                                              # FoundationPose. Sim-only ground truth for comparison /
+                                              # exact replay (visualizer --ground-truth). Set 0 to disable.
+BOX_GT_PORT="${BOX_GT_PORT:-5560}"            # ZMQ port for the ground-truth box-pose stream.
 SIM_EXTRA="${SIM_EXTRA:-}"                     # extra run_sim_loop.py flags, e.g. "--table-height 0.8"
 # Deploy runs INSIDE the docker container: localhost there is the container, so the
 # manager (5556, bound on this host) is reached via host.docker.internal.
@@ -77,6 +82,7 @@ SESSION="${SESSION:-g1_sim}"                   # tmux session name
 
 # Config vars propagated into each tmux window (so exported overrides survive).
 CONFIG_VARS=(REPO CAMERA_PORT IMAGE_FPS CAMERA_RELAY_HOST TASK_PROMPT RENDER_DEPTH_SEG \
+             RECORD_BOX_GT BOX_GT_PORT \
              SIM_EXTRA DEPLOY_ZMQ_HOST DEPLOY_EXTRA MANAGER_EXTRA REPLAY_QUEST SIM_VENV TELEOP_VENV \
              DATA_VENV SESSION)
 DEFAULT_COMPONENTS=(sim deploy relay manager recorder viewer teardown)
@@ -164,6 +170,7 @@ run_single() {
             sim_args=(--table --box --detach-gantry --enable-image-publish --enable-offscreen
                       --camera-port "$CAMERA_PORT")
             [ "$RENDER_DEPTH_SEG" -eq 1 ] && sim_args+=(--render-depth-seg)
+            [ "$RECORD_BOX_GT" -eq 1 ] && sim_args+=(--record-box-gt --box-gt-port "$BOX_GT_PORT")
             # shellcheck disable=SC2086
             run "$SIM_VENV" "$REPO" python gear_sonic/scripts/run_sim_loop.py \
                 "${sim_args[@]}" $SIM_EXTRA
@@ -252,12 +259,16 @@ run_single() {
                 "${manager_args[@]}" $MANAGER_EXTRA
             ;;
         recorder)
+            recorder_args=(--task-prompt "$TASK_PROMPT"
+                           --camera-host localhost --camera-port "$CAMERA_PORT"
+                           --sonic-zmq-host localhost --sonic-zmq-port 5556
+                           --state-zmq-host localhost --state-zmq-port 5557
+                           --hand-type brainco)
+            [ "$RECORD_BOX_GT" -eq 1 ] && recorder_args+=(--record-object-gt
+                                                          --box-gt-zmq-host localhost
+                                                          --box-gt-zmq-port "$BOX_GT_PORT")
             run "$DATA_VENV" - python "$REPO/gear_sonic/scripts/run_data_exporter.py" \
-                --task-prompt "$TASK_PROMPT" \
-                --camera-host localhost --camera-port "$CAMERA_PORT" \
-                --sonic-zmq-host localhost --sonic-zmq-port 5556 \
-                --state-zmq-host localhost --state-zmq-port 5557 \
-                --hand-type brainco
+                "${recorder_args[@]}"
             ;;
         viewer)
             run "$DATA_VENV" - python "$REPO/gear_sonic/scripts/run_camera_viewer.py" \
@@ -353,7 +364,11 @@ Sim manipulation stack (no robot — everything on this machine):
   teardown   parking pane: focus it and press Enter to kill the whole stack
   kill       kill the '$SESSION' tmux session (+ remove the relay container)
 
-Resolved config: CAMERA_PORT=$CAMERA_PORT  RENDER_DEPTH_SEG=$RENDER_DEPTH_SEG
+Recording writes FoundationPose data (RGB-D + box mask) and, with RECORD_BOX_GT=1, the
+sim's exact box pose to object_gt/*.parquet (sim-only ground truth). Replay a recording
+with 'python gear_sonic/scripts/visualize_robot_object_trajectory.py [--ground-truth]'.
+
+Resolved config: CAMERA_PORT=$CAMERA_PORT  RENDER_DEPTH_SEG=$RENDER_DEPTH_SEG  RECORD_BOX_GT=$RECORD_BOX_GT
                  MANAGER_EXTRA='$MANAGER_EXTRA'  SIM_EXTRA='$SIM_EXTRA'  SESSION=$SESSION
 Point the Quest Unity app at THIS machine's Wi-Fi/LAN IP : 10000.
 Override any config via env vars (see the config block at the top of this file).

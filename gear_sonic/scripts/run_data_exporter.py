@@ -25,6 +25,7 @@ from datetime import datetime
 import time
 from typing import Callable, Literal
 
+import msgpack
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 import tyro
@@ -41,6 +42,7 @@ from gear_sonic.data.features_sonic_vla import (
 from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
 from gear_sonic.utils.data_collection.episode_state import EpisodeState
 from gear_sonic.utils.data_collection.foundation_pose_writer import FoundationPoseWriter
+from gear_sonic.utils.data_collection.object_gt_writer import ObjectGtWriter
 from gear_sonic.utils.data_collection.keyboard_subscriber import ZMQKeyboardSubscriber
 from gear_sonic.utils.data_collection.telemetry import Telemetry
 from gear_sonic.utils.data_collection.text_to_speech import TextToSpeech
@@ -116,6 +118,17 @@ class SonicDataExporterConfig:
     auto_record: bool = False
     """Skip keyboard/ZMQ recording toggle controls and start recording immediately at launch.
     Stop with Ctrl+C to save the episode."""
+
+    # ZMQ: ground-truth box pose (from the sim's --record-box-gt publisher)
+    record_object_gt: bool = False
+    """Record the box's exact pose from the sim into a separate object_gt/ parquet, in
+    parallel to FoundationPose (for comparison / direct use in replay). Sim-only."""
+
+    box_gt_zmq_host: str = "localhost"
+    """ZMQ host for the sim's ground-truth box-pose publisher (see --record-object-gt)."""
+
+    box_gt_zmq_port: int = 5560
+    """ZMQ port for the sim's ground-truth box-pose publisher."""
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +209,9 @@ class GrootDataCollector:
         state_zmq_port: int = 5557,
         skip_robot_state: bool = False,
         auto_record: bool = False,
+        record_object_gt: bool = False,
+        box_gt_zmq_host: str = "localhost",
+        box_gt_zmq_port: int = 5560,
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
@@ -218,6 +234,27 @@ class GrootDataCollector:
         self._fp_writer: FoundationPoseWriter | None = None
         self._fp_enabled = False
         self._fp_last_written_ts = None
+
+        # Ground-truth box pose (sim-only): a separate parquet written in parallel to
+        # FoundationPose. Writer is created alongside the exporter; the latest pose is
+        # kept fresh by a background subscriber to the sim's box-GT publisher.
+        self._record_object_gt = record_object_gt
+        self._gt_writer: ObjectGtWriter | None = None
+        self.latest_box_gt = None
+        self._box_gt_socket = None
+        self._box_gt_ctx = None
+        if record_object_gt:
+            try:
+                self._box_gt_ctx = zmq.Context()
+                self._box_gt_socket = self._box_gt_ctx.socket(zmq.SUB)
+                self._box_gt_socket.connect(f"tcp://{box_gt_zmq_host}:{box_gt_zmq_port}")
+                self._box_gt_socket.setsockopt(zmq.RCVTIMEO, 100)
+                self._box_gt_socket.setsockopt(zmq.CONFLATE, 1)  # only the latest pose matters
+                self._box_gt_socket.setsockopt_string(zmq.SUBSCRIBE, "")
+                print(f"[GT] Subscribed to box ground-truth at {box_gt_zmq_host}:{box_gt_zmq_port}")
+            except Exception as e:
+                print(f"[GT] Warning: Failed to initialize box-GT subscriber: {e}")
+                self._box_gt_socket = None
 
         self._image_subscriber = ComposedCameraClientSensor(server_ip=camera_host, port=camera_port)
 
@@ -289,6 +326,8 @@ class GrootDataCollector:
         if self.data_exporter is None:
             self.data_exporter = self._exporter_factory()
             self._fp_writer = FoundationPoseWriter(self.data_exporter.meta.root)
+            if self._record_object_gt:
+                self._gt_writer = ObjectGtWriter(self.data_exporter.meta.root)
             print(f"Recording to {self.data_exporter.meta.root}")
         return self.data_exporter
 
@@ -341,6 +380,8 @@ class GrootDataCollector:
             if self._episode_state.get_state() == self._episode_state.RECORDING:
                 self.data_exporter.save_episode_as_discarded()
                 self._fp_writer.discard_episode()
+                if self._gt_writer is not None:
+                    self._gt_writer.discard_episode()
                 self._episode_state.reset_state()
                 self._initial_yaw = None
                 self._print_and_say("Discarded episode", blocking=False)
@@ -534,6 +575,42 @@ class GrootDataCollector:
             if parts:
                 print(f"[Latency] {', '.join(parts)}")
 
+    def _poll_box_gt(self) -> None:
+        """Drain the sim's box-GT publisher to the latest pose (non-blocking)."""
+        if self._box_gt_socket is None:
+            return
+        try:
+            raw = self._box_gt_socket.recv(zmq.NOBLOCK)
+        except zmq.Again:
+            return
+        except Exception:
+            return
+        try:
+            self.latest_box_gt = msgpack.unpackb(raw, raw=False)
+        except Exception:
+            pass
+
+    def _write_object_gt_frame(self) -> None:
+        """Buffer one ground-truth box pose for the current parquet row (sim-only).
+
+        Recorded densely (one row per recorded frame) with the same proprio-row index
+        convention as FoundationPose, so ground truth and estimate can be compared at any
+        FP frame's row.
+        """
+        if self._gt_writer is None or self.latest_box_gt is None:
+            return
+        gt = self.latest_box_gt
+        ob_in_cam = gt.get("ob_in_cam")
+        if ob_in_cam is None:
+            return
+        proprio_frame_index = max(0, self.data_exporter.episode_buffer.get("size", 1) - 1)
+        self._gt_writer.write_frame(
+            ob_in_cam=ob_in_cam,
+            proprio_frame_index=proprio_frame_index,
+            timestamp=gt.get("timestamp", time.time()),
+            box_half_extents=gt.get("box_half_extents"),
+        )
+
     def _write_foundation_pose_frame(self) -> None:
         """Save one FoundationPose frame (rgb+depth; on frame 0 also cam_K, the object
         mask, box.obj, and/or extrinsics — whichever the stream provides).
@@ -599,6 +676,8 @@ class GrootDataCollector:
                 self.sonic_timing_monitor.reset()
                 self._initial_yaw = None
                 self._fp_writer.close_episode()
+                if self._gt_writer is not None:
+                    self._gt_writer.close_episode()
                 self._print_and_say("Finished saving episode")
             else:
                 self._print_and_say("Skipping save: no frames collected", say=False)
@@ -689,6 +768,11 @@ class GrootDataCollector:
             if not self._fp_writer.is_active():
                 self._fp_writer.start_episode(self.current_episode_index)
             self._write_foundation_pose_frame()
+
+        if self._gt_writer is not None:
+            if not self._gt_writer.is_active():
+                self._gt_writer.start_episode(self.current_episode_index)
+            self._write_object_gt_frame()
 
         return self._finalize_frame(t_start)
 
@@ -923,13 +1007,13 @@ class GrootDataCollector:
             self._state_subscriber.close()
         except Exception:
             pass
-        for sock in [self._sonic_zmq_socket]:
+        for sock in [self._sonic_zmq_socket, self._box_gt_socket]:
             if sock is not None:
                 try:
                     sock.close()
                 except Exception:
                     pass
-        for ctx in [self._sonic_zmq_ctx]:
+        for ctx in [self._sonic_zmq_ctx, self._box_gt_ctx]:
             if ctx is not None:
                 try:
                     ctx.term()
@@ -948,6 +1032,8 @@ class GrootDataCollector:
 
                     with self.telemetry.timer("poll_sonic"):
                         self._poll_sonic_zmq_messages()
+
+                    self._poll_box_gt()
 
                     with self.telemetry.timer("poll_image"):
                         img_msg = self._image_subscriber.read()
@@ -986,9 +1072,13 @@ class GrootDataCollector:
                     # No keyboard control to stop-and-save; Ctrl+C is the only way out.
                     self.data_exporter.save_episode()
                     self._fp_writer.close_episode()
+                    if self._gt_writer is not None:
+                        self._gt_writer.close_episode()
                 else:
                     self.data_exporter.save_episode_as_discarded()
                     self._fp_writer.discard_episode()
+                    if self._gt_writer is not None:
+                        self._gt_writer.discard_episode()
 
         finally:
             self.save_and_cleanup()
@@ -1050,6 +1140,9 @@ def main(config: SonicDataExporterConfig):
         state_zmq_port=config.state_zmq_port,
         skip_robot_state=config.skip_robot_state,
         auto_record=config.auto_record,
+        record_object_gt=config.record_object_gt,
+        box_gt_zmq_host=config.box_gt_zmq_host,
+        box_gt_zmq_port=config.box_gt_zmq_port,
     )
     data_collector.run()
 
