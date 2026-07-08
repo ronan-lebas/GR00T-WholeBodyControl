@@ -374,7 +374,10 @@ class Gr00tDataExporter(LeRobotDataset):
         video_files = list(self.root.rglob("*.mp4"))
         assert len(video_files) == self.num_episodes * len(self.meta.video_keys)
 
-        parquet_files = list(self.root.rglob("*.parquet"))
+        # Count only the LeRobot data parquets (root/data/chunk-*/episode_*.parquet), not
+        # any sidecar parquet written elsewhere under root (e.g. object_gt/), which a
+        # bare root.rglob would wrongly include and break this invariant.
+        parquet_files = list((self.root / "data").rglob("*.parquet"))
         assert len(parquet_files) == self.num_episodes
 
         img_dir = self.root / "images"

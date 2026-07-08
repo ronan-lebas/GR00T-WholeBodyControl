@@ -371,6 +371,14 @@ class SimLoopConfig(BaseConfig):
     """Render depth/seg only every Nth image frame (1 = every frame). Lowers the FoundationPose
     sequence fps to reduce per-frame render cost."""
 
+    record_box_gt: bool = False
+    """Publish the box's exact pose from MuJoCo (object-in-head-camera) on a ZMQ PUB, in
+    parallel to FoundationPose, so the data recorder can store ground truth for comparison.
+    Sim-only (impossible on real hardware) — hence gated behind this flag."""
+
+    box_gt_port: int = 5560
+    """Port for the ground-truth box-pose publisher (see --record-box-gt)."""
+
     table: bool = False
     """Add a static table in front of the robot (manipulation setup). Combine with --box
     to spawn a graspable box on the tabletop."""

@@ -144,6 +144,11 @@ def main(config: ArgsConfig):
             "port": config.manager_port,
         }
 
+    if config.record_box_gt:
+        assert spawn_box, "record_box_gt requires --box or --held-box (there must be a box to track)"
+        wbc_config["record_box_gt"] = True
+        wbc_config["box_gt_port"] = config.box_gt_port
+
     if config.render_depth_seg:
         assert spawn_box, "render_depth_seg requires --box or --held-box (the segmented object is the box)"
         assert config.enable_image_publish and config.enable_offscreen, (

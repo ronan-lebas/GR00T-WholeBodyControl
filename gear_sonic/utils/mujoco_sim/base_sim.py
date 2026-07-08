@@ -21,6 +21,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 
+from gear_sonic.utils.box_appearance import box_face_slabs
 from gear_sonic.utils.mujoco_sim.metric_utils import check_contact, check_height
 from gear_sonic.utils.mujoco_sim.sim_utils import get_subtree_body_names
 from gear_sonic.utils.mujoco_sim.unitree_sdk2py_bridge import ElasticBand, UnitreeSdk2Bridge
@@ -78,6 +79,14 @@ class DefaultEnv:
         self.fp_render_w = 0
         self.fp_renderer = None
         self._fp_frame_counter = 0
+
+        # Ground-truth box pose export (sim-only): publish the exact object pose from
+        # MuJoCo alongside FoundationPose so the two can be compared. Handles resolved
+        # lazily in get_box_in_head_camera(); half-extents stored in init_scene.
+        self.record_box_gt = self.config.get("record_box_gt", False)
+        self.box_half_extents = None
+        self._gt_box_body_id = None
+        self._gt_head_cam_id = None
 
         self.init_scene()
         self.last_reward = 0
@@ -238,6 +247,21 @@ class DefaultEnv:
             geom.set("contype", "0")
             geom.set("conaffinity", "0")
 
+        # Paint each face a distinct color with thin visual-only slab geoms. The
+        # collision geom above stays geom 0 (so fp_box_geom_id / the seg mask and all
+        # contact tuning are unaffected); the slabs sit flush on the faces and carry no
+        # collision. Colors match the exported box.obj (box_appearance), which is what
+        # lets FoundationPose resolve the otherwise-ambiguous orientation.
+        for pos, half, rgba in box_face_slabs(size):
+            slab = ET.SubElement(box_body, "geom")
+            slab.set("type", "box")
+            slab.set("pos", f"{pos[0]} {pos[1]} {pos[2]}")
+            slab.set("size", f"{half[0]} {half[1]} {half[2]}")
+            slab.set("rgba", f"{rgba[0]} {rgba[1]} {rgba[2]} {rgba[3]}")
+            slab.set("contype", "0")
+            slab.set("conaffinity", "0")
+            slab.set("mass", "0")
+
     def _inject_scene_objects(
         self, xml_path: str, box_config: dict | None, table_config: dict | None
     ) -> str:
@@ -279,6 +303,9 @@ class DefaultEnv:
         self.torso_index = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
         self.root_body = "pelvis"
         self.root_body_id = self.mj_model.body(self.root_body).id
+
+        if box_config is not None:
+            self.box_half_extents = [float(s) for s in box_config["size"]]
 
         if self.render_depth_seg:
             self._setup_foundation_pose(box_config)
@@ -654,6 +681,32 @@ class DefaultEnv:
         root_quat = self.mj_data.body("torso_link").xquat.copy()[[1, 2, 3, 0]]
         head_pos = root_pos + Rotation.from_quat(root_quat).apply(np.array([0.0, 0.0, -0.044]))
         return np.concatenate((head_pos, root_quat))
+
+    def get_box_in_head_camera(self) -> np.ndarray | None:
+        """Exact 4x4 pose of the box in the ``head_camera`` frame, or None if no box.
+
+        Uses the same camera (``data.cam_xpos``/``cam_xmat`` of ``head_camera``, MuJoCo
+        camera convention) that the replay visualizer uses to place the FoundationPose
+        object, so this ground-truth pose drops into the identical camera-FK path (no
+        OpenCV-optical conversion). Handles are resolved and cached on first call.
+        """
+        if self._gt_box_body_id is None:
+            bid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "box")
+            cid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_CAMERA, "head_camera")
+            if bid < 0 or cid < 0:
+                return None
+            self._gt_box_body_id = int(bid)
+            self._gt_head_cam_id = int(cid)
+        t_wc = np.eye(4)
+        t_wc[:3, :3] = self.mj_data.cam_xmat[self._gt_head_cam_id].reshape(3, 3)
+        t_wc[:3, 3] = self.mj_data.cam_xpos[self._gt_head_cam_id]
+        t_wo = np.eye(4)
+        # MuJoCo quats are [w,x,y,z]; scipy wants [x,y,z,w].
+        t_wo[:3, :3] = Rotation.from_quat(
+            self.mj_data.xquat[self._gt_box_body_id][[1, 2, 3, 0]]
+        ).as_matrix()
+        t_wo[:3, 3] = self.mj_data.xpos[self._gt_box_body_id]
+        return np.linalg.inv(t_wc) @ t_wo
 
     def get_root_vel(self) -> np.ndarray:
         return self.mj_data.qvel[:6]
@@ -1125,7 +1178,47 @@ class BaseSimulator:
             self._applied_reset_sim_count = sim_count
 
     def init_publisher(self):
-        pass
+        """Publish the ground-truth box pose (sim-only) on a small ZMQ PUB, if enabled.
+
+        One msgpack message per image frame carrying the exact object-in-head-camera
+        pose. The data recorder subscribes and writes it to a separate parquet in
+        parallel to the FoundationPose estimate, so the two can be compared (and, in sim,
+        the ground truth used directly). Real hardware has no such stream — hence the
+        ``record_box_gt`` flag gates it entirely.
+        """
+        self._box_gt_socket = None
+        if not getattr(self.sim_env, "record_box_gt", False):
+            return
+        import zmq
+
+        port = int(self.config.get("box_gt_port", 5560))
+        ctx = zmq.Context.instance()
+        sock = ctx.socket(zmq.PUB)
+        sock.setsockopt(zmq.SNDHWM, 4)
+        sock.bind(f"tcp://*:{port}")
+        self._box_gt_socket = sock
+        print(f"[Sim] box ground-truth publisher bound on tcp://*:{port}")
+
+    def _publish_box_gt(self):
+        """Send one ground-truth box-pose message (object-in-head-camera), if enabled."""
+        if getattr(self, "_box_gt_socket", None) is None:
+            return
+        pose = self.sim_env.get_box_in_head_camera()
+        if pose is None:
+            return
+        import msgpack
+        import zmq
+
+        msg = {
+            "topic": "box_gt",
+            "ob_in_cam": pose.reshape(-1).tolist(),  # 4x4 row-major, MuJoCo camera frame
+            "box_half_extents": [float(s) for s in (self.sim_env.box_half_extents or [])],
+            "timestamp": time.time(),
+        }
+        try:
+            self._box_gt_socket.send(msgpack.packb(msg, use_bin_type=True), flags=zmq.NOBLOCK)
+        except Exception:
+            pass
 
     def init_unitree_bridge(self):
         self.unitree_bridge = UnitreeSdk2Bridge(self.config)
@@ -1163,6 +1256,7 @@ class BaseSimulator:
 
                 if sim_cnt % int(self.image_dt / self.sim_dt) == 0:
                     self.sim_env.update_render_caches()
+                    self._publish_box_gt()
 
                 # Simple rate limiter (replaces ROS rate)
                 elapsed = time.monotonic() - step_start
