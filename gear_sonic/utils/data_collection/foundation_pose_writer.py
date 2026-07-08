@@ -2,17 +2,22 @@
 
 For each recorded episode this produces, under ``<dataset_root>/foundation_pose_data/``::
 
+    box.obj                         # shared object mesh (meters), written once (sim only)
     episode_000000/
         cam_K.txt                   # 3x3 intrinsics, row-major
-        cam_extrinsics.txt          # 4x4 depth->color transform, row-major (if available)
+        cam_extrinsics.txt          # 4x4 depth->color transform, row-major (real camera only)
         rgb/000000.png ...          # 8-bit RGB, every frame
         depth/000000.png ...        # 16-bit depth in millimeters, every frame
+        masks/000000.png            # binary object mask, frame 0 only (when seg is streamed)
         frame_map.txt               # FP-frame -> proprio-row correspondence
 
-This is the (partial) input layout expected by FoundationPose's ``run_demo.py`` (one
-scene folder per sequence); mask + mesh are supplied separately. The writer is
-inactive until ``start_episode`` is called, so it is a no-op when depth is not being
-streamed.
+This is the input layout expected by FoundationPose's ``run_demo.py`` (one scene
+folder per sequence, plus a separate ``--mesh_file``). In sim (``--render-depth-seg``)
+the object mask is rendered and the box mesh is derived from its half-extents, so both
+are written here; on the real RealSense the mask comes from segmentation supplied
+elsewhere and the mesh from a CAD file, so ``mask``/``box_half_extents`` are simply
+omitted. The writer is inactive until ``start_episode`` is called, so it is a no-op
+when depth is not being streamed.
 
 ``frame_map.txt`` is the exact correspondence between each FP frame and the
 proprio/parquet row it was captured alongside. Depth is rendered/streamed at a
@@ -45,7 +50,7 @@ class FoundationPoseWriter:
     def start_episode(self, episode_index: int) -> None:
         """Create the folder structure for a new episode and reset the frame counter."""
         self._episode_dir = self.base / f"episode_{episode_index:06d}"
-        for sub in ("rgb", "depth"):
+        for sub in ("rgb", "depth", "masks"):
             (self._episode_dir / sub).mkdir(parents=True, exist_ok=True)
         self._frame = 0
         self._frame_map = []
@@ -56,16 +61,24 @@ class FoundationPoseWriter:
         depth: np.ndarray,
         cam_K,
         proprio_frame_index: int,
+        mask: np.ndarray | None = None,
+        box_half_extents=None,
         cam_extrinsics_R=None,
         cam_extrinsics_t=None,
         timestamp: float | None = None,
     ) -> None:
-        """Write one RGB+depth frame; on frame 0 also write cam_K (and extrinsics if given).
+        """Write one RGB+depth frame; on frame 0 also write cam_K, the init mask, box.obj,
+        and extrinsics (whichever are supplied).
 
         ``proprio_frame_index`` is the parquet row (within the episode) captured in
         the same loop iteration as this FP frame; together with ``timestamp`` it is
         appended to ``frame_map.txt`` so downstream tools can recover the exact
         FP-frame -> robot-state correspondence.
+
+        ``mask`` is the object segmentation (sim ``ego_view_seg``); only the frame-0
+        mask is written, since FoundationPose uses it to initialize and tracks after.
+        ``box_half_extents`` (meters) drive the once-written ``box.obj`` CAD mesh.
+        Both are ``None`` on the real camera (mask/mesh supplied out of band).
 
         ``cam_extrinsics_R``/``cam_extrinsics_t`` are the depth->color transform
         (RealSense depth and color are physically separate sensors); pass ``None``
@@ -74,10 +87,12 @@ class FoundationPoseWriter:
         if self._episode_dir is None:
             return
 
-        # Depth may be rendered/streamed at a different resolution; upscale (nearest) to match RGB.
+        # Depth/seg may be rendered/streamed at a different resolution; upscale (nearest) to match RGB.
         h, w = rgb.shape[:2]
         if depth.shape[:2] != (h, w):
             depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_NEAREST)
+        if mask is not None and mask.shape[:2] != (h, w):
+            mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
 
         if self._frame == 0:
             if cam_K is None:
@@ -88,6 +103,9 @@ class FoundationPoseWriter:
             else:
                 K = np.asarray(cam_K, dtype=np.float64).reshape(3, 3)
                 np.savetxt(self._episode_dir / "cam_K.txt", K)
+            if mask is not None:
+                cv2.imwrite(str(self._episode_dir / "masks" / "000000.png"), mask)
+            self._ensure_box_mesh(box_half_extents)
             if cam_extrinsics_R is not None and cam_extrinsics_t is not None:
                 T = np.eye(4, dtype=np.float64)
                 T[:3, :3] = np.asarray(cam_extrinsics_R, dtype=np.float64).reshape(3, 3)
@@ -121,6 +139,33 @@ class FoundationPoseWriter:
         lines = ["# fp_frame proprio_frame_index timestamp"]
         lines += [f"{f} {p} {t:.6f}" for f, p, t in self._frame_map]
         (self._episode_dir / "frame_map.txt").write_text("\n".join(lines) + "\n")
+
+    def _ensure_box_mesh(self, box_half_extents) -> None:
+        """Write a centered axis-aligned box mesh (meters) once, shared across episodes.
+
+        No-op when ``box_half_extents`` is None (real camera: the CAD mesh is supplied
+        separately) or the mesh already exists.
+        """
+        out = self.base / "box.obj"
+        if out.exists() or box_half_extents is None:
+            return
+        hx, hy, hz = (float(s) for s in box_half_extents)
+        verts = [
+            (-hx, -hy, -hz), (hx, -hy, -hz), (hx, hy, -hz), (-hx, hy, -hz),
+            (-hx, -hy, hz), (hx, -hy, hz), (hx, hy, hz), (-hx, hy, hz),
+        ]
+        # 1-indexed triangles, outward winding.
+        faces = [
+            (1, 3, 2), (1, 4, 3),  # bottom (-z)
+            (5, 6, 7), (5, 7, 8),  # top (+z)
+            (1, 2, 6), (1, 6, 5),  # -y
+            (3, 4, 8), (3, 8, 7),  # +y
+            (1, 5, 8), (1, 8, 4),  # -x
+            (2, 3, 7), (2, 7, 6),  # +x
+        ]
+        lines = [f"v {x:.6f} {y:.6f} {z:.6f}" for x, y, z in verts]
+        lines += [f"f {a} {b} {c}" for a, b, c in faces]
+        out.write_text("\n".join(lines) + "\n")
 
     def discard_episode(self) -> None:
         """Remove the current (partial) episode folder, e.g. after an abort."""

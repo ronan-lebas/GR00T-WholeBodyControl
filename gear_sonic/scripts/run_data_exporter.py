@@ -23,7 +23,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 import time
-from typing import Literal
+from typing import Callable, Literal
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -186,7 +186,7 @@ class GrootDataCollector:
         self,
         camera_host: str,
         camera_port: int,
-        data_exporter: Gr00tDataExporter,
+        exporter_factory: Callable[[], Gr00tDataExporter],
         robot_model,
         text_to_speech=None,
         frequency: int = 20,
@@ -200,7 +200,10 @@ class GrootDataCollector:
         self.text_to_speech = text_to_speech
         self.frequency = frequency
         self.loop_period = 1.0 / frequency
-        self.data_exporter = data_exporter
+        # The LeRobot dataset is created lazily on the first recording so that merely
+        # launching the recorder does not litter an empty dataset folder on disk.
+        self._exporter_factory = exporter_factory
+        self.data_exporter: Gr00tDataExporter | None = None
         self.robot_model = robot_model
         self._skip_robot_state = skip_robot_state
         self._auto_record = auto_record
@@ -211,7 +214,8 @@ class GrootDataCollector:
         # FoundationPose export: active only when the sim streams ego depth/seg
         # (i.e. run_sim_loop launched with --render-depth-seg). Depth/seg arrive at a
         # reduced rate, so track whether the stream exists at all and de-dupe by timestamp.
-        self._fp_writer = FoundationPoseWriter(self.data_exporter.meta.root)
+        # Created alongside the exporter in _ensure_exporter (needs the dataset root).
+        self._fp_writer: FoundationPoseWriter | None = None
         self._fp_enabled = False
         self._fp_last_written_ts = None
 
@@ -260,9 +264,10 @@ class GrootDataCollector:
         self._last_latency_log_time = 0.0
         self._initial_yaw = None
 
-        print(f"Recording to {self.data_exporter.meta.root}")
+        print("Data exporter ready — dataset folder is created on the first recording.")
 
         if self._auto_record:
+            self._ensure_exporter()
             self._episode_state.change_state()  # IDLE -> RECORDING
             self._print_and_say(
                 f"Auto-record enabled, started recording {self.current_episode_index}",
@@ -271,7 +276,21 @@ class GrootDataCollector:
 
     @property
     def current_episode_index(self):
+        if self.data_exporter is None:
+            return 0
         return self.data_exporter.episode_buffer["episode_index"]
+
+    def _ensure_exporter(self) -> Gr00tDataExporter:
+        """Create the LeRobot dataset (and FoundationPose writer) on first use.
+
+        Deferred from __init__ so the dataset folder appears on disk only once
+        recording actually starts, not merely when the recorder is launched.
+        """
+        if self.data_exporter is None:
+            self.data_exporter = self._exporter_factory()
+            self._fp_writer = FoundationPoseWriter(self.data_exporter.meta.root)
+            print(f"Recording to {self.data_exporter.meta.root}")
+        return self.data_exporter
 
     def _print_and_say(self, message: str, say: bool = True, blocking: bool = False):
         if self.text_to_speech is not None:
@@ -304,6 +323,9 @@ class GrootDataCollector:
             self._manager_toggle_dc = False
 
         if key == "c":
+            # Entering RECORDING from IDLE: materialize the dataset on disk now.
+            if self._episode_state.get_state() == self._episode_state.IDLE:
+                self._ensure_exporter()
             self._episode_state.change_state()
             if self._episode_state.get_state() == self._episode_state.RECORDING:
                 self._initial_yaw = None
@@ -513,7 +535,8 @@ class GrootDataCollector:
                 print(f"[Latency] {', '.join(parts)}")
 
     def _write_foundation_pose_frame(self) -> None:
-        """Save one FoundationPose frame (rgb+depth, plus cam_K/extrinsics on frame 0).
+        """Save one FoundationPose frame (rgb+depth; on frame 0 also cam_K, the object
+        mask, box.obj, and/or extrinsics — whichever the stream provides).
 
         Self-guards: only writes when the current message carries a *fresh* depth frame
         (on the sim renderer depth arrives at a reduced rate; on the real RealSense every
@@ -540,6 +563,10 @@ class GrootDataCollector:
             rgb=images["ego_view"],
             depth=images["ego_view_depth"],
             cam_K=fp_meta.get("cam_K"),
+            # Sim (--render-depth-seg): object mask + box mesh from the seg render.
+            mask=images.get("ego_view_seg"),
+            box_half_extents=fp_meta.get("box_half_extents"),
+            # Real RealSense: depth->color transform (sim leaves these unset).
             cam_extrinsics_R=fp_meta.get("cam_extrinsics_R"),
             cam_extrinsics_t=fp_meta.get("cam_extrinsics_t"),
             proprio_frame_index=proprio_frame_index,
@@ -881,13 +908,14 @@ class GrootDataCollector:
 
     def save_and_cleanup(self):
         try:
-            self._print_and_say("saving episode done", blocking=False)
-            buffer_size = self.data_exporter.episode_buffer.get("size", 0)
-            if buffer_size > 0:
-                self.data_exporter.save_episode()
-            self._print_and_say(
-                f"Recording complete: {self.data_exporter.meta.root}", say=False, blocking=True
-            )
+            if self.data_exporter is not None:
+                self._print_and_say("saving episode done", blocking=False)
+                buffer_size = self.data_exporter.episode_buffer.get("size", 0)
+                if buffer_size > 0:
+                    self.data_exporter.save_episode()
+                self._print_and_say(
+                    f"Recording complete: {self.data_exporter.meta.root}", say=False, blocking=True
+                )
         except Exception as e:
             self._print_and_say(f"Error saving episode: {e}", blocking=True)
 
@@ -948,7 +976,11 @@ class GrootDataCollector:
 
         except KeyboardInterrupt:
             print("Data exporter terminated by user")
-            buffer_size = self.data_exporter.episode_buffer.get("size", 0)
+            buffer_size = (
+                self.data_exporter.episode_buffer.get("size", 0)
+                if self.data_exporter is not None
+                else 0
+            )
             if buffer_size > 0:
                 if self._auto_record:
                     # No keyboard control to stop-and-save; Ctrl+C is the only way out.
@@ -993,18 +1025,21 @@ def main(config: SonicDataExporterConfig):
             config.state_zmq_host, config.state_zmq_port, config.robot_config_timeout
         )
 
-    data_exporter = Gr00tDataExporter.create(
-        save_root=f"{config.root_output_dir}/{config.dataset_name}",
-        fps=config.data_collection_frequency,
-        features=dataset_features,
-        modality_config=modality_config,
-        task=config.task_prompt,
-        script_config={**robot_config, "record_wrist_cameras": config.record_wrist_cameras},
-    )
+    # Built lazily by the collector on the first recording so launching the recorder
+    # (without ever toggling data collection) doesn't create an empty dataset folder.
+    def make_exporter() -> Gr00tDataExporter:
+        return Gr00tDataExporter.create(
+            save_root=f"{config.root_output_dir}/{config.dataset_name}",
+            fps=config.data_collection_frequency,
+            features=dataset_features,
+            modality_config=modality_config,
+            task=config.task_prompt,
+            script_config={**robot_config, "record_wrist_cameras": config.record_wrist_cameras},
+        )
 
     data_collector = GrootDataCollector(
         frequency=config.data_collection_frequency,
-        data_exporter=data_exporter,
+        exporter_factory=make_exporter,
         robot_model=g1_rm,
         camera_host=config.camera_host,
         camera_port=config.camera_port,
