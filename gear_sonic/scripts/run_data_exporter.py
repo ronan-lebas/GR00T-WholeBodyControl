@@ -600,12 +600,12 @@ class GrootDataCollector:
         if self._gt_writer is None or self.latest_box_gt is None:
             return
         gt = self.latest_box_gt
-        ob_in_cam = gt.get("ob_in_cam")
-        if ob_in_cam is None:
+        ob_in_ref = gt.get("ob_in_ref")
+        if ob_in_ref is None:
             return
         proprio_frame_index = max(0, self.data_exporter.episode_buffer.get("size", 1) - 1)
         self._gt_writer.write_frame(
-            ob_in_cam=ob_in_cam,
+            ob_in_ref=ob_in_ref,
             proprio_frame_index=proprio_frame_index,
             timestamp=gt.get("timestamp", time.time()),
             box_half_extents=gt.get("box_half_extents"),

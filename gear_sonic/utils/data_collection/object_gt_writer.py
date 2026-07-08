@@ -10,13 +10,14 @@ For each recorded episode this produces, under ``<dataset_root>/object_gt/``::
     episode_000000.parquet          # one row per recorded frame:
                                      #   proprio_frame_index : int   (parquet/robot row)
                                      #   timestamp           : float
-                                     #   ob_in_cam           : 16 floats (4x4 row-major)
+                                     #   ob_in_ref           : 16 floats (4x4 row-major)
 
-``ob_in_cam`` is the box pose in the ``head_camera`` frame (MuJoCo camera convention),
-matching what the replay visualizer uses to place the FoundationPose object — so it drops
-into the same camera-FK path. ``proprio_frame_index`` links each pose to the robot row it
-was captured alongside (same convention as ``FoundationPoseWriter``'s ``frame_map.txt``),
-letting the replay align the two timelines and compare ground truth against the estimate.
+``ob_in_ref`` is the box pose in the right-foot frame (``right_ankle_roll_link``), a
+planted, near-static reference — so the replayed cube doesn't jitter (the head camera, the
+fast-moving tip of the chain, did). The replay visualizer places the box with that same
+body's pose. ``proprio_frame_index`` links each pose to the robot row it was captured
+alongside (same convention as ``FoundationPoseWriter``'s ``frame_map.txt``), letting the
+replay align the two timelines and compare ground truth against the estimate.
 
 The writer also ensures the shared colored ``box.obj`` mesh exists (under
 ``foundation_pose_data/``, where the visualizer looks for it) so ground-truth-only runs
@@ -53,15 +54,15 @@ class ObjectGtWriter:
 
     def write_frame(
         self,
-        ob_in_cam,
+        ob_in_ref,
         proprio_frame_index: int,
         timestamp: float,
         box_half_extents=None,
     ) -> None:
-        """Buffer one ground-truth pose. ``ob_in_cam`` is a 4x4 (or flat-16) array."""
+        """Buffer one ground-truth pose. ``ob_in_ref`` is a 4x4 (or flat-16) array."""
         if self._episode_index is None:
             return
-        pose = np.asarray(ob_in_cam, dtype=np.float64).reshape(16)
+        pose = np.asarray(ob_in_ref, dtype=np.float64).reshape(16)
         self._rows.append((int(proprio_frame_index), float(timestamp), pose))
         # Write the shared colored mesh once (needed for ground-truth-only replay).
         if box_half_extents is not None and len(box_half_extents) == 3:
@@ -88,7 +89,7 @@ class ObjectGtWriter:
                 {
                     "proprio_frame_index": pa.array([r[0] for r in self._rows], pa.int64()),
                     "timestamp": pa.array([r[1] for r in self._rows], pa.float64()),
-                    "ob_in_cam": pa.array(
+                    "ob_in_ref": pa.array(
                         [r[2].tolist() for r in self._rows], pa.list_(pa.float64(), 16)
                     ),
                 }

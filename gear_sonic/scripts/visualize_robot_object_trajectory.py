@@ -166,15 +166,16 @@ def load_object_poses(ob_dir: Path) -> np.ndarray:
 
 
 def load_object_gt(parquet: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Return ((M, 4, 4) object-in-head-camera poses, (M,) proprio-row indices).
+    """Return ((M, 4, 4) box-in-right-foot poses, (M,) proprio-row indices).
 
-    Ground truth recorded by ObjectGtWriter: exact MuJoCo box poses in the head_camera
-    frame, one row per recorded frame. The proprio_frame_index column *is* the object->
-    robot frame map (rows are dense and monotonic), so it feeds object_index directly.
+    Ground truth recorded by ObjectGtWriter: exact MuJoCo box poses in the right-foot
+    frame (a planted, near-static reference — so the replayed cube doesn't jitter), one
+    row per recorded frame. The proprio_frame_index column *is* the object->robot frame
+    map (rows are dense and monotonic), so it feeds object_index directly.
     """
-    table = pq.read_table(parquet, columns=["proprio_frame_index", "ob_in_cam"])
+    table = pq.read_table(parquet, columns=["proprio_frame_index", "ob_in_ref"])
     idx = np.asarray(table.column("proprio_frame_index").to_pylist(), dtype=int)
-    poses = np.asarray(table.column("ob_in_cam").to_pylist(), dtype=np.float64).reshape(-1, 4, 4)
+    poses = np.asarray(table.column("ob_in_ref").to_pylist(), dtype=np.float64).reshape(-1, 4, 4)
     return poses, idx
 
 
@@ -283,7 +284,7 @@ class TrajectoryReplay:
         base_quats: np.ndarray | None = None,
         obj_to_robot: np.ndarray | None = None,
         obj_in_world: bool = False,
-        obj_gt_cam: bool = False,
+        obj_gt_ref: bool = False,
     ):
         self.states = states
         self.obj_poses = obj_poses
@@ -292,9 +293,9 @@ class TrajectoryReplay:
         # If True, obj_poses are already 4x4 world poses (filtered) and are placed
         # directly; otherwise they are object-in-camera and go through camera FK.
         self.obj_in_world = obj_in_world
-        # If True, obj_poses are ground-truth object-in-camera in MuJoCo camera frame
-        # (no OpenCV-optical conversion) — placed via camera FK without GL_FROM_CV.
-        self.obj_gt_cam = obj_gt_cam
+        # If True, obj_poses are ground-truth box-in-right-foot poses — placed via the
+        # right foot's (planted, near-static) FK pose, which keeps the cube from jittering.
+        self.obj_gt_ref = obj_gt_ref
         self.n = states.shape[0]
         self.has_object = obj_poses is not None
         self.m = obj_poses.shape[0] if self.has_object else 0
@@ -308,6 +309,11 @@ class TrajectoryReplay:
 
         self.cam_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_CAMERA, "head_camera"
+        )
+        # Ground-truth box poses are stored relative to this body (must match base_sim's
+        # BOX_GT_REFERENCE_BODY); placed via its FK pose in set_frame.
+        self.gt_ref_body_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_BODY, "right_ankle_roll_link"
         )
         self.obj_qadr: int | None = None
         if self.has_object:
@@ -378,13 +384,21 @@ class TrajectoryReplay:
             # Filtered poses are already world 4x4 — place directly, NOT through the
             # per-frame camera FK (which would re-inject the camera wobble).
             t_wo = obj
+        elif self.obj_gt_ref:
+            # Ground truth is the box in the right-foot frame — place via that body's FK
+            # pose. The foot is planted/near-static, so the cube doesn't jitter (unlike the
+            # head camera, the fast-moving tip of the chain used by the FoundationPose path).
+            t_wr = np.eye(4)
+            t_wr[:3, :3] = self.data.xmat[self.gt_ref_body_id].reshape(3, 3)
+            t_wr[:3, 3] = self.data.xpos[self.gt_ref_body_id]
+            t_wo = t_wr @ obj
         else:
+            # FoundationPose poses are object-in-camera in the OpenCV optical frame; convert
+            # to the MuJoCo camera frame (GL_FROM_CV) then to world via the head-camera FK.
             t_wc = np.eye(4)
             t_wc[:3, :3] = self.data.cam_xmat[self.cam_id].reshape(3, 3)
             t_wc[:3, 3] = self.data.cam_xpos[self.cam_id]
-            # Ground truth is already in the MuJoCo camera frame; FoundationPose poses are
-            # in the OpenCV optical frame and need GL_FROM_CV first.
-            t_wo = t_wc @ obj if self.obj_gt_cam else t_wc @ GL_FROM_CV @ obj
+            t_wo = t_wc @ GL_FROM_CV @ obj
 
         self.data.qpos[self.obj_qadr : self.obj_qadr + 3] = t_wo[:3, 3]
         self.data.qpos[self.obj_qadr + 3 : self.obj_qadr + 7] = R.from_matrix(
@@ -482,7 +496,7 @@ def main() -> None:
         print(f"[info] object     : {ob_src.relative_to(traj)} ({obj_poses.shape[0]} frames)")
         if args.ground_truth:
             print("[info] frame map  : exact (object_gt proprio_frame_index)")
-            print("[info] object pose: ground truth, camera frame, via FK")
+            print("[info] object pose: ground truth, right-foot frame, via FK")
         else:
             fmap = "exact (frame_map.txt)" if obj_to_robot is not None else "uniform resampling (no map)"
             pose = "world frame, placed directly (filtered)" if args.filtered else "camera frame, via FK"
@@ -493,7 +507,7 @@ def main() -> None:
 
     replay = TrajectoryReplay(
         states, obj_poses, mesh, base_quats, obj_to_robot,
-        obj_in_world=args.filtered, obj_gt_cam=args.ground_truth,
+        obj_in_world=args.filtered, obj_gt_ref=args.ground_truth,
     )
 
     if args.check:
