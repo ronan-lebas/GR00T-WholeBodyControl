@@ -165,18 +165,20 @@ def load_object_poses(ob_dir: Path) -> np.ndarray:
     return np.stack([np.loadtxt(f).reshape(4, 4) for f in files], axis=0)
 
 
-def load_object_gt(parquet: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Return ((M, 4, 4) box-in-right-foot poses, (M,) proprio-row indices).
+def load_object_gt(parquet: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return ((M,4,4) box-in-world, (M,4,4) reference-body-in-world, (M,) proprio rows).
 
-    Ground truth recorded by ObjectGtWriter: exact MuJoCo box poses in the right-foot
-    frame (a planted, near-static reference — so the replayed cube doesn't jitter), one
-    row per recorded frame. The proprio_frame_index column *is* the object->robot frame
-    map (rows are dense and monotonic), so it feeds object_index directly.
+    Ground truth recorded by ObjectGtWriter: exact MuJoCo box poses in the *world* frame
+    (so a static box stays static — no robot-link motion is folded in), plus the reference
+    body's world pose at the same instant, used once to anchor the sim world to the replay's
+    feet-planted world. The proprio_frame_index column *is* the object->robot frame map (rows
+    are dense and monotonic), so it feeds object_index directly.
     """
-    table = pq.read_table(parquet, columns=["proprio_frame_index", "ob_in_ref"])
+    table = pq.read_table(parquet, columns=["proprio_frame_index", "ob_in_world", "ref_in_world"])
     idx = np.asarray(table.column("proprio_frame_index").to_pylist(), dtype=int)
-    poses = np.asarray(table.column("ob_in_ref").to_pylist(), dtype=np.float64).reshape(-1, 4, 4)
-    return poses, idx
+    box = np.asarray(table.column("ob_in_world").to_pylist(), dtype=np.float64).reshape(-1, 4, 4)
+    ref = np.asarray(table.column("ref_in_world").to_pylist(), dtype=np.float64).reshape(-1, 4, 4)
+    return box, ref, idx
 
 
 def load_frame_map(ob_dir: Path, n_obj: int) -> np.ndarray | None:
@@ -285,6 +287,7 @@ class TrajectoryReplay:
         obj_to_robot: np.ndarray | None = None,
         obj_in_world: bool = False,
         obj_gt_ref: bool = False,
+        ref_poses: np.ndarray | None = None,
     ):
         self.states = states
         self.obj_poses = obj_poses
@@ -293,9 +296,14 @@ class TrajectoryReplay:
         # If True, obj_poses are already 4x4 world poses (filtered) and are placed
         # directly; otherwise they are object-in-camera and go through camera FK.
         self.obj_in_world = obj_in_world
-        # If True, obj_poses are ground-truth box-in-right-foot poses — placed via the
-        # right foot's (planted, near-static) FK pose, which keeps the cube from jittering.
+        # If True, obj_poses are ground-truth box-in-*world* poses and ref_poses are the
+        # reference body's world pose at the same instant. The box is placed via a single
+        # constant anchor (self.gt_anchor, built at frame 0) that maps the sim world to the
+        # replay's feet-planted world — so a static box stays exactly static and the box's
+        # true motion is reproduced with no per-frame robot motion leaking into the cube.
         self.obj_gt_ref = obj_gt_ref
+        self.ref_poses = ref_poses
+        self.gt_anchor = np.eye(4)
         self.n = states.shape[0]
         self.has_object = obj_poses is not None
         self.m = obj_poses.shape[0] if self.has_object else 0
@@ -341,6 +349,32 @@ class TrajectoryReplay:
         else:
             self.foot_ids = None
 
+        # Ground-truth anchor: one constant transform mapping the sim world into the replay's
+        # feet-planted world. Built at frame 0 as (replay reference pose) @ inv(sim reference
+        # pose), so placing the box with gt_anchor @ box_in_world reproduces the box's true
+        # world trajectory relative to the robot — with no per-frame robot motion folded in.
+        if self.obj_gt_ref and self.ref_poses is not None:
+            ref0 = self._replay_ref_pose(0)  # replay reference body pose at frame 0
+            sim_ref0 = self.ref_poses[self.object_index(0)]
+            self.gt_anchor = ref0 @ np.linalg.inv(sim_ref0)
+
+    def _replay_ref_pose(self, i: int) -> np.ndarray:
+        """World pose (4x4) of the GT reference body at frame ``i`` in the replay, feet planted.
+
+        Mirrors ``set_frame``'s robot placement (joints + base orientation + foot-planting
+        translation) but only up to and including reading the reference body — used to build
+        the constant ground-truth anchor without needing the anchor itself (chicken-and-egg).
+        """
+        self._apply_robot_pose(i)
+        if self.foot_target is not None:
+            mid = 0.5 * (self.data.xpos[self.foot_ids[0]] + self.data.xpos[self.foot_ids[1]])
+            self.data.qpos[0:3] += self.foot_target - mid
+            mujoco.mj_forward(self.model, self.data)
+        t = np.eye(4)
+        t[:3, :3] = self.data.xmat[self.gt_ref_body_id].reshape(3, 3)
+        t[:3, 3] = self.data.xpos[self.gt_ref_body_id]
+        return t
+
     def _apply_robot_pose(self, i: int) -> None:
         """Set robot joints + base orientation for frame i and run FK (no foot anchor/object)."""
         i = int(np.clip(i, 0, self.n - 1))
@@ -385,13 +419,10 @@ class TrajectoryReplay:
             # per-frame camera FK (which would re-inject the camera wobble).
             t_wo = obj
         elif self.obj_gt_ref:
-            # Ground truth is the box in the right-foot frame — place via that body's FK
-            # pose. The foot is planted/near-static, so the cube doesn't jitter (unlike the
-            # head camera, the fast-moving tip of the chain used by the FoundationPose path).
-            t_wr = np.eye(4)
-            t_wr[:3, :3] = self.data.xmat[self.gt_ref_body_id].reshape(3, 3)
-            t_wr[:3, 3] = self.data.xpos[self.gt_ref_body_id]
-            t_wo = t_wr @ obj
+            # Ground truth is the box's absolute world pose; map it into the replay world with
+            # the single constant anchor built at frame 0. No dependence on the live robot pose,
+            # so a static box stays exactly static and its true motion is reproduced faithfully.
+            t_wo = self.gt_anchor @ obj
         else:
             # FoundationPose poses are object-in-camera in the OpenCV optical frame; convert
             # to the MuJoCo camera frame (GL_FROM_CV) then to world via the head-camera FK.
@@ -481,10 +512,11 @@ def main() -> None:
     traj, parquet, mesh, ob_src = resolve_paths(args)
     states = load_robot_states(parquet)
     base_quats = load_base_quats(parquet)
+    ref_poses = None
     if ob_src is None:
         obj_poses, obj_to_robot = None, None
     elif args.ground_truth:
-        obj_poses, obj_to_robot = load_object_gt(ob_src)
+        obj_poses, ref_poses, obj_to_robot = load_object_gt(ob_src)
     else:
         obj_poses = load_object_poses(ob_src)
         obj_to_robot = load_frame_map(ob_src, obj_poses.shape[0])
@@ -496,7 +528,7 @@ def main() -> None:
         print(f"[info] object     : {ob_src.relative_to(traj)} ({obj_poses.shape[0]} frames)")
         if args.ground_truth:
             print("[info] frame map  : exact (object_gt proprio_frame_index)")
-            print("[info] object pose: ground truth, right-foot frame, via FK")
+            print("[info] object pose: ground truth, world frame, via constant frame-0 anchor")
         else:
             fmap = "exact (frame_map.txt)" if obj_to_robot is not None else "uniform resampling (no map)"
             pose = "world frame, placed directly (filtered)" if args.filtered else "camera frame, via FK"
@@ -507,7 +539,7 @@ def main() -> None:
 
     replay = TrajectoryReplay(
         states, obj_poses, mesh, base_quats, obj_to_robot,
-        obj_in_world=args.filtered, obj_gt_ref=args.ground_truth,
+        obj_in_world=args.filtered, obj_gt_ref=args.ground_truth, ref_poses=ref_poses,
     )
 
     if args.check:
