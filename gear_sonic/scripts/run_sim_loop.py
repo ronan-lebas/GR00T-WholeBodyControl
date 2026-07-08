@@ -26,7 +26,24 @@ BOX_MASS = 1.0                # mass in kg
 
 # Tabletop box defaults, used when --table and --box are combined (graspable cube)
 TABLE_BOX_SIZE = (0.04, 0.04, 0.04)  # half-extents in meters (8 cm cube)
-TABLE_BOX_MASS = 0.2                  # mass in kg
+TABLE_BOX_MASS = 0.1                  # mass in kg
+
+# Grip behaviour for the graspable box. The problem is twofold: the cube slips, AND the
+# position-controlled fingers sink into it (default MuJoCo contacts are soft, so a finger
+# whose closed target is inside the cube penetrates deeply before the contact force balances
+# it). Cranking friction alone makes the sinking obvious and the grasp mushy. So instead we
+# stiffen the box contact (less penetration -> the finger pads actually meet the faces) and
+# use a MODERATE friction with torsional grip:
+#   - solref timeconst 0.01s = 2*sim timestep (1/200s): the stiffest value that stays stable.
+#   - solimp raised so the contact hardens quickly near the surface (less sink).
+#   - friction moderate; condim=4 adds torsional friction so the cube can't twist out.
+#   - priority=1 makes these win for every box contact (hands are all default), so the box's
+#     stiff/grippy contact is used rather than a soft mix with the finger geoms.
+BOX_FRICTION = "2 0.05 0.001"          # sliding / torsional / rolling (moderate)
+BOX_CONDIM = 4                         # 3=slide only, 4=+torsional (grasp), 6=+rolling
+BOX_PRIORITY = 1                       # box contact params win over the contacting geom's
+BOX_SOLREF = "0.01 1"                  # stiffer contact (timeconst, dampratio); reduces sinking
+BOX_SOLIMP = "0.95 0.99 0.001 0.5 2"   # harder impedance near contact; reduces sinking
 
 TABLE_TOP_THICKNESS = 0.02  # tabletop half-thickness in meters
 
@@ -114,6 +131,11 @@ def main(config: ArgsConfig):
                 "size": box_size,
                 "pos": box_pos,
                 "mass": box_mass,
+                "friction": BOX_FRICTION,
+                "condim": BOX_CONDIM,
+                "priority": BOX_PRIORITY,
+                "solref": BOX_SOLREF,
+                "solimp": BOX_SOLIMP,
             }
 
     if config.scene_reset:

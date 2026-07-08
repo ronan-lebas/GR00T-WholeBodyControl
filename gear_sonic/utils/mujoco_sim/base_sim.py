@@ -218,6 +218,19 @@ class DefaultEnv:
         geom.set("type", "box")
         geom.set("size", f"{size[0]} {size[1]} {size[2]}")
         geom.set("mass", str(mass))
+        # Grip/anti-sink tuning: with priority set, the box's contact params win for every
+        # box contact (hands, table, floor). Stiffer solref/solimp keep the fingers from
+        # sinking into the cube; moderate friction + condim=4 hold it without slipping.
+        if box_config.get("friction"):
+            geom.set("friction", str(box_config["friction"]))
+        if box_config.get("condim") is not None:
+            geom.set("condim", str(box_config["condim"]))
+        if box_config.get("priority") is not None:
+            geom.set("priority", str(box_config["priority"]))
+        if box_config.get("solref"):
+            geom.set("solref", str(box_config["solref"]))
+        if box_config.get("solimp"):
+            geom.set("solimp", str(box_config["solimp"]))
         if box_config.get("held"):
             # Held box is kinematically scripted onto the hands every step
             # (_update_held_box); disabling collision keeps it purely visual so it
