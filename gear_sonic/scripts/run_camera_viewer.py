@@ -34,6 +34,15 @@ import tyro
 from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
 
 
+# Depth and segmentation streams are published only on the frames they are freshly
+# rendered (a reduced rate — see image_publish_utils), so they come and go frame to
+# frame. Displaying them makes the tile count (and canvas width) flicker, so the viewer
+# shows only the always-present color streams; depth/seg remain available to the
+# recorder for FoundationPose.
+def is_displayable(name: str) -> bool:
+    return not (name.endswith("_depth") or name.endswith("_seg"))
+
+
 def to_display_bgr(img: np.ndarray) -> np.ndarray:
     """Convert any camera stream to a 3-channel uint8 BGR image for display/recording.
 
@@ -93,8 +102,15 @@ def main(config: CameraViewerConfig):
         print("ERROR: No camera frames received after 10s. Check the camera server.")
         return
 
-    camera_names = sorted(sample["images"].keys())
+    all_streams = sorted(sample["images"].keys())
+    camera_names = [n for n in all_streams if is_displayable(n)]
+    hidden = [n for n in all_streams if not is_displayable(n)]
     print(f"Detected {len(camera_names)} camera stream(s): {camera_names}")
+    if hidden:
+        print(f"Hiding intermittent depth/seg stream(s) from the viewer: {hidden}")
+    if not camera_names:
+        print("ERROR: no displayable color streams (only depth/seg present).")
+        return
 
     output_dir = Path(config.output_path) if config.output_path else Path("camera_recordings")
 

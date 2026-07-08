@@ -375,8 +375,9 @@ class SimLoopConfig(BaseConfig):
     """Add a static table in front of the robot (manipulation setup). Combine with --box
     to spawn a graspable box on the tabletop."""
 
-    table_pos: tuple[float, float] = (0.75, 0.0)
-    """Table center (x, y) in meters. Robot spawns at the origin facing +x."""
+    table_pos: tuple[float, float] = (0.50, 0.0)
+    """Table center (x, y) in meters. Robot spawns at the origin facing +x. The graspable
+    box is placed at table_pos[0]-0.1, so both move together and stay within arm's reach."""
 
     table_top_size: tuple[float, float] = (0.3, 0.5)
     """Tabletop half-extents (x, y) in meters."""
