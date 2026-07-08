@@ -46,7 +46,7 @@ set -euo pipefail
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
 # ---------------------------------------------------------------------------
-# Config — override by exporting before you call, e.g. RENDER_DEPTH_SEG=1
+# Config — override by exporting before you call, e.g. RENDER_DEPTH_SEG=0
 # ---------------------------------------------------------------------------
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 CAMERA_PORT="${CAMERA_PORT:-5555}"
@@ -57,7 +57,9 @@ IMAGE_FPS="${IMAGE_FPS:-30}"                   # ego-view image relay cap (Quest
 # detected from this host's primary IP when empty; override if auto-detection is wrong.
 CAMERA_RELAY_HOST="${CAMERA_RELAY_HOST:-}"
 TASK_PROMPT="${TASK_PROMPT:-pick up the box}"
-RENDER_DEPTH_SEG="${RENDER_DEPTH_SEG:-0}"     # 1 = publish ego depth + box seg (FoundationPose)
+RENDER_DEPTH_SEG="${RENDER_DEPTH_SEG:-1}"     # 1 = publish ego depth + box seg (FoundationPose).
+                                              # On by default: this setup records FoundationPose-ready
+                                              # data (RGB-D + box mask). Set 0 for RGB-only (faster sim).
 SIM_EXTRA="${SIM_EXTRA:-}"                     # extra run_sim_loop.py flags, e.g. "--table-height 0.8"
 # Deploy runs INSIDE the docker container: localhost there is the container, so the
 # manager (5556, bound on this host) is reached via host.docker.internal.
