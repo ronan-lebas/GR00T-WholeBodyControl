@@ -236,11 +236,16 @@ class GrootDataCollector:
         self._fp_last_written_ts = None
 
         # Ground-truth box pose (sim-only): a separate parquet written in parallel to
-        # FoundationPose. Writer is created alongside the exporter; the latest pose is
-        # kept fresh by a background subscriber to the sim's box-GT publisher.
+        # FoundationPose. Writer is created alongside the exporter; poses are buffered by a
+        # background subscriber to the sim's box-GT publisher and time-matched to each proprio
+        # row (see _write_object_gt_frame). We keep a short *history* (not CONFLATE) so we can
+        # pick the box pose contemporaneous with the proprio frame: the box-GT stream comes
+        # straight from the sim and is fresher than proprio (which crosses the deploy pipeline),
+        # so blindly taking "latest" would place the cube slightly ahead of the robot.
         self._record_object_gt = record_object_gt
         self._gt_writer: ObjectGtWriter | None = None
         self.latest_box_gt = None
+        self._box_gt_buffer: deque = deque(maxlen=512)  # (timestamp, msg), oldest -> newest
         self._box_gt_socket = None
         self._box_gt_ctx = None
         if record_object_gt:
@@ -249,7 +254,8 @@ class GrootDataCollector:
                 self._box_gt_socket = self._box_gt_ctx.socket(zmq.SUB)
                 self._box_gt_socket.connect(f"tcp://{box_gt_zmq_host}:{box_gt_zmq_port}")
                 self._box_gt_socket.setsockopt(zmq.RCVTIMEO, 100)
-                self._box_gt_socket.setsockopt(zmq.CONFLATE, 1)  # only the latest pose matters
+                # Default RCVHWM (bounded) is fine — no CONFLATE, so a short history of poses
+                # accumulates between polls; the loop drains it fully each iteration.
                 self._box_gt_socket.setsockopt_string(zmq.SUBSCRIBE, "")
                 print(f"[GT] Subscribed to box ground-truth at {box_gt_zmq_host}:{box_gt_zmq_port}")
             except Exception as e:
@@ -576,36 +582,61 @@ class GrootDataCollector:
                 print(f"[Latency] {', '.join(parts)}")
 
     def _poll_box_gt(self) -> None:
-        """Drain the sim's box-GT publisher to the latest pose (non-blocking)."""
+        """Drain all pending box-GT messages into the history buffer (non-blocking)."""
         if self._box_gt_socket is None:
             return
-        try:
-            raw = self._box_gt_socket.recv(zmq.NOBLOCK)
-        except zmq.Again:
-            return
-        except Exception:
-            return
-        try:
-            self.latest_box_gt = msgpack.unpackb(raw, raw=False)
-        except Exception:
-            pass
+        for _ in range(1024):  # bounded drain: empty the socket each loop
+            try:
+                raw = self._box_gt_socket.recv(zmq.NOBLOCK)
+            except zmq.Again:
+                break
+            except Exception:
+                break
+            try:
+                msg = msgpack.unpackb(raw, raw=False)
+            except Exception:
+                continue
+            self.latest_box_gt = msg
+            self._box_gt_buffer.append((float(msg.get("timestamp", time.time())), msg))
+
+    def _select_box_gt(self):
+        """Return the buffered box-GT message contemporaneous with the current proprio frame.
+
+        The box-GT stream is published straight from the sim, so it is fresher than the proprio
+        stream (which crosses the deploy pipeline). Pairing "latest with latest" would therefore
+        stamp each robot row with a box pose from slightly *later*, making the replayed cube run
+        ahead of the hand. We instead pick the box pose whose wall-clock timestamp is closest to
+        the proprio message's ``ros_timestamp``, cancelling that constant offset. If no proprio
+        timestamp is available we fall back to the latest pose (previous behaviour).
+        """
+        if not self._box_gt_buffer:
+            return self.latest_box_gt
+        proprio = self.latest_proprio_msg or {}
+        ref_ts = float(proprio.get("ros_timestamp", 0.0) or 0.0)
+        if ref_ts <= 0.0:
+            return self._box_gt_buffer[-1][1]
+        return min(self._box_gt_buffer, key=lambda item: abs(item[0] - ref_ts))[1]
 
     def _write_object_gt_frame(self) -> None:
         """Buffer one ground-truth box pose for the current parquet row (sim-only).
 
         Recorded densely (one row per recorded frame) with the same proprio-row index
         convention as FoundationPose, so ground truth and estimate can be compared at any
-        FP frame's row.
+        FP frame's row. The pose is time-matched to the proprio row (see _select_box_gt).
         """
-        if self._gt_writer is None or self.latest_box_gt is None:
+        if self._gt_writer is None:
             return
-        gt = self.latest_box_gt
-        ob_in_ref = gt.get("ob_in_ref")
-        if ob_in_ref is None:
+        gt = self._select_box_gt()
+        if gt is None:
+            return
+        ob_in_world = gt.get("ob_in_world")
+        ref_in_world = gt.get("ref_in_world")
+        if ob_in_world is None or ref_in_world is None:
             return
         proprio_frame_index = max(0, self.data_exporter.episode_buffer.get("size", 1) - 1)
         self._gt_writer.write_frame(
-            ob_in_ref=ob_in_ref,
+            ob_in_world=ob_in_world,
+            ref_in_world=ref_in_world,
             proprio_frame_index=proprio_frame_index,
             timestamp=gt.get("timestamp", time.time()),
             box_half_extents=gt.get("box_half_extents"),

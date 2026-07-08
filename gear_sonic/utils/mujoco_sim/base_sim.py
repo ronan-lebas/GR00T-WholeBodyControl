@@ -29,10 +29,11 @@ from gear_sonic.utils.mujoco_sim.robot import Robot
 
 GEAR_SONIC_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
-# Reference body for the ground-truth box pose: a planted, near-static frame. The box
-# pose is stored relative to it so the replayed cube doesn't jitter (unlike the head
-# camera, the fast-moving tip of the chain). MUST match the visualizer's GT reference
-# (visualize_robot_object_trajectory.py).
+# Reference body for the ground-truth box anchor: a planted, near-static frame whose
+# world pose is published alongside the box's world pose. The replay uses it *once* (at
+# frame 0) to map the sim's arbitrary world into its own feet-planted world, so the cube
+# lands correctly relative to the robot without re-injecting per-frame robot motion. MUST
+# match the visualizer's GT reference (visualize_robot_object_trajectory.py).
 BOX_GT_REFERENCE_BODY = "right_ankle_roll_link"
 
 
@@ -88,7 +89,7 @@ class DefaultEnv:
 
         # Ground-truth box pose export (sim-only): publish the exact object pose from
         # MuJoCo alongside FoundationPose so the two can be compared. Handles resolved
-        # lazily in get_box_in_gt_reference(); half-extents stored in init_scene.
+        # lazily in get_box_gt_poses(); half-extents stored in init_scene.
         self.record_box_gt = self.config.get("record_box_gt", False)
         self.box_half_extents = None
         self._gt_box_body_id = None
@@ -688,17 +689,20 @@ class DefaultEnv:
         head_pos = root_pos + Rotation.from_quat(root_quat).apply(np.array([0.0, 0.0, -0.044]))
         return np.concatenate((head_pos, root_quat))
 
-    def get_box_in_gt_reference(self) -> np.ndarray | None:
-        """Exact 4x4 pose of the box in the ground-truth reference frame, or None if no box.
+    def get_box_gt_poses(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """Exact ``(box_in_world, ref_in_world)`` 4x4 world poses, or None if no box.
 
-        The reference is ``BOX_GT_REFERENCE_BODY`` (the right ankle-roll link): a planted,
-        near-static frame. Referencing the head camera instead — the fast-moving tip of the
-        kinematic chain — made the replayed cube jitter, because the GT stream is sampled
-        slightly out of step with the proprio rows, so a held pose swung against the moving
-        camera. A foot frame barely moves during static-base manipulation, so the cube stays
-        put while staying exact (relative poses among robot links are joint-determined, so the
-        cube-in-hand configuration is preserved regardless of the reference). The replay
-        visualizer places the box with the same body's pose. Handles are cached on first call.
+        Both are absolute MuJoCo world poses sampled from the *same* ``mj_data`` (same
+        physics step), so they are perfectly time-consistent with each other. We publish the
+        box in the **world** frame — not relative to a robot link — so that a physically static
+        box has a constant recorded pose: expressing it relative to a moving link (the head
+        camera, or even a foot) injects that link's motion into the stored pose, making a
+        static cube appear to drift/jitter on replay. ``ref_in_world`` is the pose of
+        ``BOX_GT_REFERENCE_BODY`` (the right ankle-roll link, a planted near-static frame),
+        recorded alongside so the replay can anchor the (arbitrary) sim world to its own
+        feet-planted world with a single constant transform — placing the cube correctly
+        relative to the robot without re-injecting any per-frame robot motion into the cube.
+        Handles are resolved and cached on first call.
         """
         if self._gt_box_body_id is None:
             bid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "box")
@@ -715,9 +719,7 @@ class DefaultEnv:
             t[:3, 3] = self.mj_data.xpos[body_id]
             return t
 
-        t_wr = _body_pose(self._gt_ref_body_id)
-        t_wo = _body_pose(self._gt_box_body_id)
-        return np.linalg.inv(t_wr) @ t_wo
+        return _body_pose(self._gt_box_body_id), _body_pose(self._gt_ref_body_id)
 
     def get_root_vel(self) -> np.ndarray:
         return self.mj_data.qvel[:6]
@@ -1191,12 +1193,13 @@ class BaseSimulator:
     def init_publisher(self):
         """Publish the ground-truth box pose (sim-only) on a small ZMQ PUB, if enabled.
 
-        One msgpack message per physics step carrying the exact box-in-right-foot pose
-        (see _publish_box_gt). Published at the full sim rate so it is always fresher than
-        the recorder's sampling loop. The data recorder subscribes (CONFLATE, latest-only)
-        and writes it to a separate parquet in parallel to the FoundationPose estimate, so
-        the two can be compared (and, in sim, the ground truth used directly). Real hardware
-        has no such stream — hence the ``record_box_gt`` flag gates it entirely.
+        One msgpack message per physics step carrying the exact box-in-world and
+        reference-body-in-world poses (see _publish_box_gt). Published at the full sim rate so
+        the recorder can time-match a pose to each proprio row. The data recorder subscribes,
+        buffers a short history, and writes the contemporaneous pose to a separate parquet in
+        parallel to the FoundationPose estimate, so the two can be compared (and, in sim, the
+        ground truth used directly). Real hardware has no such stream — hence the
+        ``record_box_gt`` flag gates it entirely.
         """
         self._box_gt_socket = None
         if not getattr(self.sim_env, "record_box_gt", False):
@@ -1206,24 +1209,29 @@ class BaseSimulator:
         port = int(self.config.get("box_gt_port", 5560))
         ctx = zmq.Context.instance()
         sock = ctx.socket(zmq.PUB)
-        sock.setsockopt(zmq.SNDHWM, 4)
+        # Keep a small backlog (not just the latest): the recorder drains a short history each
+        # loop and time-matches the pose to the proprio row, so a handful of in-flight physics
+        # steps must survive between its (slower) polls rather than being dropped.
+        sock.setsockopt(zmq.SNDHWM, 128)
         sock.bind(f"tcp://*:{port}")
         self._box_gt_socket = sock
         print(f"[Sim] box ground-truth publisher bound on tcp://*:{port}")
 
     def _publish_box_gt(self):
-        """Send one ground-truth box-pose message (object in the right-foot frame), if enabled."""
+        """Send one ground-truth box-pose message (box + reference body, world frame)."""
         if getattr(self, "_box_gt_socket", None) is None:
             return
-        pose = self.sim_env.get_box_in_gt_reference()
-        if pose is None:
+        poses = self.sim_env.get_box_gt_poses()
+        if poses is None:
             return
+        box_in_world, ref_in_world = poses
         import msgpack
         import zmq
 
         msg = {
             "topic": "box_gt",
-            "ob_in_ref": pose.reshape(-1).tolist(),  # 4x4 row-major, box in right-foot frame
+            "ob_in_world": box_in_world.reshape(-1).tolist(),  # 4x4 row-major, box in world
+            "ref_in_world": ref_in_world.reshape(-1).tolist(),  # 4x4 row-major, ref body in world
             "box_half_extents": [float(s) for s in (self.sim_env.box_half_extents or [])],
             "timestamp": time.time(),
         }
