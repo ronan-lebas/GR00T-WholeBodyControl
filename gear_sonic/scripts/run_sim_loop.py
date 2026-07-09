@@ -25,7 +25,7 @@ BOX_POS  = (1.5, 0.0, 0.1)   # position in meters (x, y, z); z = half-height to 
 BOX_MASS = 1.0                # mass in kg
 
 # Tabletop box defaults, used when --table and --box are combined (graspable cube)
-TABLE_BOX_SIZE = (0.04, 0.04, 0.04)  # half-extents in meters (8 cm cube)
+TABLE_BOX_SIZE = (0.025, 0.025, 0.025)  # half-extents in meters (8 cm cube)
 TABLE_BOX_MASS = 0.1                  # mass in kg
 
 # Grip behaviour for the graspable box. The problem is twofold: the cube slips, AND the
