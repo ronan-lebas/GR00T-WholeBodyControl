@@ -29,6 +29,12 @@ Usage (needs gear_sonic[sim] — mujoco, pin, scipy, pyarrow):
     python gear_sonic/scripts/visualize_robot_object_trajectory.py
     python gear_sonic/scripts/visualize_robot_object_trajectory.py --trajectory outputs/2026-06-12-19-32-55
     python gear_sonic/scripts/visualize_robot_object_trajectory.py --episode 0 --check   # headless sanity
+    python gear_sonic/scripts/visualize_robot_object_trajectory.py --ground-truth --contacts  # + red contact dots
+
+With ``--contacts`` the finger<->object contact points from the ``contacts/`` sidecar (written by
+``gear_sonic/scripts/process_contacts.py``) are overlaid as red spheres. They are stored in the
+object-local frame, so they ride on the box surface; pair with ``--ground-truth`` (the pose they
+were computed against) for the exact geometry.
 
 Controls: space = pause/resume, left/right arrows = step one frame (while paused).
 """
@@ -204,6 +210,33 @@ def load_frame_map(ob_dir: Path, n_obj: int) -> np.ndarray | None:
     return proprio
 
 
+def load_contacts(traj: Path, episode: int, n_frames: int) -> np.ndarray | None:
+    """Return (N, S, 3) per-frame object-local contact points (NaN where no contact), or None.
+
+    Reads the ``contacts/episode_*.parquet`` sidecar written by ``process_contacts.py``. Points
+    are stored in the OBJECT-LOCAL frame; the replay converts them to world each frame with the
+    placed box pose (see ``set_frame``), so the drawn dots stay glued to the box surface whatever
+    pose mode is used. The parquet is one row per robot frame keyed by ``proprio_frame_index``, so
+    we scatter into a robot-frame-aligned array. Contacts pair naturally with ``--ground-truth``
+    (the pose they were computed against), but also render fine over the filtered/FP box.
+    """
+    path = traj / "contacts" / f"episode_{episode:06d}.parquet"
+    if not path.is_file():
+        return None
+    table = pq.read_table(path, columns=["proprio_frame_index", "contact_points"])
+    idx = np.asarray(table.column("proprio_frame_index").to_pylist(), dtype=int)
+    pts = np.asarray(table.column("contact_points").to_pylist(), dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] % 3 != 0:
+        print(f"[warn] unexpected contact_points shape {pts.shape}; ignoring contacts")
+        return None
+    s = pts.shape[1] // 3
+    pts = pts.reshape(-1, s, 3)
+    out = np.full((n_frames, s, 3), np.nan)
+    valid = (idx >= 0) & (idx < n_frames)
+    out[idx[valid]] = pts[valid]
+    return out
+
+
 def read_fps(traj: Path, default: float = 50.0) -> float:
     info = traj / "meta" / "info.json"
     if info.is_file():
@@ -219,8 +252,20 @@ def read_fps(traj: Path, default: float = 50.0) -> float:
 # --------------------------------------------------------------------------- #
 
 
-def build_model(mesh_path: Path | None) -> mujoco.MjModel:
-    """Inject the tracked object (mesh + freejoint) into the brainco scene, if a mesh is given."""
+def build_model(
+    mesh_path: Path | None,
+    collidable_object: bool = False,
+    object_margin: float = 0.0,
+) -> mujoco.MjModel:
+    """Inject the tracked object (mesh + freejoint) into the brainco scene, if a mesh is given.
+
+    By default the object is *visual only* (contype/conaffinity 0): the visualizer and the pose
+    filter never step physics, so it must not collide. Pass ``collidable_object=True`` to instead
+    make it collidable with all-ones contype/conaffinity (so it overlaps whatever collision bitmask
+    the hand geoms carry) and ``margin=object_margin`` — this lets ``mj_forward``'s collision phase
+    report near-contacts within ``object_margin`` (used by ``process_contacts.py`` to recover
+    finger<->object contacts offline, without stepping physics).
+    """
     tree = ET.parse(SCENE_XML)
     root = tree.getroot()
 
@@ -238,9 +283,19 @@ def build_model(mesh_path: Path | None) -> mujoco.MjModel:
         geom = ET.SubElement(body, "geom")
         geom.set("type", "mesh")
         geom.set("mesh", "tracked_object")
-        geom.set("contype", "0")  # visual only — no collision (we never step physics)
-        geom.set("conaffinity", "0")
-        geom.set("rgba", "1 0.5 0 0.6")
+        if collidable_object:
+            # All-ones masks overlap both hands' bitmasks (left contype=2/conaffinity=5,
+            # right contype=4/conaffinity=3); margin makes mj_forward emit contacts up to
+            # `object_margin` away. Callers filter results to object<->finger pairs by body.
+            all_ones = str((1 << 31) - 1)
+            geom.set("contype", all_ones)
+            geom.set("conaffinity", all_ones)
+            geom.set("margin", str(object_margin))
+            geom.set("rgba", "1 0.5 0 0.4")
+        else:
+            geom.set("contype", "0")  # visual only — no collision (we never step physics)
+            geom.set("conaffinity", "0")
+            geom.set("rgba", "1 0.5 0 0.6")
 
     # Write next to the scene so the relative <include> stays valid.
     with tempfile.NamedTemporaryFile(
@@ -288,11 +343,18 @@ class TrajectoryReplay:
         obj_in_world: bool = False,
         obj_gt_ref: bool = False,
         ref_poses: np.ndarray | None = None,
+        collidable_object: bool = False,
+        object_margin: float = 0.0,
+        contacts_local: np.ndarray | None = None,
     ):
         self.states = states
         self.obj_poses = obj_poses
         self.base_quats = base_quats
         self.obj_to_robot = obj_to_robot
+        # (N, S, 3) per-frame contact points in the OBJECT-LOCAL frame (NaN where no contact),
+        # from process_contacts.py. Converted to world in set_frame and drawn as red spheres.
+        self.contacts_local = contacts_local
+        self.current_contact_points = np.zeros((0, 3))
         # If True, obj_poses are already 4x4 world poses (filtered) and are placed
         # directly; otherwise they are object-in-camera and go through camera FK.
         self.obj_in_world = obj_in_world
@@ -308,12 +370,20 @@ class TrajectoryReplay:
         self.has_object = obj_poses is not None
         self.m = obj_poses.shape[0] if self.has_object else 0
 
-        self.model = build_model(mesh_path)
+        self.model = build_model(mesh_path, collidable_object, object_margin)
         self.data = mujoco.MjData(self.model)
         self.data.qpos[:] = self.model.qpos0  # fixed standing base
 
         robot_model = instantiate_g1_robot_model(hand_type="brainco")
         self.joint_map = build_joint_map(self.model, robot_model)
+        # BrainCo fingers are underactuated: each *_distal joint is passive, driven by its
+        # *_proximal joint through a mimic coupling (multiplier ~1.155 for fingers, 1.0 for the
+        # thumb). The recorded whole_q stores those passive joints as 0 (only the 6 actuated
+        # joints/hand are filled), and mj_forward does NOT project qpos onto equality constraints,
+        # so without this the distal segments stay straight and the fingers never close on the
+        # object. We read the coupling straight from the model's joint-equality constraints so it
+        # stays in sync with the MJCF, and re-apply it every frame in _apply_robot_pose.
+        self.joint_couplings = self._build_joint_couplings()
 
         self.cam_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_CAMERA, "head_camera"
@@ -375,12 +445,44 @@ class TrajectoryReplay:
         t[:3, 3] = self.data.xpos[self.gt_ref_body_id]
         return t
 
+    def _build_joint_couplings(self) -> list[tuple[int, int, np.ndarray, float, float]]:
+        """Passive-joint couplings from the model's joint-equality constraints.
+
+        Each returned tuple is ``(dep_qadr, ref_qadr, polycoef, dep_q0, ref_q0)`` for a MuJoCo
+        ``mjEQ_JOINT`` constraint, encoding ``qpos[dep] = dep_q0 + poly(qpos[ref] - ref_q0)`` with
+        ``poly`` the (lowest-order-first) 5-coefficient polynomial in ``eq_data``. This is exactly
+        the BrainCo distal<-proximal mimic, but read generically so any coupling in the MJCF works.
+        """
+        couplings = []
+        for e in range(self.model.neq):
+            if self.model.eq_type[e] != mujoco.mjtEq.mjEQ_JOINT:
+                continue
+            j_dep = int(self.model.eq_obj1id[e])  # joint1: the passive/driven joint
+            j_ref = int(self.model.eq_obj2id[e])  # joint2: the actuated/reference joint
+            dep_qadr = int(self.model.jnt_qposadr[j_dep])
+            ref_qadr = int(self.model.jnt_qposadr[j_ref])
+            poly = np.asarray(self.model.eq_data[e][:5], dtype=np.float64)
+            couplings.append(
+                (dep_qadr, ref_qadr, poly, float(self.model.qpos0[dep_qadr]),
+                 float(self.model.qpos0[ref_qadr]))
+            )
+        return couplings
+
+    def _apply_joint_couplings(self) -> None:
+        """Drive each passive joint from its reference joint (BrainCo distal <- proximal mimic)."""
+        for dep_qadr, ref_qadr, poly, dep_q0, ref_q0 in self.joint_couplings:
+            d = self.data.qpos[ref_qadr] - ref_q0
+            self.data.qpos[dep_qadr] = dep_q0 + np.polyval(poly[::-1], d)
+
     def _apply_robot_pose(self, i: int) -> None:
         """Set robot joints + base orientation for frame i and run FK (no foot anchor/object)."""
         i = int(np.clip(i, 0, self.n - 1))
         whole_q = self.states[i]
         for adr, didx in self.joint_map:
             self.data.qpos[adr] = whole_q[didx]
+        # Fill the passive finger joints from their actuated counterparts (recorded whole_q has
+        # them at 0); without this the fingers don't curl around the object.
+        self._apply_joint_couplings()
         # Recorded base orientation (pitch/roll + relative yaw) reproduces how the head camera
         # actually swept during recording, so the static object cancels out on reprojection.
         if self.base_quats is not None:
@@ -410,6 +512,7 @@ class TrajectoryReplay:
             mujoco.mj_forward(self.model, self.data)
 
         if not self.has_object:
+            self.current_contact_points = np.zeros((0, 3))  # contacts attach to the object
             mujoco.mj_forward(self.model, self.data)
             return
 
@@ -437,7 +540,37 @@ class TrajectoryReplay:
         ).as_quat(scalar_first=True)
         mujoco.mj_forward(self.model, self.data)
 
-    def run(self, fps: float) -> None:
+        # Object-local contact points -> world, using the box pose we just placed, so the red
+        # dots ride on the box surface (finite rows are in contact; NaN rows are skipped).
+        if self.contacts_local is not None:
+            local = self.contacts_local[int(np.clip(i, 0, self.contacts_local.shape[0] - 1))]
+            finite = np.isfinite(local).all(axis=1)
+            if finite.any():
+                self.current_contact_points = local[finite] @ t_wo[:3, :3].T + t_wo[:3, 3]
+            else:
+                self.current_contact_points = np.zeros((0, 3))
+
+    def _render_contacts(self, viewer, radius: float) -> None:
+        """Draw the current frame's contact points as red spheres in the viewer overlay scene."""
+        scn = viewer.user_scn
+        scn.ngeom = 0
+        rgba = np.array([1.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        size = np.array([radius, radius, radius], dtype=np.float64)
+        eye = np.eye(3, dtype=np.float64).reshape(9)
+        for p in self.current_contact_points:
+            if scn.ngeom >= scn.maxgeom:
+                break
+            mujoco.mjv_initGeom(
+                scn.geoms[scn.ngeom],
+                type=mujoco.mjtGeom.mjGEOM_SPHERE,
+                size=size,
+                pos=np.asarray(p, dtype=np.float64),
+                mat=eye,
+                rgba=rgba,
+            )
+            scn.ngeom += 1
+
+    def run(self, fps: float, contact_radius: float = 0.008) -> None:
         state = {"frame": 0.0, "paused": False, "step": 0}
 
         def key_callback(key: int) -> None:
@@ -458,6 +591,8 @@ class TrajectoryReplay:
             show_left_ui=False, show_right_ui=False,
         ) as viewer:
             self.set_frame(0)
+            self._render_contacts(viewer, contact_radius)
+            viewer.sync()
             last = time.time()
             while viewer.is_running():
                 now = time.time()
@@ -469,10 +604,12 @@ class TrajectoryReplay:
                         state["frame"] = float(idx)
                         state["step"] = 0
                         self.set_frame(idx)
+                        self._render_contacts(viewer, contact_radius)
                         viewer.sync()
                 else:
                     state["frame"] = (state["frame"] + dt * fps) % self.n
                     self.set_frame(int(state["frame"]))
+                    self._render_contacts(viewer, contact_radius)
                     viewer.sync()
                 time.sleep(max(0.0, 1.0 / fps - (time.time() - now)))
 
@@ -499,6 +636,15 @@ def main() -> None:
         "--ground-truth", dest="ground_truth", action="store_true",
         help="use the sim ground-truth object pose (object_gt/episode_*.parquet) instead of "
         "the FoundationPose estimate — sim-only, for comparison / exact replay",
+    )
+    parser.add_argument(
+        "--contacts", action="store_true",
+        help="overlay red spheres at the finger<->object contact points from the contacts/ "
+        "sidecar (run gear_sonic/scripts/process_contacts.py first); best with --ground-truth",
+    )
+    parser.add_argument(
+        "--contact-radius", type=float, default=0.008,
+        help="radius (m) of the contact spheres (default: 0.008)",
     )
     parser.add_argument(
         "--check", action="store_true",
@@ -537,9 +683,25 @@ def main() -> None:
     else:
         print("[info] object     : none — replaying robot body only")
 
+    contacts_local = None
+    if args.contacts:
+        contacts_local = load_contacts(traj, args.episode, states.shape[0])
+        if contacts_local is None:
+            print(
+                "[warn] --contacts set but no contacts/episode_"
+                f"{args.episode:06d}.parquet found; run process_contacts.py first"
+            )
+        else:
+            n_hit = int(np.isfinite(contacts_local).all(axis=2).any(axis=1).sum())
+            print(
+                f"[info] contacts   : {contacts_local.shape[1]} segments, "
+                f"{n_hit}/{states.shape[0]} frames with contact (red spheres)"
+            )
+
     replay = TrajectoryReplay(
         states, obj_poses, mesh, base_quats, obj_to_robot,
         obj_in_world=args.filtered, obj_gt_ref=args.ground_truth, ref_poses=ref_poses,
+        contacts_local=contacts_local,
     )
 
     if args.check:
@@ -562,7 +724,7 @@ def main() -> None:
         print("[check] OK")
         return
 
-    replay.run(fps)
+    replay.run(fps, contact_radius=args.contact_radius)
 
 
 if __name__ == "__main__":
