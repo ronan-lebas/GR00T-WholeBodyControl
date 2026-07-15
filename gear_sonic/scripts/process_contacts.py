@@ -14,20 +14,30 @@ upstream dataset pipeline), so we replicate the *convention* rather than import 
 converter — out of scope here — later remaps our ``segment_names`` onto ConTrack's links.
 
 How contacts are recovered (no physics stepping):
-  We reuse the ground-truth replay in ``visualize_robot_object_trajectory.py``. Each frame it
-  poses the robot from the recorded 51-DOF ``whole_q`` and places the box at its ground-truth
-  world pose (``object_gt/``), so the *relative* hand/box geometry is physically correct. We build
-  that model with the injected object made **collidable with margin = threshold**, so
+  We reuse the replay in ``visualize_robot_object_trajectory.py``. Each frame it poses the robot
+  from the recorded 51-DOF ``whole_q`` and places the box at its object pose, so the *relative*
+  hand/box geometry is physically correct (up to the accuracy of that object pose — see below). We
+  build that model with the injected object made **collidable with margin = threshold**, so
   ``mj_forward``'s collision phase (which runs even without ``mj_step``) reports every
   object<->finger contact whose surface gap is <= the threshold. We read those from
   ``mj_data.contact``, keep the closest per finger segment, and express its midpoint in the
   object-local frame. This works for both free-box and held-box recordings (held-box disables
   *sim* collision, but here we recompute purely from geometry).
 
+Object pose source: by default this uses the sim ground truth (``object_gt/``) — exact, when
+available. Pass ``--from-vision`` to instead use the FoundationPose estimate (``ob_in_cam`` per
+frame via the camera FK, or ``ob_in_world_filtered`` with ``--filtered``) — needed for recordings
+where the ground truth is unavailable or unreliable (e.g. reconstructed from a legacy schema and
+contaminated by unrecorded base motion — see ``convert_object_gt_to_world.py``). Output format,
+path, and schema are identical either way; re-running overwrites any existing contacts file for
+that episode, whichever source produced it.
+
 Usage (needs gear_sonic[sim] — mujoco, pin, scipy, pyarrow):
     python gear_sonic/scripts/process_contacts.py
     python gear_sonic/scripts/process_contacts.py --trajectory outputs/2026-07-09-14-54-30 --episode 0
     python gear_sonic/scripts/process_contacts.py --episode 0 --check   # headless sanity, no writes
+    python gear_sonic/scripts/process_contacts.py --episode 4 --from-vision            # raw ob_in_cam
+    python gear_sonic/scripts/process_contacts.py --episode 4 --from-vision --filtered # ob_in_world_filtered
 """
 
 import argparse
@@ -307,41 +317,72 @@ def main() -> None:
         help="output subfolder under the trajectory (default: contacts)",
     )
     parser.add_argument(
+        "--from-vision",
+        action="store_true",
+        help="use the FoundationPose object-pose estimate instead of the sim ground truth "
+        "(ob_in_cam by default, or ob_in_world_filtered with --filtered)",
+    )
+    parser.add_argument(
+        "--filtered",
+        action="store_true",
+        help="with --from-vision, use ob_in_world_filtered/ instead of raw ob_in_cam/",
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help="headless sanity summary (no viewer, no files written)",
     )
     args = parser.parse_args()
 
+    if args.filtered and not args.from_vision:
+        sys.exit("[error] --filtered only applies with --from-vision")
+
     viz = _load_viz_module()
 
     # resolve_paths reads .ground_truth / .filtered off the args namespace; force ground-truth
-    # mode so it returns the object_gt parquet (the exact box world pose we key contacts against).
-    gt_args = types.SimpleNamespace(
-        trajectory=args.trajectory, episode=args.episode, ground_truth=True, filtered=False
+    # mode (default) so it returns the object_gt parquet, or vision mode with --from-vision so it
+    # returns the FoundationPose ob_in_cam/ob_in_world_filtered folder instead.
+    src_args = types.SimpleNamespace(
+        trajectory=args.trajectory,
+        episode=args.episode,
+        ground_truth=not args.from_vision,
+        filtered=args.filtered,
     )
-    traj, parquet, mesh, gt_parquet = viz.resolve_paths(gt_args)
-    if mesh is None or gt_parquet is None:
-        sys.exit(
-            "[error] contacts require the sim ground-truth object pose "
-            f"(object_gt/episode_{args.episode:06d}.parquet) and box.obj; not found under {traj}"
+    traj, parquet, mesh, ob_src = viz.resolve_paths(src_args)
+    if mesh is None or ob_src is None:
+        source_desc = (
+            f"foundation_pose_data/episode_{args.episode:06d}/"
+            f"{'ob_in_world_filtered' if args.filtered else 'ob_in_cam'}"
+            if args.from_vision
+            else f"object_gt/episode_{args.episode:06d}.parquet"
         )
+        sys.exit(f"[error] contacts require the object pose ({source_desc}) and box.obj; not found under {traj}")
 
     states = viz.load_robot_states(parquet)
     base_quats = viz.load_base_quats(parquet)
-    box, ref, idx = viz.load_object_gt(gt_parquet)
     proprio_idx = load_frame_index(parquet, states.shape[0])
     fps = viz.read_fps(traj)
 
+    if args.from_vision:
+        obj_poses = viz.load_object_poses(ob_src)
+        obj_to_robot = viz.load_frame_map(ob_src, obj_poses.shape[0])
+        obj_gt_ref, ref_poses = False, None
+        obj_in_world = args.filtered
+        source_tag = "vision_filtered" if args.filtered else "vision_raw"
+    else:
+        obj_poses, ref_poses, obj_to_robot = viz.load_object_gt(ob_src)
+        obj_gt_ref, obj_in_world = True, False
+        source_tag = "ground_truth"
+
     replay = viz.TrajectoryReplay(
         states,
-        box,
+        obj_poses,
         mesh,
         base_quats,
-        obj_to_robot=idx,
-        obj_in_world=False,
-        obj_gt_ref=True,
-        ref_poses=ref,
+        obj_to_robot=obj_to_robot,
+        obj_in_world=obj_in_world,
+        obj_gt_ref=obj_gt_ref,
+        ref_poses=ref_poses,
         collidable_object=True,
         object_margin=args.threshold,
     )
@@ -352,7 +393,7 @@ def main() -> None:
     print(
         f"[info] parquet    : {parquet.relative_to(traj)} ({states.shape[0]} frames @ {fps:.0f} fps)"
     )
-    print(f"[info] object gt  : {gt_parquet.relative_to(traj)} ({box.shape[0]} frames)")
+    print(f"[info] object pose: {ob_src.relative_to(traj)} ({obj_poses.shape[0]} frames, source={source_tag})")
     print(
         f"[info] segments   : {n_segments} finger collision segments; threshold {args.threshold*1000:.1f} mm"
     )
@@ -381,7 +422,7 @@ def main() -> None:
         "contact_frame": "object_local",
         "contact_point_units": "meters",
         "nan_convention": "NaN where segment not in contact",
-        "source": "ground_truth",
+        "source": source_tag,
         "fps": fps,
         "flat_layout": (
             "columns are flat length-num_segments (is_contact/dist) or num_segments*3 "
@@ -391,10 +432,13 @@ def main() -> None:
         ),
     }
     out_dir = traj / args.out_name
+    out_path = out_dir / f"episode_{args.episode:06d}.parquet"
+    if out_path.exists():
+        print(f"[info] {out_path.relative_to(traj)} already exists; overwriting (source={source_tag})")
     write_outputs(out_dir, args.episode, proprio_idx, is_contact, points, dist, meta)
     counts = is_contact.sum(axis=1)
     print(
-        f"[done] wrote {out_dir / f'episode_{args.episode:06d}.parquet'} "
+        f"[done] wrote {out_path} "
         f"({is_contact.shape[0]} rows, {int((counts > 0).sum())} with contact) + meta.json"
     )
 
