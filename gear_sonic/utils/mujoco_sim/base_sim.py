@@ -94,6 +94,11 @@ class DefaultEnv:
         self.box_half_extents = None
         self._gt_box_body_id = None
         self._gt_ref_body_id = None
+        # Lazily built in get_gt_state(): maps MuJoCo joint-velocity dof addresses to the
+        # Pinocchio whole_q (observation.state) ordering, so recorded joint velocities pair
+        # 1:1 with observation.state on the training side. None until first GT publish.
+        self._gt_jointvel_map: list[tuple[int, int]] | None = None
+        self._gt_njoints: int | None = None
 
         self.init_scene()
         self.last_reward = 0
@@ -721,6 +726,88 @@ class DefaultEnv:
 
         return _body_pose(self._gt_box_body_id), _body_pose(self._gt_ref_body_id)
 
+    def _ensure_gt_jointvel_map(self) -> None:
+        """Lazily build ``(mj_dof_addr, whole_q_index)`` pairs mapping MuJoCo joint velocities
+        into the Pinocchio ``whole_q`` (``observation.state``) ordering.
+
+        This mirrors ``visualize_robot_object_trajectory.build_joint_map`` but on the *velocity*
+        (dof) side, so a recorded ``joint_vel`` vector pairs 1:1 with ``observation.state`` and can
+        be written straight back into another MuJoCo model's ``qvel`` for reference-state resets.
+        Free joints (the robot base + the object) are skipped; their twists are stored separately.
+        """
+        if self._gt_jointvel_map is not None:
+            return
+        from gear_sonic.data.robot_model.instantiation.g1 import instantiate_g1_robot_model
+
+        hand_type = "brainco" if "brainco" in self.config["ROBOT_SCENE"] else "dex3"
+        rm = instantiate_g1_robot_model(hand_type=hand_type)
+        pairs: list[tuple[int, int]] = []
+        for j in range(self.mj_model.njnt):
+            if self.mj_model.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE:
+                continue
+            name = mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, j)
+            try:
+                didx = rm.dof_index(name)
+            except Exception:
+                continue  # joint not in the Pinocchio model
+            pairs.append((int(self.mj_model.jnt_dofadr[j]), int(didx)))
+        self._gt_jointvel_map = pairs
+        self._gt_njoints = int(rm.num_joints)
+
+    def get_gt_state(self) -> dict | None:
+        """Full sim ground-truth state for reference-state resets (sim-only), or None if no box.
+
+        Everything is read from the *same* ``mj_data`` (one physics step), so poses and velocities
+        are mutually time-consistent. Extends ``get_box_gt_poses`` with the robot's floating-base
+        world pose and every velocity needed to reset without a zero-velocity discontinuity:
+
+          - ``ob_in_world``      : 4x4 box pose in the MuJoCo world frame
+          - ``ref_in_world``     : 4x4 pose of ``BOX_GT_REFERENCE_BODY`` (kept for the replay anchor)
+          - ``pelvis_in_world``  : 4x4 robot floating-base (pelvis) pose in world -- the base
+                                   translation that is otherwise unrecorded (no need for Recipe A)
+          - ``base_vel``         : (6,) base freejoint qvel: [lin_xyz (world frame), ang_xyz (base
+                                   local frame)] -- MuJoCo freejoint velocity convention
+          - ``object_vel``       : (6,) box freejoint qvel, same convention (world lin / local ang)
+          - ``joint_vel``        : (num_joints,) joint velocities in whole_q / observation.state
+                                   ordering (see _ensure_gt_jointvel_map)
+        """
+        poses = self.get_box_gt_poses()
+        if poses is None:
+            return None
+        box_in_world, ref_in_world = poses
+
+        # Robot floating base = pelvis freejoint at qpos[:7] (wxyz quat) / qvel[:6].
+        pelvis_in_world = np.eye(4)
+        pelvis_in_world[:3, :3] = Rotation.from_quat(
+            self.mj_data.qpos[3:7][[1, 2, 3, 0]]
+        ).as_matrix()
+        pelvis_in_world[:3, 3] = self.mj_data.qpos[:3]
+        base_vel = self.mj_data.qvel[:6].copy()
+
+        # Object freejoint twist (resolved from the box body's joint; may be absent for a
+        # held/kinematic box, in which case its velocity is a scripted zero).
+        object_vel = None
+        if self._gt_box_body_id is not None:
+            box_jnt = int(self.mj_model.body_jntadr[self._gt_box_body_id])
+            if box_jnt >= 0 and self.mj_model.jnt_type[box_jnt] == mujoco.mjtJoint.mjJNT_FREE:
+                dofadr = int(self.mj_model.jnt_dofadr[box_jnt])
+                object_vel = self.mj_data.qvel[dofadr : dofadr + 6].copy()
+
+        # Joint velocities in whole_q / observation.state ordering.
+        self._ensure_gt_jointvel_map()
+        joint_vel = np.zeros(self._gt_njoints, dtype=np.float64)
+        for dofadr, didx in self._gt_jointvel_map:
+            joint_vel[didx] = self.mj_data.qvel[dofadr]
+
+        return {
+            "ob_in_world": box_in_world,
+            "ref_in_world": ref_in_world,
+            "pelvis_in_world": pelvis_in_world,
+            "base_vel": base_vel,
+            "object_vel": object_vel,
+            "joint_vel": joint_vel,
+        }
+
     def get_root_vel(self) -> np.ndarray:
         return self.mj_data.qvel[:6]
 
@@ -1218,20 +1305,29 @@ class BaseSimulator:
         print(f"[Sim] box ground-truth publisher bound on tcp://*:{port}")
 
     def _publish_box_gt(self):
-        """Send one ground-truth box-pose message (box + reference body, world frame)."""
+        """Send one ground-truth state message (box + reference body + robot base + velocities).
+
+        World-frame poses plus every velocity needed for a reference-state reset without a
+        zero-velocity jump (see BaseSimulator.get_gt_state). ``pelvis_in_world`` supplies the base
+        translation the LeRobot parquet never stores, so downstream needs no FK reconstruction.
+        """
         if getattr(self, "_box_gt_socket", None) is None:
             return
-        poses = self.sim_env.get_box_gt_poses()
-        if poses is None:
+        gt = self.sim_env.get_gt_state()
+        if gt is None:
             return
-        box_in_world, ref_in_world = poses
         import msgpack
         import zmq
 
+        object_vel = gt["object_vel"]
         msg = {
             "topic": "box_gt",
-            "ob_in_world": box_in_world.reshape(-1).tolist(),  # 4x4 row-major, box in world
-            "ref_in_world": ref_in_world.reshape(-1).tolist(),  # 4x4 row-major, ref body in world
+            "ob_in_world": gt["ob_in_world"].reshape(-1).tolist(),  # 4x4 row-major, box in world
+            "ref_in_world": gt["ref_in_world"].reshape(-1).tolist(),  # 4x4 row-major, ref body
+            "pelvis_in_world": gt["pelvis_in_world"].reshape(-1).tolist(),  # 4x4 base in world
+            "base_vel": gt["base_vel"].tolist(),  # (6,) freejoint qvel: world lin, local ang
+            "object_vel": (object_vel.tolist() if object_vel is not None else None),  # (6,) or None
+            "joint_vel": gt["joint_vel"].tolist(),  # (num_joints,) in observation.state ordering
             "box_half_extents": [float(s) for s in (self.sim_env.box_half_extents or [])],
             "timestamp": time.time(),
         }
