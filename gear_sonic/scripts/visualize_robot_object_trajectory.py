@@ -12,14 +12,22 @@ Data sources for a recording folder ``outputs/<ts>/``:
     (``foundation_pose/pose_estimation.py``).
   - object mesh  : ``foundation_pose_data/box.obj``.
 
-The recording stores no base world *position*, so the base translation is solved each frame to
-keep the feet planted on the floor (during recording the feet — not the pelvis — are fixed). The
-base *orientation* comes from the recording (`observation.root_orientation`) with only the
-initial yaw removed: the yaw *variation* is real camera azimuth motion and must be kept, or the
-static object appears to swing in azimuth as the robot turns. Orientation accuracy matters: the
-head camera is pitched down, so a few degrees of base pitch levers the camera-anchored object by
-several cm. The object is placed relative to the **live head_camera FK pose**, so the
-hand/object geometry stays consistent.
+Two ways to place the robot base:
+
+  - **legacy (default)** — the LeRobot recording stores no base world *position*, so the base
+    translation is solved each frame to keep the feet planted on the floor (during recording the
+    feet — not the pelvis — are fixed). The base *orientation* comes from the recording
+    (`observation.root_orientation`) with only the initial yaw removed: the yaw *variation* is real
+    camera azimuth motion and must be kept, or the static object appears to swing in azimuth as the
+    robot turns. Orientation accuracy matters: the head camera is pitched down, so a few degrees of
+    base pitch levers the camera-anchored object by several cm. With `--ground-truth` the box is
+    mapped into this feet-planted world by a single constant frame-0 anchor.
+
+  - **`--exact-base`** (needs `--ground-truth` + a recording with the `pelvis_in_world` column,
+    see new_data_collection_report.md) — the robot base is placed **directly** at its recorded true
+    world pose (full orientation + translation) and the box **directly** at `ob_in_world`. Both are
+    in the true sim world, so this is an exact reproduction of the sim: no feet-planting, no
+    yaw-zeroing, no anchor. Prefer this for new recordings.
 
 The robot trajectory (50 Hz) and the object trajectory (lower rate) generally differ in
 length; with no stored frame map they are aligned by uniform nearest-neighbour
@@ -30,6 +38,7 @@ Usage (needs gear_sonic[sim] — mujoco, pin, scipy, pyarrow):
     python gear_sonic/scripts/visualize_robot_object_trajectory.py --trajectory outputs/2026-06-12-19-32-55
     python gear_sonic/scripts/visualize_robot_object_trajectory.py --episode 0 --check   # headless sanity
     python gear_sonic/scripts/visualize_robot_object_trajectory.py --ground-truth --contacts  # + red contact dots
+    python gear_sonic/scripts/visualize_robot_object_trajectory.py --ground-truth --exact-base  # exact sim replay
 
 With ``--contacts`` the finger<->object contact points from the ``contacts/`` sidecar (written by
 ``gear_sonic/scripts/process_contacts.py``) are overlaid as red spheres. They are stored in the
@@ -171,20 +180,36 @@ def load_object_poses(ob_dir: Path) -> np.ndarray:
     return np.stack([np.loadtxt(f).reshape(4, 4) for f in files], axis=0)
 
 
-def load_object_gt(parquet: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return ((M,4,4) box-in-world, (M,4,4) reference-body-in-world, (M,) proprio rows).
+def load_object_gt(
+    parquet: Path,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray]:
+    """Return ((M,4,4) box-in-world, (M,4,4) ref-body-in-world, (M,4,4) pelvis-in-world|None,
+    (M,) proprio rows).
 
     Ground truth recorded by ObjectGtWriter: exact MuJoCo box poses in the *world* frame
     (so a static box stays static — no robot-link motion is folded in), plus the reference
     body's world pose at the same instant, used once to anchor the sim world to the replay's
     feet-planted world. The proprio_frame_index column *is* the object->robot frame map (rows
     are dense and monotonic), so it feeds object_index directly.
+
+    ``pelvis_in_world`` is present only in recordings made after the reset-state schema change
+    (see new_data_collection_report.md); it is the robot's true floating-base world pose and lets
+    ``--exact-base`` place the base directly instead of feet-planting. Returns None when absent.
     """
-    table = pq.read_table(parquet, columns=["proprio_frame_index", "ob_in_world", "ref_in_world"])
+    cols = pq.read_table(parquet).column_names
+    want = ["proprio_frame_index", "ob_in_world", "ref_in_world"]
+    if "pelvis_in_world" in cols:
+        want.append("pelvis_in_world")
+    table = pq.read_table(parquet, columns=want)
     idx = np.asarray(table.column("proprio_frame_index").to_pylist(), dtype=int)
     box = np.asarray(table.column("ob_in_world").to_pylist(), dtype=np.float64).reshape(-1, 4, 4)
     ref = np.asarray(table.column("ref_in_world").to_pylist(), dtype=np.float64).reshape(-1, 4, 4)
-    return box, ref, idx
+    pelvis = (
+        np.asarray(table.column("pelvis_in_world").to_pylist(), dtype=np.float64).reshape(-1, 4, 4)
+        if "pelvis_in_world" in cols
+        else None
+    )
+    return box, ref, pelvis, idx
 
 
 def load_frame_map(ob_dir: Path, n_obj: int) -> np.ndarray | None:
@@ -346,6 +371,8 @@ class TrajectoryReplay:
         collidable_object: bool = False,
         object_margin: float = 0.0,
         contacts_local: np.ndarray | None = None,
+        pelvis_poses: np.ndarray | None = None,
+        exact_base: bool = False,
     ):
         self.states = states
         self.obj_poses = obj_poses
@@ -366,6 +393,14 @@ class TrajectoryReplay:
         self.obj_gt_ref = obj_gt_ref
         self.ref_poses = ref_poses
         self.gt_anchor = np.eye(4)
+        # Exact-base mode: place the robot's floating base directly from the recorded
+        # pelvis_in_world (full orientation + translation, true W_sim) instead of the
+        # feet-planting + yaw-zeroing reconstruction. The box then goes straight to ob_in_world
+        # (gt_anchor stays identity) since robot and box are both in the true sim world — an
+        # exact reproduction of the sim, no anchor, no feet-planting approximation. Requires the
+        # ground-truth path and the new pelvis_in_world column.
+        self.pelvis_poses = pelvis_poses
+        self.exact_base = bool(exact_base) and pelvis_poses is not None
         self.n = states.shape[0]
         self.has_object = obj_poses is not None
         self.m = obj_poses.shape[0] if self.has_object else 0
@@ -411,7 +446,10 @@ class TrajectoryReplay:
             for n in ("left_ankle_roll_link", "right_ankle_roll_link")
         ]
         self.foot_target: np.ndarray | None = None
-        if all(fid >= 0 for fid in self.foot_ids):
+        if self.exact_base:
+            # Base comes straight from pelvis_in_world; no feet-planting solve, no anchor.
+            self.foot_ids = None
+        elif all(fid >= 0 for fid in self.foot_ids):
             self._apply_robot_pose(0)
             self.foot_target = 0.5 * (
                 self.data.xpos[self.foot_ids[0]] + self.data.xpos[self.foot_ids[1]]
@@ -423,7 +461,9 @@ class TrajectoryReplay:
         # feet-planted world. Built at frame 0 as (replay reference pose) @ inv(sim reference
         # pose), so placing the box with gt_anchor @ box_in_world reproduces the box's true
         # world trajectory relative to the robot — with no per-frame robot motion folded in.
-        if self.obj_gt_ref and self.ref_poses is not None:
+        # Skipped in exact-base mode: gt_anchor stays identity, so the box is placed at its
+        # recorded ob_in_world directly (robot base is already in the true sim world).
+        if self.obj_gt_ref and self.ref_poses is not None and not self.exact_base:
             ref0 = self._replay_ref_pose(0)  # replay reference body pose at frame 0
             sim_ref0 = self.ref_poses[self.object_index(0)]
             self.gt_anchor = ref0 @ np.linalg.inv(sim_ref0)
@@ -483,9 +523,15 @@ class TrajectoryReplay:
         # Fill the passive finger joints from their actuated counterparts (recorded whole_q has
         # them at 0); without this the fingers don't curl around the object.
         self._apply_joint_couplings()
-        # Recorded base orientation (pitch/roll + relative yaw) reproduces how the head camera
-        # actually swept during recording, so the static object cancels out on reprojection.
-        if self.base_quats is not None:
+        if self.exact_base:
+            # Place the floating base directly at its recorded true world pose (position + full
+            # orientation) — no feet-planting, no yaw-zeroing. Exact reproduction of the sim.
+            pel = self.pelvis_poses[self.object_index(i)]
+            self.data.qpos[0:3] = pel[:3, 3]
+            self.data.qpos[3:7] = R.from_matrix(pel[:3, :3]).as_quat(scalar_first=True)
+        elif self.base_quats is not None:
+            # Recorded base orientation (pitch/roll + relative yaw) reproduces how the head camera
+            # actually swept during recording, so the static object cancels out on reprojection.
             self.data.qpos[3:7] = self.base_quats[i]
         mujoco.mj_forward(self.model, self.data)
 
@@ -638,6 +684,13 @@ def main() -> None:
         "the FoundationPose estimate — sim-only, for comparison / exact replay",
     )
     parser.add_argument(
+        "--exact-base", dest="exact_base", action="store_true",
+        help="place the robot base directly from the recorded pelvis_in_world (true sim world, no "
+        "feet-planting / yaw-zeroing) and the box at ob_in_world directly — an exact replay of the "
+        "sim. Requires --ground-truth and a recording with the pelvis_in_world column "
+        "(new_data_collection_report.md). Default is the legacy feet-planted foot-anchor replay.",
+    )
+    parser.add_argument(
         "--contacts", action="store_true",
         help="overlay red spheres at the finger<->object contact points from the contacts/ "
         "sidecar (run gear_sonic/scripts/process_contacts.py first); best with --ground-truth",
@@ -654,18 +707,29 @@ def main() -> None:
 
     if args.ground_truth and args.filtered:
         sys.exit("[error] --ground-truth and --filtered are mutually exclusive")
+    if args.exact_base and not args.ground_truth:
+        sys.exit("[error] --exact-base requires --ground-truth (pelvis_in_world is in object_gt/)")
 
     traj, parquet, mesh, ob_src = resolve_paths(args)
     states = load_robot_states(parquet)
     base_quats = load_base_quats(parquet)
     ref_poses = None
+    pelvis_poses = None
     if ob_src is None:
         obj_poses, obj_to_robot = None, None
     elif args.ground_truth:
-        obj_poses, ref_poses, obj_to_robot = load_object_gt(ob_src)
+        obj_poses, ref_poses, pelvis_poses, obj_to_robot = load_object_gt(ob_src)
     else:
         obj_poses = load_object_poses(ob_src)
         obj_to_robot = load_frame_map(ob_src, obj_poses.shape[0])
+
+    exact_base = args.exact_base
+    if exact_base and pelvis_poses is None:
+        print(
+            "[warn] --exact-base set but this recording has no pelvis_in_world column "
+            "(pre-reset-state schema); falling back to the feet-planted foot-anchor replay"
+        )
+        exact_base = False
     fps = read_fps(traj)
 
     print(f"[info] trajectory : {traj}")
@@ -674,7 +738,12 @@ def main() -> None:
         print(f"[info] object     : {ob_src.relative_to(traj)} ({obj_poses.shape[0]} frames)")
         if args.ground_truth:
             print("[info] frame map  : exact (object_gt proprio_frame_index)")
-            print("[info] object pose: ground truth, world frame, via constant frame-0 anchor")
+            if exact_base:
+                print("[info] base pose  : exact (recorded pelvis_in_world, true sim world)")
+                print("[info] object pose: ground truth, world frame, placed directly (no anchor)")
+            else:
+                print("[info] base pose  : feet-planted foot anchor (legacy)")
+                print("[info] object pose: ground truth, world frame, via constant frame-0 anchor")
         else:
             fmap = "exact (frame_map.txt)" if obj_to_robot is not None else "uniform resampling (no map)"
             pose = "world frame, placed directly (filtered)" if args.filtered else "camera frame, via FK"
@@ -701,7 +770,7 @@ def main() -> None:
     replay = TrajectoryReplay(
         states, obj_poses, mesh, base_quats, obj_to_robot,
         obj_in_world=args.filtered, obj_gt_ref=args.ground_truth, ref_poses=ref_poses,
-        contacts_local=contacts_local,
+        contacts_local=contacts_local, pelvis_poses=pelvis_poses, exact_base=exact_base,
     )
 
     if args.check:

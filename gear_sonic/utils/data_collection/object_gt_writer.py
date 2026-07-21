@@ -12,6 +12,10 @@ For each recorded episode this produces, under ``<dataset_root>/object_gt/``::
                                      #   timestamp           : float
                                      #   ob_in_world         : 16 floats (4x4 row-major)
                                      #   ref_in_world        : 16 floats (4x4 row-major)
+                                     #   pelvis_in_world     : 16 floats (4x4 row-major)
+                                     #   base_vel            : 6 floats  (freejoint qvel)
+                                     #   object_vel          : 6 floats  (freejoint qvel)
+                                     #   joint_vel           : N floats  (observation.state order)
 
 ``ob_in_world`` is the box's absolute pose in the MuJoCo world frame; ``ref_in_world`` is
 the pose of the ground-truth reference body (``right_ankle_roll_link``) in that same world,
@@ -23,6 +27,14 @@ constant transform, so the cube lands correctly relative to the robot without re
 per-frame robot motion. ``proprio_frame_index`` links each pose to the robot row it was
 captured alongside (same convention as ``FoundationPoseWriter``'s ``frame_map.txt``),
 letting the replay align the two timelines and compare ground truth against the estimate.
+
+``pelvis_in_world`` is the robot floating-base (pelvis) world pose — the base translation the
+LeRobot parquet never records — so downstream can place the robot in the world exactly, with no
+FK reconstruction. ``base_vel`` / ``object_vel`` are the base and box freejoint velocities and
+``joint_vel`` the joint velocities in ``observation.state`` (whole_q) ordering; together they let
+a training env reset to any recorded frame (reference-state initialization) without a
+zero-velocity jump. All are sampled from the same physics step as the poses. See
+``new_data_collection_report.md`` for the reset recipe.
 
 The writer also ensures the shared colored ``box.obj`` mesh exists (under
 ``foundation_pose_data/``, where the visualizer looks for it) so ground-truth-only runs
@@ -47,7 +59,7 @@ class ObjectGtWriter:
         # in one place regardless of which writer produced it.
         self._mesh_path = Path(dataset_root) / "foundation_pose_data" / "box.obj"
         self._episode_index: int | None = None
-        self._rows: list[tuple[int, float, np.ndarray, np.ndarray]] = []
+        self._rows: list[dict] = []
 
     def is_active(self) -> bool:
         """Whether an episode is currently open for writing."""
@@ -64,13 +76,46 @@ class ObjectGtWriter:
         proprio_frame_index: int,
         timestamp: float,
         box_half_extents=None,
+        pelvis_in_world=None,
+        base_vel=None,
+        object_vel=None,
+        joint_vel=None,
     ) -> None:
-        """Buffer one ground-truth pose. Poses are 4x4 (or flat-16) world transforms."""
+        """Buffer one ground-truth frame.
+
+        Poses are 4x4 (or flat-16) world transforms; velocities are 1-D arrays. The reset-state
+        fields (``pelvis_in_world``, ``base_vel``, ``object_vel``, ``joint_vel``) are optional so
+        that legacy publishers that only send poses still record; missing ones are written as
+        zeros of the expected width (a missing ``object_vel`` — e.g. a held/kinematic box — is a
+        genuine scripted zero). ``joint_vel`` sets this recording's joint count.
+        """
         if self._episode_index is None:
             return
         box = np.asarray(ob_in_world, dtype=np.float64).reshape(16)
         ref = np.asarray(ref_in_world, dtype=np.float64).reshape(16)
-        self._rows.append((int(proprio_frame_index), float(timestamp), box, ref))
+        jvel = None if joint_vel is None else np.asarray(joint_vel, dtype=np.float64).reshape(-1)
+        self._rows.append(
+            {
+                "proprio_frame_index": int(proprio_frame_index),
+                "timestamp": float(timestamp),
+                "ob_in_world": box,
+                "ref_in_world": ref,
+                "pelvis_in_world": (
+                    None
+                    if pelvis_in_world is None
+                    else np.asarray(pelvis_in_world, dtype=np.float64).reshape(16)
+                ),
+                "base_vel": (
+                    None if base_vel is None else np.asarray(base_vel, dtype=np.float64).reshape(-1)
+                ),
+                "object_vel": (
+                    None
+                    if object_vel is None
+                    else np.asarray(object_vel, dtype=np.float64).reshape(-1)
+                ),
+                "joint_vel": jvel,
+            }
+        )
         # Write the shared colored mesh once (needed for ground-truth-only replay).
         if box_half_extents is not None and len(box_half_extents) == 3:
             self._ensure_box_mesh(box_half_extents)
@@ -92,15 +137,34 @@ class ObjectGtWriter:
             return
         if self._rows:
             self.base.mkdir(parents=True, exist_ok=True)
+
+            # Widths for the optional velocity/pose fields: infer joint_vel width from the first
+            # row that has it (51 for brainco), fall back to fixed sizes for the twists.
+            n_joints = next(
+                (r["joint_vel"].shape[0] for r in self._rows if r["joint_vel"] is not None), 0
+            )
+
+            def _flat(key: str, width: int) -> list[list[float]]:
+                zeros = [0.0] * width
+                return [
+                    (r[key].tolist() if r[key] is not None else zeros) for r in self._rows
+                ]
+
             table = pa.table(
                 {
-                    "proprio_frame_index": pa.array([r[0] for r in self._rows], pa.int64()),
-                    "timestamp": pa.array([r[1] for r in self._rows], pa.float64()),
-                    "ob_in_world": pa.array(
-                        [r[2].tolist() for r in self._rows], pa.list_(pa.float64(), 16)
+                    "proprio_frame_index": pa.array(
+                        [r["proprio_frame_index"] for r in self._rows], pa.int64()
                     ),
-                    "ref_in_world": pa.array(
-                        [r[3].tolist() for r in self._rows], pa.list_(pa.float64(), 16)
+                    "timestamp": pa.array([r["timestamp"] for r in self._rows], pa.float64()),
+                    "ob_in_world": pa.array(_flat("ob_in_world", 16), pa.list_(pa.float64(), 16)),
+                    "ref_in_world": pa.array(_flat("ref_in_world", 16), pa.list_(pa.float64(), 16)),
+                    "pelvis_in_world": pa.array(
+                        _flat("pelvis_in_world", 16), pa.list_(pa.float64(), 16)
+                    ),
+                    "base_vel": pa.array(_flat("base_vel", 6), pa.list_(pa.float64(), 6)),
+                    "object_vel": pa.array(_flat("object_vel", 6), pa.list_(pa.float64(), 6)),
+                    "joint_vel": pa.array(
+                        _flat("joint_vel", n_joints), pa.list_(pa.float64(), n_joints)
                     ),
                 }
             )

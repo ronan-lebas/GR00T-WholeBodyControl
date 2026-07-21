@@ -212,6 +212,7 @@ class GrootDataCollector:
         record_object_gt: bool = False,
         box_gt_zmq_host: str = "localhost",
         box_gt_zmq_port: int = 5560,
+        hand_type: str = "dex3",
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
@@ -223,6 +224,22 @@ class GrootDataCollector:
         self.robot_model = robot_model
         self._skip_robot_state = skip_robot_state
         self._auto_record = auto_record
+
+        # BrainCo hand STATE and COMMANDS arrive normalized [0, 1] (the sim bridge publishes
+        # `(q - lower) / span`, and the deploy passes that straight through as *_hand_q /
+        # *_hand_action). Left unmapped, whole_q would store fractions where the body joints are
+        # radians, so any FK under-curls the fingers (~1.47x for the 1.466 rad finger range). We
+        # map hand values back to radians here so observation.state / action.wbc are uniformly in
+        # radians. Dex3 already reports radians, so this is a no-op there. teleop.*_hand_joints is
+        # left as the raw [0,1] command on purpose (that IS the command representation).
+        self._denorm_hands = hand_type == "brainco"
+        self._hand_limits: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        if self._denorm_hands:
+            lower = np.asarray(self.robot_model.lower_joint_limits, dtype=np.float64)
+            upper = np.asarray(self.robot_model.upper_joint_limits, dtype=np.float64)
+            for side in ("left", "right"):
+                act = list(self.robot_model.get_hand_actuated_joint_indices(side))
+                self._hand_limits[side] = (lower[act], upper[act])
 
         self._episode_state = EpisodeState()
         self._keyboard_listener = ZMQKeyboardSubscriber()
@@ -384,7 +401,9 @@ class GrootDataCollector:
                 self._print_and_say("Saved episode and back to idle state", blocking=False)
         elif key == "x":
             if self._episode_state.get_state() == self._episode_state.RECORDING:
-                self.data_exporter.save_episode_as_discarded()
+                # True discard: delete the partial video + drop the buffer so no parquet/video is
+                # written (the old save_episode_as_discarded saved everything and merely tagged it).
+                self.data_exporter.discard_episode()
                 self._fp_writer.discard_episode()
                 if self._gt_writer is not None:
                     self._gt_writer.discard_episode()
@@ -640,6 +659,12 @@ class GrootDataCollector:
             proprio_frame_index=proprio_frame_index,
             timestamp=gt.get("timestamp", time.time()),
             box_half_extents=gt.get("box_half_extents"),
+            # Reset-state fields (sim publisher >= this change); older publishers omit them and
+            # the writer stores zeros. See new_data_collection_report.md.
+            pelvis_in_world=gt.get("pelvis_in_world"),
+            base_vel=gt.get("base_vel"),
+            object_vel=gt.get("object_vel"),
+            joint_vel=gt.get("joint_vel"),
         )
 
     def _write_foundation_pose_frame(self) -> None:
@@ -752,6 +777,22 @@ class GrootDataCollector:
 
         return self._add_data_frame_sonic(t_start)
 
+    def _denorm_hand(self, values, side: str) -> np.ndarray:
+        """Map BrainCo hand values from normalized [0, 1] back to radians (no-op for Dex3).
+
+        Uses the per-joint ``[lower, upper]`` limits in the actuated-joint order (the order in
+        which ``get_configuration_from_actuated_joints`` consumes them), applying the same affine
+        the bridge inverts: ``q_rad = lower + norm * (upper - lower)``.
+        """
+        v = np.asarray(values, dtype=np.float64)
+        if not self._denorm_hands:
+            return v
+        lower, upper = self._hand_limits[side]
+        n = min(v.shape[0], lower.shape[0])
+        out = v.copy()
+        out[:n] = lower[:n] + v[:n] * (upper[:n] - lower[:n])
+        return out
+
     def _add_data_frame_sonic(self, t_start: float) -> bool:
         """Build one data frame in Sonic CPP + SMPL mode."""
         assert self.latest_proprio_msg is not None
@@ -759,13 +800,13 @@ class GrootDataCollector:
 
         whole_q = self.robot_model.get_configuration_from_actuated_joints(
             body_actuated_joint_values=proprio["body_q"],
-            left_hand_actuated_joint_values=proprio["left_hand_q"],
-            right_hand_actuated_joint_values=proprio["right_hand_q"],
+            left_hand_actuated_joint_values=self._denorm_hand(proprio["left_hand_q"], "left"),
+            right_hand_actuated_joint_values=self._denorm_hand(proprio["right_hand_q"], "right"),
         )
         whole_action_wbc = self.robot_model.get_configuration_from_actuated_joints(
             body_actuated_joint_values=proprio["last_action"],
-            left_hand_actuated_joint_values=proprio["last_left_hand_action"],
-            right_hand_actuated_joint_values=proprio["last_right_hand_action"],
+            left_hand_actuated_joint_values=self._denorm_hand(proprio["last_left_hand_action"], "left"),
+            right_hand_actuated_joint_values=self._denorm_hand(proprio["last_right_hand_action"], "right"),
         )
 
         self.robot_model.cache_forward_kinematics(whole_q)
@@ -1106,7 +1147,8 @@ class GrootDataCollector:
                     if self._gt_writer is not None:
                         self._gt_writer.close_episode()
                 else:
-                    self.data_exporter.save_episode_as_discarded()
+                    # Manual mode Ctrl+C mid-recording = abort: leave no parquet/video behind.
+                    self.data_exporter.discard_episode()
                     self._fp_writer.discard_episode()
                     if self._gt_writer is not None:
                         self._gt_writer.discard_episode()
@@ -1174,6 +1216,7 @@ def main(config: SonicDataExporterConfig):
         record_object_gt=config.record_object_gt,
         box_gt_zmq_host=config.box_gt_zmq_host,
         box_gt_zmq_port=config.box_gt_zmq_port,
+        hand_type=config.hand_type,
     )
     data_collector.run()
 

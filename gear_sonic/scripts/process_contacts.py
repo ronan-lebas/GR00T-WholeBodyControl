@@ -363,17 +363,26 @@ def main() -> None:
     proprio_idx = load_frame_index(parquet, states.shape[0])
     fps = viz.read_fps(traj)
 
+    pelvis_poses = None
+    exact_base = False
     if args.from_vision:
+        # Hardware path: no sim base pose exists, so place the base with the feet-planted anchor
+        # and the object via camera FK (raw) or directly (filtered) — same as on real recordings.
         obj_poses = viz.load_object_poses(ob_src)
         obj_to_robot = viz.load_frame_map(ob_src, obj_poses.shape[0])
         obj_gt_ref, ref_poses = False, None
         obj_in_world = args.filtered
         source_tag = "vision_filtered" if args.filtered else "vision_raw"
     else:
-        obj_poses, ref_poses, obj_to_robot = viz.load_object_gt(ob_src)
+        obj_poses, ref_poses, pelvis_poses, obj_to_robot = viz.load_object_gt(ob_src)
         obj_gt_ref, obj_in_world = True, False
+        # New sim recordings store the robot's true base pose: place the base exactly (no
+        # feet-planting) for the most accurate hand<->object geometry. Old GT recordings lacking
+        # pelvis_in_world fall back to the feet-planted anchor automatically.
+        exact_base = pelvis_poses is not None
         source_tag = "ground_truth"
 
+    base_mode = "exact (pelvis_in_world)" if exact_base else "feet-planted anchor"
     replay = viz.TrajectoryReplay(
         states,
         obj_poses,
@@ -385,6 +394,8 @@ def main() -> None:
         ref_poses=ref_poses,
         collidable_object=True,
         object_margin=args.threshold,
+        pelvis_poses=pelvis_poses,
+        exact_base=exact_base,
     )
     segment_names, geom_to_segment, object_geom_ids = build_segment_map(replay.model)
     n_segments = len(segment_names)
@@ -394,6 +405,7 @@ def main() -> None:
         f"[info] parquet    : {parquet.relative_to(traj)} ({states.shape[0]} frames @ {fps:.0f} fps)"
     )
     print(f"[info] object pose: {ob_src.relative_to(traj)} ({obj_poses.shape[0]} frames, source={source_tag})")
+    print(f"[info] base pose  : {base_mode}")
     print(
         f"[info] segments   : {n_segments} finger collision segments; threshold {args.threshold*1000:.1f} mm"
     )
@@ -423,6 +435,7 @@ def main() -> None:
         "contact_point_units": "meters",
         "nan_convention": "NaN where segment not in contact",
         "source": source_tag,
+        "base_placement": "exact_pelvis_in_world" if exact_base else "feet_planted_anchor",
         "fps": fps,
         "flat_layout": (
             "columns are flat length-num_segments (is_contact/dist) or num_segments*3 "

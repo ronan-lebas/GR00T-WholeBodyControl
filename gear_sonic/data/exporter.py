@@ -408,11 +408,35 @@ class Gr00tDataExporter(LeRobotDataset):
         return video_paths
 
     def save_episode_as_discarded(self) -> None:
-        """Flag ongoing episode as discarded and save it to disk."""
+        """Flag ongoing episode as discarded and save it to disk.
+
+        NOTE: this still writes the full episode (parquet + video) and only *tags* its index in
+        info.json's ``discarded_episode_indices``. Prefer ``discard_episode`` to abort an episode
+        without leaving any files behind. Kept for callers that rely on the tag-and-keep behavior.
+        """
         self.meta.info["discarded_episode_indices"] = self.meta.info.get(
             "discarded_episode_indices", []
         ) + [self.episode_buffer["episode_index"]]
         self.save_episode()
+
+    def discard_episode(self) -> None:
+        """Abort the in-progress episode, leaving nothing on disk.
+
+        Cancels the video writers — deleting the partial ``.mp4`` that ``av.open`` created when the
+        episode was armed — clears the stray ``images/`` scratch dir, and resets the episode
+        buffer. No data parquet, video, or episode metadata is produced, matching
+        ``FoundationPoseWriter``/``ObjectGtWriter``'s ``discard_episode``. The ``episode_index`` is
+        NOT advanced (``meta.save_episode`` is never called), so the next recording reuses it and
+        indices stay contiguous — an aborted take leaves no gap and no junk files to filter out.
+        """
+        for key in self.video_writers:
+            self.video_writers[key].cancel()
+        # add_frame creates an images/<...> scratch tree at frame 0 for video features; drop it.
+        img_dir = self.root / "images"
+        if img_dir.is_dir():
+            shutil.rmtree(img_dir)
+        self.episode_buffer = self.create_episode_buffer()
+        self.video_writers = self.create_video_writer()
 
 
 # ---------------------------------------------------------------------------
