@@ -36,12 +36,15 @@ a training env reset to any recorded frame (reference-state initialization) with
 zero-velocity jump. All are sampled from the same physics step as the poses. See
 ``new_data_collection_report.md`` for the reset recipe.
 
-The writer also ensures the shared colored ``box.obj`` mesh exists (under
-``foundation_pose_data/``, where the visualizer looks for it) so ground-truth-only runs
-still have a mesh to render.
+The writer also ensures the shared object mesh exists (under ``foundation_pose_data/``, where the
+visualizer looks for it) so ground-truth-only runs still have a mesh to render: a synthesized
+colored ``box.obj`` for the primitive cube, or a copy of the staged asset (``object.obj`` plus its
+convex hulls as ``object_collision_*.stl``) when the sim ran with a mesh object (``--chair``).
 """
 
+import json
 from pathlib import Path
+import shutil
 
 import numpy as np
 import pyarrow as pa
@@ -76,6 +79,7 @@ class ObjectGtWriter:
         proprio_frame_index: int,
         timestamp: float,
         box_half_extents=None,
+        object_mesh_dir=None,
         pelvis_in_world=None,
         base_vel=None,
         object_vel=None,
@@ -116,8 +120,10 @@ class ObjectGtWriter:
                 "joint_vel": jvel,
             }
         )
-        # Write the shared colored mesh once (needed for ground-truth-only replay).
-        if box_half_extents is not None and len(box_half_extents) == 3:
+        # Write the shared object mesh once (needed for ground-truth-only replay).
+        if object_mesh_dir:
+            self._ensure_asset_mesh(object_mesh_dir)
+        elif box_half_extents is not None and len(box_half_extents) == 3:
             self._ensure_box_mesh(box_half_extents)
 
     def _ensure_box_mesh(self, box_half_extents) -> None:
@@ -125,6 +131,27 @@ class ObjectGtWriter:
             return
         self._mesh_path.parent.mkdir(parents=True, exist_ok=True)
         write_colored_box_obj(self._mesh_path, box_half_extents)
+
+    def _ensure_asset_mesh(self, object_mesh_dir) -> None:
+        """Copy a staged mesh asset (``--chair``) next to the dataset for replay.
+
+        Landed as ``object.obj`` + ``object_collision_*.stl``, which the replay/contact tooling
+        prefers over the synthesized ``box.obj``. The hulls travel too so ``process_contacts.py``
+        collides against the decomposition rather than the mesh's overall convex hull.
+        """
+        out = self._mesh_path.parent / "object.obj"
+        if out.exists():
+            return
+        src = Path(object_mesh_dir)
+        meta_path = src / "object.json"
+        if not meta_path.exists():
+            print(f"[ObjectGt] staged asset {src} has no object.json; skipping mesh copy")
+            return
+        meta = json.loads(meta_path.read_text())
+        out.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src / meta["visual_mesh"], out)
+        for i, fname in enumerate(meta.get("collision_meshes", [])):
+            shutil.copyfile(src / fname, out.parent / f"object_collision_{i:03d}.stl")
 
     def discard_episode(self) -> None:
         """Drop the current (partial) episode without writing it."""

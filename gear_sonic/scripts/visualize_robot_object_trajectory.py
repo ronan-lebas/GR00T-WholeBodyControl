@@ -108,7 +108,11 @@ def resolve_paths(args) -> tuple[Path, Path, Path | None, Path | None]:
     )
 
     fp_data = traj / "foundation_pose_data"
-    mesh = fp_data / "box.obj"
+    # object.obj is the staged mesh asset (--chair recordings); box.obj is the synthesized
+    # cube of the tabletop task. Older recordings only have box.obj.
+    mesh = fp_data / "object.obj"
+    if not mesh.is_file():
+        mesh = fp_data / "box.obj"
 
     # Ground truth (sim-only): poses come from a single object_gt parquet, not the
     # FoundationPose per-frame txt folders. The mesh stays the shared box.obj.
@@ -298,29 +302,51 @@ def build_model(
         asset = root.find("asset")
         if asset is None:
             asset = ET.SubElement(root, "asset")
-        mesh_el = ET.SubElement(asset, "mesh")
-        mesh_el.set("name", "tracked_object")
-        mesh_el.set("file", str(mesh_path.resolve()))
-
         body = ET.SubElement(root.find("worldbody"), "body")
         body.set("name", "tracked_object")
         ET.SubElement(body, "freejoint")
-        geom = ET.SubElement(body, "geom")
-        geom.set("type", "mesh")
-        geom.set("mesh", "tracked_object")
-        if collidable_object:
-            # All-ones masks overlap both hands' bitmasks (left contype=2/conaffinity=5,
-            # right contype=4/conaffinity=3); margin makes mj_forward emit contacts up to
-            # `object_margin` away. Callers filter results to object<->finger pairs by body.
-            all_ones = str((1 << 31) - 1)
-            geom.set("contype", all_ones)
-            geom.set("conaffinity", all_ones)
-            geom.set("margin", str(object_margin))
-            geom.set("rgba", "1 0.5 0 0.4")
+
+        # A non-convex object (chair) is recorded together with its convex decomposition,
+        # since MuJoCo collides meshes as convex hulls — colliding against the single visual
+        # mesh would report contacts against the chair's overall hull, i.e. thin air.
+        hulls = sorted(mesh_path.parent.glob("object_collision_*.stl"))
+        collision_meshes = [(f"tracked_object_col_{i}", p) for i, p in enumerate(hulls)]
+        if collidable_object and collision_meshes:
+            visual_names = [("tracked_object", mesh_path)]
         else:
-            geom.set("contype", "0")  # visual only — no collision (we never step physics)
+            collision_meshes = [("tracked_object", mesh_path)]
+            visual_names = []
+
+        for name, path in collision_meshes + visual_names:
+            mesh_el = ET.SubElement(asset, "mesh")
+            mesh_el.set("name", name)
+            mesh_el.set("file", str(path.resolve()))
+
+        for name, _ in collision_meshes:
+            geom = ET.SubElement(body, "geom")
+            geom.set("type", "mesh")
+            geom.set("mesh", name)
+            if collidable_object:
+                # All-ones masks overlap both hands' bitmasks (left contype=2/conaffinity=5,
+                # right contype=4/conaffinity=3); margin makes mj_forward emit contacts up to
+                # `object_margin` away. Callers filter results to object<->finger pairs by body.
+                all_ones = str((1 << 31) - 1)
+                geom.set("contype", all_ones)
+                geom.set("conaffinity", all_ones)
+                geom.set("margin", str(object_margin))
+                geom.set("rgba", "1 0.5 0 0.4")
+            else:
+                geom.set("contype", "0")  # visual only — no collision (we never step physics)
+                geom.set("conaffinity", "0")
+                geom.set("rgba", "1 0.5 0 0.6")
+
+        for name, _ in visual_names:
+            geom = ET.SubElement(body, "geom")
+            geom.set("type", "mesh")
+            geom.set("mesh", name)
+            geom.set("contype", "0")
             geom.set("conaffinity", "0")
-            geom.set("rgba", "1 0.5 0 0.6")
+            geom.set("rgba", "1 0.5 0 0.4")
 
     # Write next to the scene so the relative <include> stays valid.
     with tempfile.NamedTemporaryFile(
