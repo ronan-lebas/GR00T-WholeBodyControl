@@ -58,7 +58,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 VIS_SCRIPT = REPO_ROOT / "gear_sonic" / "scripts" / "visualize_robot_object_trajectory.py"
 
 DEFAULT_THRESHOLD = 0.005  # 5 mm, matching ConTrack's contacts/contact_threshold
-OBJECT_BODY_NAME = "tracked_object"  # the replay injects the box under this name (NOT "box")
+OBJECT_BODY_NAME = "tracked_object"  # the replay injects the object under this name
 HANDS = ("left", "right")
 FINGERS = ("thumb", "index", "middle", "ring", "pinky")
 
@@ -414,8 +414,8 @@ def main() -> None:
         replay, geom_to_segment, object_geom_ids, n_segments, args.threshold
     )
 
-    box_geom = min(object_geom_ids)
-    box_rbound = float(replay.model.geom_rbound[box_geom])
+    # Bounding radius of the whole object (a decomposed mesh has one geom per convex hull).
+    box_rbound = max(float(replay.model.geom_rbound[g]) for g in object_geom_ids)
 
     if args.check:
         run_check(segment_names, is_contact, points, dist, box_rbound, args.threshold, max_ncon)

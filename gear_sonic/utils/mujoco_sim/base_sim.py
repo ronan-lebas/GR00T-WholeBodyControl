@@ -9,6 +9,7 @@ import os
 import pathlib
 from pathlib import Path
 import pickle
+import shutil
 import tempfile
 from threading import Lock, Thread
 import time
@@ -35,6 +36,14 @@ GEAR_SONIC_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 # lands correctly relative to the robot without re-injecting per-frame robot motion. MUST
 # match the visualizer's GT reference (visualize_robot_object_trajectory.py).
 BOX_GT_REFERENCE_BODY = "right_ankle_roll_link"
+
+# Name of the injected manipulable object body, whatever its shape (primitive box or a
+# staged mesh asset). Everything downstream (reset, ground-truth publish) resolves it by name.
+OBJECT_BODY_NAME = "object"
+
+# Geom group used for a mesh object's convex collision hulls. Hidden from every renderer
+# (see DefaultEnv.scene_option) so the hulls don't draw on top of the visual mesh.
+COLLISION_GEOM_GROUP = 3
 
 
 class DefaultEnv:
@@ -92,6 +101,9 @@ class DefaultEnv:
         # lazily in get_box_gt_poses(); half-extents stored in init_scene.
         self.record_box_gt = self.config.get("record_box_gt", False)
         self.box_half_extents = None
+        # Staged asset dir for a mesh object (None for the primitive box); shipped with the
+        # GT stream so the recorder copies the real mesh instead of synthesizing a cube.
+        self.object_mesh_dir = None
         self._gt_box_body_id = None
         self._gt_ref_body_id = None
         # Lazily built in get_gt_state(): maps MuJoCo joint-velocity dof addresses to the
@@ -99,6 +111,11 @@ class DefaultEnv:
         # 1:1 with observation.state on the training side. None until first GT publish.
         self._gt_jointvel_map: list[tuple[int, int]] | None = None
         self._gt_njoints: int | None = None
+
+        # Shared by every renderer and the onscreen viewer: hides the mesh object's convex
+        # collision hulls, which would otherwise draw over its visual mesh.
+        self.scene_option = mujoco.MjvOption()
+        self.scene_option.geomgroup[COLLISION_GEOM_GROUP] = 0
 
         self.init_scene()
         self.last_reward = 0
@@ -232,7 +249,7 @@ class DefaultEnv:
         mass = box_config["mass"]
 
         box_body = ET.SubElement(worldbody, "body")
-        box_body.set("name", "box")
+        box_body.set("name", OBJECT_BODY_NAME)
         box_body.set("pos", f"{pos[0]} {pos[1]} {pos[2]}")
         ET.SubElement(box_body, "freejoint")
         geom = ET.SubElement(box_body, "geom")
@@ -274,18 +291,80 @@ class DefaultEnv:
             slab.set("conaffinity", "0")
             slab.set("mass", "0")
 
+    @staticmethod
+    def _append_mesh_object(worldbody: ET.Element, asset: ET.Element, object_config: dict) -> None:
+        """Append a free mesh object (staged asset dir) to the worldbody.
+
+        The asset dir is what ``prepare_object_asset.py`` writes: one visual mesh plus a set of
+        pre-computed convex hulls (MuJoCo mesh collisions are convex, so a non-convex object has
+        to be decomposed). Mesh paths are absolute because ``g1_29dof_with_hand.xml`` sets
+        ``meshdir="meshes"``, which the injected scene inherits.
+        """
+        meta = object_config["meta"]
+        asset_dir = Path(object_config["asset_dir"])
+        pos = object_config["pos"]
+        quat = object_config["quat"]  # (w, x, y, z)
+
+        vis_name = f"{OBJECT_BODY_NAME}_visual"
+        mesh_el = ET.SubElement(asset, "mesh")
+        mesh_el.set("name", vis_name)
+        mesh_el.set("file", str((asset_dir / meta["visual_mesh"]).resolve()))
+        for i, fname in enumerate(meta["collision_meshes"]):
+            m = ET.SubElement(asset, "mesh")
+            m.set("name", f"{OBJECT_BODY_NAME}_col_{i}")
+            m.set("file", str((asset_dir / fname).resolve()))
+
+        body = ET.SubElement(worldbody, "body")
+        body.set("name", OBJECT_BODY_NAME)
+        body.set("pos", f"{pos[0]} {pos[1]} {pos[2]}")
+        body.set("quat", f"{quat[0]} {quat[1]} {quat[2]} {quat[3]}")
+        ET.SubElement(body, "freejoint")
+
+        # Explicit inertial: the mass is split over many hulls (which also overlap after
+        # decomposition), so a geom-derived inertia would be meaningless. The tensor comes from
+        # the source URDF, rescaled to the sim mass (inertia is linear in mass at fixed shape).
+        inertial = ET.SubElement(body, "inertial")
+        inertial.set("pos", " ".join(str(v) for v in meta["com"]))
+        inertial.set("mass", str(object_config["mass"]))
+        scale = object_config["mass"] / max(float(meta["mass"]), 1e-9)
+        inertial.set("fullinertia", " ".join(str(v * scale) for v in meta["fullinertia"]))
+
+        for i in range(len(meta["collision_meshes"])):
+            geom = ET.SubElement(body, "geom")
+            geom.set("type", "mesh")
+            geom.set("mesh", f"{OBJECT_BODY_NAME}_col_{i}")
+            geom.set("group", str(COLLISION_GEOM_GROUP))
+            geom.set("mass", "0")  # inertia comes from <inertial> above
+            for key in ("friction", "condim", "priority", "solref", "solimp"):
+                if object_config.get(key) is not None:
+                    geom.set(key, str(object_config[key]))
+
+        visual = ET.SubElement(body, "geom")
+        visual.set("type", "mesh")
+        visual.set("mesh", vis_name)
+        visual.set("contype", "0")
+        visual.set("conaffinity", "0")
+        visual.set("mass", "0")
+        visual.set("rgba", object_config.get("rgba", "0.75 0.6 0.4 1"))
+
     def _inject_scene_objects(
-        self, xml_path: str, box_config: dict | None, table_config: dict | None
+        self, xml_path: str, object_config: dict | None, table_config: dict | None
     ) -> str:
-        """Inject table and/or box bodies into the scene XML; returns path to temp file."""
+        """Inject table and/or manipulable object into the scene XML; returns a temp file path."""
         tree = ET.parse(xml_path)
         root = tree.getroot()
         worldbody = root.find("worldbody")
 
         if table_config:
             self._append_table(worldbody, table_config)
-        if box_config:
-            self._append_box(worldbody, box_config)
+        if object_config:
+            if object_config.get("kind", "box") == "mesh":
+                asset = root.find("asset")
+                if asset is None:
+                    asset = ET.SubElement(root, "asset")
+                self._append_mesh_object(worldbody, asset, object_config)
+            else:
+                self._append_box(worldbody, object_config)
 
         # Write next to the original so relative <include> paths remain valid
         xml_dir = os.path.dirname(xml_path)
@@ -299,10 +378,14 @@ class DefaultEnv:
         """Initialize the default robot scene"""
         xml_path = str(pathlib.Path(GEAR_SONIC_ROOT) / self.config["ROBOT_SCENE"])
 
-        box_config = self.config.get("box_config", None)
+        object_config = self.config.get("object_config", None)
         table_config = self.config.get("table_config", None)
-        if box_config or table_config:
-            tmp_xml = self._inject_scene_objects(xml_path, box_config, table_config)
+        if object_config or table_config:
+            tmp_xml = self._inject_scene_objects(xml_path, object_config, table_config)
+            dump_path = self.config.get("dump_scene")
+            if dump_path:
+                shutil.copyfile(tmp_xml, dump_path)
+                print(f"[Sim] injected scene written to {dump_path}")
             try:
                 self.mj_model = mujoco.MjModel.from_xml_path(tmp_xml)
             finally:
@@ -316,14 +399,22 @@ class DefaultEnv:
         self.root_body = "pelvis"
         self.root_body_id = self.mj_model.body(self.root_body).id
 
-        if box_config is not None:
-            self.box_half_extents = [float(s) for s in box_config["size"]]
+        if object_config is not None:
+            if object_config.get("kind", "box") == "mesh":
+                # Half-extents of the collision bbox — the mesh analogue of the cube's size,
+                # published with the ground truth for downstream sizing.
+                lo = np.asarray(object_config["meta"]["bbox_min"], dtype=float)
+                hi = np.asarray(object_config["meta"]["bbox_max"], dtype=float)
+                self.box_half_extents = ((hi - lo) / 2.0).tolist()
+                self.object_mesh_dir = str(Path(object_config["asset_dir"]).resolve())
+            else:
+                self.box_half_extents = [float(s) for s in object_config["size"]]
 
         if self.render_depth_seg:
-            self._setup_foundation_pose(box_config)
+            self._setup_foundation_pose(object_config)
 
-        self._setup_held_box(box_config)
-        self._setup_box_reset(box_config)
+        self._setup_held_box(object_config)
+        self._setup_object_reset(object_config)
 
         self.joint_class_map = self._get_dof_indices_by_class()
 
@@ -389,6 +480,7 @@ class DefaultEnv:
                 self.viewer = None
 
         if self.viewer:
+            self.viewer.opt.geomgroup[COLLISION_GEOM_GROUP] = 0
             self.viewer.cam.azimuth = 120
             self.viewer.cam.elevation = -30
             self.viewer.cam.distance = 2.0
@@ -516,14 +608,15 @@ class DefaultEnv:
             print("[FoundationPose] No ego_view camera configured; depth/seg export disabled")
             self.render_depth_seg = False
             return
-        if box_config is None:
-            print("[FoundationPose] No box in scene; depth/seg export disabled")
+        if box_config is None or box_config.get("kind", "box") != "box":
+            # Single-geom mask only; a decomposed mesh object would be partially masked.
+            print("[FoundationPose] No primitive box in scene; depth/seg export disabled")
             self.render_depth_seg = False
             return
 
         cam_name = ego_cfg.get("mjcf_name", "ego_view")
         self.fp_cam_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_CAMERA, cam_name)
-        box_body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "box")
+        box_body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, OBJECT_BODY_NAME)
         self.fp_box_geom_id = int(self.mj_model.body_geomadr[box_body_id])
 
         # Pinhole intrinsics from MuJoCo's vertical FOV (square pixels, principal point centered).
@@ -555,7 +648,7 @@ class DefaultEnv:
         The collector upscales both back to the RGB resolution before saving.
         """
         renderer = self.fp_renderer
-        renderer.update_scene(self.mj_data, camera="head_camera")
+        renderer.update_scene(self.mj_data, camera="head_camera", scene_option=self.scene_option)
 
         renderer.enable_depth_rendering()
         depth_m = renderer.render()
@@ -584,7 +677,7 @@ class DefaultEnv:
         self.held_box = False
         if not (box_config and box_config.get("held")):
             return
-        box_body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "box")
+        box_body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, OBJECT_BODY_NAME)
         box_jnt_id = int(self.mj_model.body_jntadr[box_body_id])
         self.held_box_qadr = int(self.mj_model.jnt_qposadr[box_jnt_id])
         self.held_box_dofadr = int(self.mj_model.jnt_dofadr[box_jnt_id])
@@ -607,34 +700,35 @@ class DefaultEnv:
             f"{self.held_anchor_offset.tolist()} (collision disabled)"
         )
 
-    def _setup_box_reset(self, box_config: dict | None):
-        """Cache the free box's joint addresses and spawn pose for ``reset_box``.
+    def _setup_object_reset(self, object_config: dict | None):
+        """Cache the free object's joint addresses and spawn pose for ``reset_object``.
 
-        Only applies to a free (non-held) box: the held box is re-anchored to the
+        Only applies to a free (non-held) object: the held box is re-anchored to the
         hands every step, so teleporting it back would be immediately overridden.
         """
-        self.has_free_box = bool(box_config) and not box_config.get("held")
+        self.has_free_box = bool(object_config) and not object_config.get("held")
         if not self.has_free_box:
             return
-        box_body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "box")
+        box_body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, OBJECT_BODY_NAME)
         box_jnt_id = int(self.mj_model.body_jntadr[box_body_id])
         self.box_qadr = int(self.mj_model.jnt_qposadr[box_jnt_id])
         self.box_dofadr = int(self.mj_model.jnt_dofadr[box_jnt_id])
-        # Identity quaternion matches the injected XML body (no orientation attr),
-        # so reset_box() and a full mj_resetData land the box in the same pose.
-        self.box_spawn_pose = np.array([*box_config["pos"], 1.0, 0.0, 0.0, 0.0])
+        # Must match the injected XML body's pose attributes, so reset_object() and a full
+        # mj_resetData land the object in the same place (the box body carries no quat).
+        quat = object_config.get("quat", (1.0, 0.0, 0.0, 0.0))
+        self.box_spawn_pose = np.array([*object_config["pos"], *quat])
 
-    def reset_box(self):
-        """Teleport the free box back to its spawn pose (robot state untouched)."""
+    def reset_object(self):
+        """Teleport the free object back to its spawn pose (robot state untouched)."""
         if not self.has_free_box:
-            print("[Sim] reset_box ignored: no free box in the scene")
+            print("[Sim] reset_object ignored: no free object in the scene")
             return
         qadr = self.box_qadr
         self.mj_data.qpos[qadr : qadr + 7] = self.box_spawn_pose
         self.mj_data.qvel[self.box_dofadr : self.box_dofadr + 6] = 0.0
         # Propagate so same-frame renders/observations see the reset pose.
         mujoco.mj_forward(self.mj_model, self.mj_data)
-        print("[Sim] box reset to spawn pose")
+        print("[Sim] object reset to spawn pose")
 
     def _update_held_box(self):
         """Script the held box onto the live two-hand FK midpoint (called after mj_step).
@@ -710,7 +804,7 @@ class DefaultEnv:
         Handles are resolved and cached on first call.
         """
         if self._gt_box_body_id is None:
-            bid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "box")
+            bid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, OBJECT_BODY_NAME)
             rid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, BOX_GT_REFERENCE_BODY)
             if bid < 0 or rid < 0:
                 return None
@@ -1086,11 +1180,17 @@ class DefaultEnv:
         for camera_name, camera_config in self.camera_configs.items():
             renderer = self.renderers[camera_name]
             if "params" in camera_config:
-                renderer.update_scene(self.mj_data, camera=camera_config["params"])
+                renderer.update_scene(
+                    self.mj_data, camera=camera_config["params"], scene_option=self.scene_option
+                )
             elif "mjcf_name" in camera_config:
-                renderer.update_scene(self.mj_data, camera=camera_config["mjcf_name"])
+                renderer.update_scene(
+                    self.mj_data, camera=camera_config["mjcf_name"], scene_option=self.scene_option
+                )
             else:
-                renderer.update_scene(self.mj_data, camera=camera_name)
+                renderer.update_scene(
+                    self.mj_data, camera=camera_name, scene_option=self.scene_option
+                )
             render_caches[camera_name + "_image"] = renderer.render()
 
         # Depth/seg are rendered separately (own low-res renderer) and only every Nth frame.
@@ -1113,7 +1213,7 @@ class DefaultEnv:
         if key == "backspace":
             self.reset()
         if key == "o":
-            self.reset_box()
+            self.reset_object()
         if key == "v":
             self.update_viewer_camera()
         if key in ["up", "down", "left", "right"]:
@@ -1267,7 +1367,7 @@ class BaseSimulator:
         box_count = self._mgr_reset_box_count
         if box_count is not None:
             if self._applied_reset_box_count is not None and box_count > self._applied_reset_box_count:
-                self.sim_env.reset_box()
+                self.sim_env.reset_object()
             self._applied_reset_box_count = box_count
 
         sim_count = self._mgr_reset_sim_count
@@ -1329,6 +1429,9 @@ class BaseSimulator:
             "object_vel": (object_vel.tolist() if object_vel is not None else None),  # (6,) or None
             "joint_vel": gt["joint_vel"].tolist(),  # (num_joints,) in observation.state ordering
             "box_half_extents": [float(s) for s in (self.sim_env.box_half_extents or [])],
+            # Staged asset dir for a mesh object (None for the primitive box): tells the
+            # recorder to copy the real mesh instead of synthesizing a cube for replay.
+            "object_mesh_dir": self.sim_env.object_mesh_dir,
             "timestamp": time.time(),
         }
         try:

@@ -2,8 +2,11 @@
 # Sim manipulation setup launcher (no robot: everything runs on this machine).
 #
 # Deploys the full teleop stack as if on the robot, but against MuJoCo. The sim
-# spawns a static table + graspable box in front of the (static-base) robot and
-# publishes the ego view on ZMQ 5555 exactly like the robot's camera server.
+# spawns the manipulation scene selected by --task in front of the (static-base)
+# robot and publishes the ego view on ZMQ 5555 exactly like the robot's camera server.
+#
+#   --task tabletop   (default) static table + graspable cube
+#   --task chair      a chair (mesh asset) standing on the floor, to lift and reorient
 #
 # Default (no args) starts everything at once in one tmux window split into tiled
 # panes, one per component, in the correct startup order
@@ -17,7 +20,7 @@
 # Single-component mode (each runs in the foreground of the current terminal; this
 # is also what the tmux panes call under the hood):
 #
-#   ./scripts/launch_sim_setup.sh sim        # MuJoCo sim + table/box + camera pub (ZMQ 5555)
+#   ./scripts/launch_sim_setup.sh sim        # MuJoCo sim + scene objects + camera pub (ZMQ 5555)
 #   ./scripts/launch_sim_setup.sh deploy     # docker/run-ros2-dev.sh container; deploy runs inside
 #   ./scripts/launch_sim_setup.sh relay      # Quest relay + ego-view image relay (headset)
 #   ./scripts/launch_sim_setup.sh manager    # Quest teleop manager (press s to start)
@@ -29,12 +32,16 @@
 # To close everything: focus the 'teardown' pane and press Enter (or run the kill
 # command below from any shell).
 #
-# Scene resets during teleop (from the manager pane): 'b' puts the box back on the
-# table (between episodes); '0' full sim reset (recovery — pause with 'p' first).
+# Scene resets during teleop (from the manager pane): 'b' puts the manipulated object
+# back at its spawn pose (between episodes); '0' full sim reset (recovery — pause with
+# 'p' first).
 #
 # All host flags are baked in from the config block below (override via env).
 #
 #   --print / -n   show the exact command(s) without running (safe to test).
+#   --task NAME    tabletop (default) or chair; selects the scene the sim spawns and the
+#                  recorded task prompt. The chair asset must be staged first, see
+#                  gear_sonic/scripts/prepare_object_asset.py.
 #   --mock-quest   full-stack modes: run mock_quest_streamer in place of relay+manager
 #                  (no headset needed — the mock drives canned teleop on 5556).
 #   --replay-quest [npz]  full-stack modes: run the manager in replay mode on the given
@@ -56,10 +63,14 @@ IMAGE_FPS="${IMAGE_FPS:-30}"                   # ego-view image relay cap (Quest
 # container can route to — the same host-IP target the deploy container uses. Auto-
 # detected from this host's primary IP when empty; override if auto-detection is wrong.
 CAMERA_RELAY_HOST="${CAMERA_RELAY_HOST:-}"
-TASK_PROMPT="${TASK_PROMPT:-pick up the box}"
-RENDER_DEPTH_SEG="${RENDER_DEPTH_SEG:-1}"     # 1 = publish ego depth + box seg (FoundationPose).
-                                              # On by default: this setup records FoundationPose-ready
-                                              # data (RGB-D + box mask). Set 0 for RGB-only (faster sim).
+TASK="${TASK:-tabletop}"                       # tabletop = table + graspable cube; chair = chair on the floor
+CHAIR_ASSET="${CHAIR_ASSET:-$REPO/data/objects/chair}"  # staged by prepare_object_asset.py
+# Defaults below depend on TASK and are resolved after argument parsing.
+TASK_PROMPT="${TASK_PROMPT:-}"
+RENDER_DEPTH_SEG="${RENDER_DEPTH_SEG:-}"      # 1 = publish ego depth + box seg (FoundationPose).
+                                              # Default: 1 for tabletop (records FoundationPose-ready
+                                              # RGB-D + box mask), 0 for chair (the depth/seg path is
+                                              # box-only). Set explicitly to override.
 RECORD_BOX_GT="${RECORD_BOX_GT:-1}"           # 1 = sim publishes the box's exact pose and the recorder
                                               # stores it (object_gt/*.parquet), in parallel to
                                               # FoundationPose. Sim-only ground truth for comparison /
@@ -81,7 +92,7 @@ DATA_VENV="${DATA_VENV:-$REPO/.venv_data_collection}"
 SESSION="${SESSION:-g1_sim}"                   # tmux session name
 
 # Config vars propagated into each tmux window (so exported overrides survive).
-CONFIG_VARS=(REPO CAMERA_PORT IMAGE_FPS CAMERA_RELAY_HOST TASK_PROMPT RENDER_DEPTH_SEG \
+CONFIG_VARS=(REPO CAMERA_PORT IMAGE_FPS CAMERA_RELAY_HOST TASK TASK_PROMPT CHAIR_ASSET RENDER_DEPTH_SEG \
              RECORD_BOX_GT BOX_GT_PORT \
              SIM_EXTRA DEPLOY_ZMQ_HOST DEPLOY_EXTRA MANAGER_EXTRA REPLAY_QUEST SIM_VENV TELEOP_VENV \
              DATA_VENV SESSION)
@@ -104,6 +115,8 @@ while [ $# -gt 0 ]; do
             fi
             ;;
         --replay-quest=*) REPLAY_QUEST="${1#*=}" ;;
+        --task) TASK="${2:?--task needs a value (tabletop|chair)}"; shift ;;
+        --task=*) TASK="${1#*=}" ;;
         *) POS+=("$1") ;;
     esac
     shift
@@ -114,6 +127,21 @@ if [ "$MOCK_QUEST" -eq 1 ] && [ -n "$REPLAY_QUEST" ]; then
     echo "ERROR: --mock-quest and --replay-quest are mutually exclusive." >&2
     exit 2
 fi
+
+case "$TASK" in
+    tabletop)
+        TASK_PROMPT="${TASK_PROMPT:-pick up the box}"
+        RENDER_DEPTH_SEG="${RENDER_DEPTH_SEG:-1}"
+        ;;
+    chair)
+        TASK_PROMPT="${TASK_PROMPT:-lift and turn the chair}"
+        RENDER_DEPTH_SEG="${RENDER_DEPTH_SEG:-0}"
+        ;;
+    *)
+        echo "ERROR: unknown --task '$TASK' (expected tabletop or chair)." >&2
+        exit 2
+        ;;
+esac
 
 # emit <cmd...>: print the shell-quoted command, then run it unless --print.
 emit() {
@@ -167,8 +195,18 @@ run_single() {
         sim)
             # --detach-gantry: start with the robot released from the virtual gantry
             # (same as pressing '9' in the viewer), so it stands on the policy alone.
-            sim_args=(--table --box --detach-gantry --enable-image-publish --enable-offscreen
-                      --camera-port "$CAMERA_PORT")
+            if [ "$TASK" = "chair" ]; then
+                if [ ! -f "$CHAIR_ASSET/object.json" ]; then
+                    echo "ERROR: no staged chair at $CHAIR_ASSET (missing object.json)." >&2
+                    echo "  python gear_sonic/scripts/prepare_object_asset.py <ikea_assets>/<CHAIR> --out $CHAIR_ASSET" >&2
+                    exit 2
+                fi
+                sim_args=(--chair --chair-asset "$CHAIR_ASSET")
+            else
+                sim_args=(--table --box)
+            fi
+            sim_args+=(--detach-gantry --enable-image-publish --enable-offscreen
+                       --camera-port "$CAMERA_PORT")
             [ "$RENDER_DEPTH_SEG" -eq 1 ] && sim_args+=(--render-depth-seg)
             [ "$RECORD_BOX_GT" -eq 1 ] && sim_args+=(--record-box-gt --box-gt-port "$BOX_GT_PORT")
             # shellcheck disable=SC2086
@@ -247,7 +285,7 @@ run_single() {
                 --camera-host "$cam_host" --camera-port "$CAMERA_PORT" --image-fps "$IMAGE_FPS"
             ;;
         manager)
-            # 'b' = box reset, '0' = full sim reset (shipped via manager_state to the sim).
+            # 'b' = object reset, '0' = full sim reset (shipped via manager_state to the sim).
             # With REPLAY_QUEST set, the manager replays that NPZ instead of the live
             # Quest relay (press 's' to start playback once the policy is up).
             manager_args=(--relay-host localhost --relay-port 5559
@@ -345,30 +383,34 @@ launch_tmux() {
 
 usage() {
     cat >&2 <<EOF
-Usage: $0 [all|sim|deploy|relay|manager|recorder|viewer|mock|teardown|kill] [--mock-quest] [--replay-quest [npz]] [--print]
+Usage: $0 [all|sim|deploy|relay|manager|recorder|viewer|mock|teardown|kill] [--task tabletop|chair] [--mock-quest] [--replay-quest [npz]] [--print]
 
 Sim manipulation stack (no robot — everything on this machine):
   (no args)  start sim + deploy + relay + manager + recorder + viewer (+ teardown) as tiled panes
   all        same as no args
+  --task NAME   manipulation scene: 'tabletop' (default, table + graspable cube) or 'chair'
+                (chair standing on the floor, to lift and reorient). Also sets the recorded
+                task prompt and the depth/seg default. Applies to single-component mode too.
   --mock-quest  (with all/no-args) swap relay+manager for mock_quest_streamer
   --replay-quest [npz]  (with all/no-args) manager replays the NPZ (default:
                 data/quest/traj_20260605_182839_000.npz), relay pane dropped
-  sim        MuJoCo sim: table + box + ego-view publisher on ZMQ $CAMERA_PORT — single, foreground
+  sim        MuJoCo sim: --task scene + ego-view publisher on ZMQ $CAMERA_PORT — single, foreground
   deploy     docker/run-ros2-dev.sh container; inside, sources setup_env.sh and runs
              './deploy.sh sim --input-type zmq_manager --zmq-host $DEPLOY_ZMQ_HOST --yes' (auto-typed in tmux)
   relay      Quest relay (TCP 10000 + ZMQ 5559) + ego-view image relay    — single, foreground
-  manager    Quest teleop manager (binds 5556; b=box reset, 0=full reset) — single, foreground
+  manager    Quest teleop manager (binds 5556; b=object reset, 0=full reset) — single, foreground
   recorder   dataset recorder                                             — single, foreground
   viewer     camera viewer                                                — single, foreground
   mock       mock_quest_streamer (binds 5556) — run INSTEAD of relay+manager
   teardown   parking pane: focus it and press Enter to kill the whole stack
   kill       kill the '$SESSION' tmux session (+ remove the relay container)
 
-Recording writes FoundationPose data (RGB-D + box mask) and, with RECORD_BOX_GT=1, the
-sim's exact box pose to object_gt/*.parquet (sim-only ground truth). Replay a recording
-with 'python gear_sonic/scripts/visualize_robot_object_trajectory.py [--ground-truth]'.
+Recording writes, with RECORD_BOX_GT=1, the sim's exact object pose to object_gt/*.parquet
+(sim-only ground truth), plus FoundationPose data (RGB-D + box mask) when RENDER_DEPTH_SEG=1.
+Replay a recording with
+'python gear_sonic/scripts/visualize_robot_object_trajectory.py [--ground-truth]'.
 
-Resolved config: CAMERA_PORT=$CAMERA_PORT  RENDER_DEPTH_SEG=$RENDER_DEPTH_SEG  RECORD_BOX_GT=$RECORD_BOX_GT
+Resolved config: TASK=$TASK  CAMERA_PORT=$CAMERA_PORT  RENDER_DEPTH_SEG=$RENDER_DEPTH_SEG  RECORD_BOX_GT=$RECORD_BOX_GT
                  MANAGER_EXTRA='$MANAGER_EXTRA'  SIM_EXTRA='$SIM_EXTRA'  SESSION=$SESSION
 Point the Quest Unity app at THIS machine's Wi-Fi/LAN IP : 10000.
 Override any config via env vars (see the config block at the top of this file).

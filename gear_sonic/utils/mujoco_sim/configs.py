@@ -401,6 +401,32 @@ class SimLoopConfig(BaseConfig):
     """Explicit box half-extents override (x, y, z). Default: tabletop cube with --table,
     else the floor-box constant in run_sim_loop.py."""
 
+    chair: bool = False
+    """Spawn a chair (mesh object) on the floor in front of the robot instead of the
+    table+box tabletop scene. Mutually exclusive with --box/--held-box/--table."""
+
+    chair_asset: str = "data/objects/chair"
+    """Staged chair asset directory (as produced by scripts/prepare_object_asset.py from an
+    IKEA_interface download): visual.obj + collision_*.stl + object.json. Relative paths are
+    resolved against the repo root."""
+
+    chair_pos: Optional[tuple[float, float, float]] = None
+    """Chair spawn position override (x, y, z) in meters. Default: (CHAIR_POS_X, 0, z) with z
+    placing the chair's lowest collision point 5 mm above the floor."""
+
+    chair_yaw: Optional[float] = None
+    """Chair spawn yaw in radians about +z. Default: CHAIR_YAW, which for the shipped SANDSBERG
+    asset turns the backrest toward the robot (the top rail is the natural two-hand grasp).
+    Which yaw does that is asset-specific — check a new asset in the viewer."""
+
+    chair_mass: Optional[float] = None
+    """Chair mass in kg. Default: CHAIR_MASS in run_sim_loop.py. Deliberately light — the
+    recordings don't need a physical mass, and IKEA's API reports a bogus constant anyway."""
+
+    dump_scene: Optional[str] = None
+    """Write the fully injected scene XML to this path at startup (debugging aid; open it with
+    open_mj_scene.py). The sim continues to run normally."""
+
     scene_reset: bool = True
     """Listen for scene-reset commands from the teleop manager (manager_state topic)."""
 

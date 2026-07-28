@@ -659,6 +659,8 @@ class GrootDataCollector:
             proprio_frame_index=proprio_frame_index,
             timestamp=gt.get("timestamp", time.time()),
             box_half_extents=gt.get("box_half_extents"),
+            # Staged mesh asset dir when the sim object isn't a primitive box (--chair).
+            object_mesh_dir=gt.get("object_mesh_dir"),
             # Reset-state fields (sim publisher >= this change); older publishers omit them and
             # the writer stores zeros. See new_data_collection_report.md.
             pelvis_in_world=gt.get("pelvis_in_world"),
