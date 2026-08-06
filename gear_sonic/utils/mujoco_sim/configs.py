@@ -408,20 +408,23 @@ class SimLoopConfig(BaseConfig):
     chair_asset: str = "data/objects/chair"
     """Staged chair asset directory (as produced by scripts/prepare_object_asset.py from an
     IKEA_interface download): visual.obj + collision_*.stl + object.json. Relative paths are
-    resolved against the repo root."""
+    resolved against the repo root. Any staged dir works — compare candidates against the
+    robot with scripts/preview_chair_assets.py."""
 
     chair_pos: Optional[tuple[float, float, float]] = None
-    """Chair spawn position override (x, y, z) in meters. Default: (CHAIR_POS_X, 0, z) with z
-    placing the chair's lowest collision point 5 mm above the floor."""
+    """Chair spawn position override (x, y, z) in meters. Default: the asset's ``spawn_pos``
+    in object.json, else (CHAIR_POS_X, 0, z) with z placing the chair's lowest collision point
+    5 mm above the floor."""
 
     chair_yaw: Optional[float] = None
-    """Chair spawn yaw in radians about +z. Default: CHAIR_YAW, which for the shipped SANDSBERG
-    asset turns the backrest toward the robot (the top rail is the natural two-hand grasp).
-    Which yaw does that is asset-specific — check a new asset in the viewer."""
+    """Chair spawn yaw in radians about +z. Default: the asset's ``spawn_yaw`` in object.json
+    (written by preview_chair_assets.py with 'w'), else CHAIR_YAW — which turns the backrest
+    toward the robot for the shipped SANDSBERG asset only; the right yaw is per-asset."""
 
     chair_mass: Optional[float] = None
-    """Chair mass in kg. Default: CHAIR_MASS in run_sim_loop.py. Deliberately light — the
-    recordings don't need a physical mass, and IKEA's API reports a bogus constant anyway."""
+    """Chair mass in kg. Default: the asset's ``spawn_mass`` in object.json, else CHAIR_MASS in
+    run_sim_loop.py. Deliberately light — the recordings don't need a physical mass, and IKEA's
+    API reports a bogus constant anyway."""
 
     dump_scene: Optional[str] = None
     """Write the fully injected scene XML to this path at startup (debugging aid; open it with

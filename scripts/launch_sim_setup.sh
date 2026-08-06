@@ -42,6 +42,9 @@
 #   --task NAME    tabletop (default) or chair; selects the scene the sim spawns and the
 #                  recorded task prompt. The chair asset must be staged first, see
 #                  gear_sonic/scripts/prepare_object_asset.py.
+#   --chair-asset DIR  (--task chair) staged asset dir to spawn, default data/objects/chair.
+#                  Any staged chair works — compare candidates next to the robot with
+#                  gear_sonic/scripts/preview_chair_assets.py.
 #   --mock-quest   full-stack modes: run mock_quest_streamer in place of relay+manager
 #                  (no headset needed — the mock drives canned teleop on 5556).
 #   --replay-quest [npz]  full-stack modes: run the manager in replay mode on the given
@@ -117,6 +120,8 @@ while [ $# -gt 0 ]; do
         --replay-quest=*) REPLAY_QUEST="${1#*=}" ;;
         --task) TASK="${2:?--task needs a value (tabletop|chair)}"; shift ;;
         --task=*) TASK="${1#*=}" ;;
+        --chair-asset) CHAIR_ASSET="${2:?--chair-asset needs a staged asset dir}"; shift ;;
+        --chair-asset=*) CHAIR_ASSET="${1#*=}" ;;
         *) POS+=("$1") ;;
     esac
     shift
@@ -383,7 +388,7 @@ launch_tmux() {
 
 usage() {
     cat >&2 <<EOF
-Usage: $0 [all|sim|deploy|relay|manager|recorder|viewer|mock|teardown|kill] [--task tabletop|chair] [--mock-quest] [--replay-quest [npz]] [--print]
+Usage: $0 [all|sim|deploy|relay|manager|recorder|viewer|mock|teardown|kill] [--task tabletop|chair] [--chair-asset DIR] [--mock-quest] [--replay-quest [npz]] [--print]
 
 Sim manipulation stack (no robot — everything on this machine):
   (no args)  start sim + deploy + relay + manager + recorder + viewer (+ teardown) as tiled panes
@@ -391,6 +396,8 @@ Sim manipulation stack (no robot — everything on this machine):
   --task NAME   manipulation scene: 'tabletop' (default, table + graspable cube) or 'chair'
                 (chair standing on the floor, to lift and reorient). Also sets the recorded
                 task prompt and the depth/seg default. Applies to single-component mode too.
+  --chair-asset DIR  staged chair asset to spawn (default $CHAIR_ASSET); preview candidates
+                with gear_sonic/scripts/preview_chair_assets.py
   --mock-quest  (with all/no-args) swap relay+manager for mock_quest_streamer
   --replay-quest [npz]  (with all/no-args) manager replays the NPZ (default:
                 data/quest/traj_20260605_182839_000.npz), relay pane dropped

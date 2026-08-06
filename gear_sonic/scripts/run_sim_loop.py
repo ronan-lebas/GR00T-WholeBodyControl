@@ -81,13 +81,24 @@ def build_chair_config(config: "ArgsConfig") -> dict:
         )
     meta = json.loads(meta_path.read_text())
 
-    yaw = CHAIR_YAW if config.chair_yaw is None else config.chair_yaw
+    # Precedence: CLI flag > per-asset default in object.json (spawn_yaw / spawn_pos /
+    # spawn_mass, e.g. written by preview_chair_assets.py) > the constants above.
+    if config.chair_yaw is not None:
+        yaw = config.chair_yaw
+    else:
+        yaw = float(meta.get("spawn_yaw", CHAIR_YAW))
     if config.chair_pos:
         pos = tuple(config.chair_pos)
+    elif meta.get("spawn_pos"):
+        pos = tuple(float(v) for v in meta["spawn_pos"])
     else:
         # z places the mesh's lowest collision point just above the floor, whatever the
         # asset's own origin height is.
         pos = (CHAIR_POS_X, 0.0, -float(meta["z_min"]) + CHAIR_FLOOR_CLEARANCE)
+    if config.chair_mass is not None:
+        mass = config.chair_mass
+    else:
+        mass = float(meta.get("spawn_mass", CHAIR_MASS))
 
     return {
         "kind": "mesh",
@@ -95,7 +106,7 @@ def build_chair_config(config: "ArgsConfig") -> dict:
         "meta": meta,
         "pos": pos,
         "quat": (math.cos(yaw / 2.0), 0.0, 0.0, math.sin(yaw / 2.0)),
-        "mass": CHAIR_MASS if config.chair_mass is None else config.chair_mass,
+        "mass": mass,
         # Same grip/anti-sink tuning as the graspable cube (it is generic contact tuning).
         "friction": BOX_FRICTION,
         "condim": BOX_CONDIM,
