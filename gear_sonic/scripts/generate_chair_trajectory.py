@@ -1,8 +1,9 @@
 """Generate a whole-body reference trajectory for moving the chair, by optimization.
 
 Say where the chair should end up and get back a trajectory — robot joints + base pose +
-chair pose, 50 Hz — that puts it there: the robot reaches, grasps the chair, moves it and
-lets go, with the hands staying on the object and the feet staying planted throughout.
+chair pose, 50 Hz — that puts it there: the robot steps up to the chair, grasps it, moves it
+(stepping again if one stance cannot cover the whole displacement) and lets go, with the
+hands staying on the object and each planted foot staying exactly where it was put.
 It is meant as the reference an RL tracking controller is trained on, so it is exact on
 kinematics and contact *placement*, and only plausible (not certified) on the dynamics —
 the policy re-derives the contact detail during training.
@@ -21,6 +22,16 @@ Usage (needs gear_sonic[sim] — mujoco, scipy; run in .venv_sim):
     # turn it and move it 15 cm to the robot's left, replay the result in the viewer
     python gear_sonic/scripts/generate_chair_trajectory.py --rotate-deg 45 \
         --translate 0.0 0.15 --replay
+
+    # do it without moving the feet at all (the old static-stance behaviour)
+    python gear_sonic/scripts/generate_chair_trajectory.py --rotate-deg 45 --walk-steps 0
+
+    # play back a trajectory generated earlier (no optimization runs)
+    python gear_sonic/scripts/generate_chair_trajectory.py \
+        --replay-from data/generated_trajectories/chair_yawp45
+
+    # see what a plan the actuation check refuses would have looked like
+    python gear_sonic/scripts/generate_chair_trajectory.py --start 0.85 0 0 --no-torque
 
     # against a staged chair asset (uses its bounding box and draws its mesh)
     python gear_sonic/scripts/generate_chair_trajectory.py --rotate-deg 90 \
@@ -46,7 +57,7 @@ import numpy as np
 
 from gear_sonic.trajopt import dynamics as dyn, kso as K, plans as P, trajectory as T
 from gear_sonic.trajopt.chair import ChairSpec
-from gear_sonic.trajopt.export import save
+from gear_sonic.trajopt.export import save, scene_qpos
 from gear_sonic.trajopt.scene import TrajOptScene
 from gear_sonic.trajopt.se3 import Pose
 
@@ -86,8 +97,15 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="how far the chair is lifted clear of the floor, meters")
     g.add_argument("--transport-knots", type=int, default=2,
                    help="keyframes across the transport stage (more = tighter object path)")
+    g.add_argument("--walk-steps", type=int, default=2,
+                   help="steps taken to approach the chair before reaching for it "
+                        "(0 = stand where the robot spawns)")
     g.add_argument("--knots", type=int, default=9,
                    help="IK knots per contact stage when densifying the path")
+    g.add_argument("--no-torque", action="store_true",
+                   help="do not reject a plan for exceeding the joint torque limits. The "
+                        "ratio is still computed and reported — this only stops it being a "
+                        "veto, so a trajectory the actuation check refuses can be looked at")
 
     g = p.add_argument_group("output")
     g.add_argument("--fps", type=float, default=50.0, help="output sample rate")
@@ -98,6 +116,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--name", default=None, help="motion name inside motion_lib.pkl")
     g.add_argument("--replay", action="store_true",
                    help="open the MuJoCo viewer and play the result on a loop")
+    g.add_argument("--replay-from", type=Path, default=None, metavar="DIR",
+                   help="play an already generated trajectory and exit — pass its output "
+                        "directory (or the trajectory.npz inside it). Nothing is generated")
     g.add_argument("--no-save", action="store_true", help="do not write anything")
     return p.parse_args(argv)
 
@@ -129,6 +150,8 @@ def auto_name(args, start: Pose, goal: Pose) -> str:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.replay_from is not None:
+        return replay_saved(args.replay_from)
     t_start = time.perf_counter()
 
     start, goal = resolve_poses(args)
@@ -136,12 +159,16 @@ def main(argv=None) -> int:
     if args.seat_height is not None:
         chair.seat_height = args.seat_height
     print(f"[trajopt] {chair.describe()}")
+    if args.no_torque:
+        print("[trajopt] WARNING: --no-torque — the joint torque check is measured but not "
+              "enforced. The result may ask for torques the robot does not have.")
     print(f"[trajopt] chair {np.round(start.p[:2], 3)} @ {np.degrees(start.yaw()):+.0f}deg "
           f"-> {np.round(goal.p[:2], 3)} @ {np.degrees(goal.yaw()):+.0f}deg")
 
     scene = TrajOptScene(chair, start)
     candidates = P.plan_by_name(
-        args.plan, chair, start, goal, lift_height=args.lift, n_transport=args.transport_knots
+        args.plan, chair, start, goal, lift_height=args.lift,
+        n_transport=args.transport_knots, walk_steps=args.walk_steps,
     )
     print(f"[trajopt] {len(candidates)} candidate contact plan(s): "
           f"{', '.join(c.name for c in candidates)}")
@@ -169,9 +196,12 @@ def main(argv=None) -> int:
         entry["kso_violations"] = ev.kso.report
         keyframes = K.unpack_keyframes(ev.problem, ev.kso.z)
         stages = T.solve_path(scene, plan, keyframes, knots_per_stage=args.knots)
-        durations = T.stage_durations(stages, plan, scene.limits, vel_scale=args.vel_scale)
+        durations = T.stage_durations(
+            stages, plan, scene.limits, scene, vel_scale=args.vel_scale, fps=args.fps
+        )
         traj, report, durations = dyn.retime_until_feasible(
-            scene, stages, plan, durations, fps=args.fps
+            scene, stages, plan, durations, fps=args.fps,
+            enforce_torque=not args.no_torque,
         )
         entry["dynamics"] = report.summary()
         print(f"[trajopt] {plan.name:26s} dynamics: {report.summary()}")
@@ -198,7 +228,9 @@ def main(argv=None) -> int:
     print("[trajopt] interpolation drift: "
           + ", ".join(
               f"{k}={v}" if isinstance(v, str)
-              else (f"{k}={v:.3f}" if k == "contact_normal" else f"{k}={v*1000:.1f}mm")
+              else (f"{k}={v:.1f}deg" if k.endswith("_deg")
+                    else f"{k}={v:.3f}" if k == "contact_normal"
+                    else f"{k}={v*1000:.1f}mm")
               for k, v in drift.items()))
 
     name = args.name or auto_name(args, start, goal)
@@ -235,6 +267,7 @@ def main(argv=None) -> int:
                 "torque_ratio": report.torque_ratio,
                 "velocity_ratio": report.velocity_ratio,
                 "max_hand_force_N": report.hand_force_max,
+                "torque_enforced": report.torque_enforced,
                 "ok": report.ok,
             },
         },
@@ -253,42 +286,71 @@ def main(argv=None) -> int:
     print(f"[trajopt] done in {time.perf_counter() - t_start:.1f}s")
 
     if args.replay:
-        replay(scene, traj)
+        replay(scene.model, scene.data, scene_qpos(scene, traj), traj.fps,
+               labels=[f"{s} {traj.stage_names[s]}" for s in traj.stage])
     return 0
 
 
-def replay(scene: TrajOptScene, traj: T.Trajectory) -> None:
-    """Kinematic playback in the MuJoCo viewer (space = pause, arrows = step)."""
+def replay(model, data, qpos: np.ndarray, fps: float, labels=None) -> None:
+    """Kinematic playback of a full-scene ``qpos`` sequence in the MuJoCo viewer.
+
+    Space = pause/resume, left/right = step a frame while paused.
+    """
     import mujoco
     import mujoco.viewer
 
-    state = {"i": 0, "paused": False}
+    n = len(qpos)
+    state = {"i": 0, "paused": False, "said": None}
 
     def key_callback(key):
         if key == 32:  # space
             state["paused"] = not state["paused"]
         elif key == 262:  # right
-            state["i"] = min(state["i"] + 1, traj.n - 1)
+            state["i"] = min(state["i"] + 1, n - 1)
         elif key == 263:  # left
             state["i"] = max(state["i"] - 1, 0)
 
-    print("[trajopt] replay: space = pause/resume, left/right = step (while paused)")
+    print(f"[trajopt] replay: {n} frames at {fps:g} Hz — "
+          "space = pause/resume, left/right = step (while paused)")
     with mujoco.viewer.launch_passive(
-        scene.model, scene.data, key_callback=key_callback, show_left_ui=False
+        model, data, key_callback=key_callback, show_left_ui=False
     ) as viewer:
-        dt = 1.0 / traj.fps
+        dt = 1.0 / fps
         while viewer.is_running():
             i = state["i"]
-            scene.set_state(
-                traj.base_p[i], traj.base_rv[i], traj.qj[i],
-                {"left": traj.hand_q[i, :6], "right": traj.hand_q[i, 6:]},
-                traj.object_pose(i),
-            )
-            mujoco.mj_forward(scene.model, scene.data)
+            data.qpos[:] = qpos[i]
+            mujoco.mj_forward(model, data)
             viewer.sync()
+            if labels is not None and labels[i] != state["said"]:
+                state["said"] = labels[i]
+                print(f"           t={i / fps:6.2f}s  stage {labels[i]}")
             if not state["paused"]:
-                state["i"] = (i + 1) % traj.n
+                state["i"] = (i + 1) % n
             time.sleep(dt)
+
+
+def replay_saved(path: Path) -> int:
+    """Play a trajectory written by a previous run, against its own exported scene."""
+    import mujoco
+
+    path = Path(path)
+    npz_path = path / "trajectory.npz" if path.is_dir() else path
+    xml_path = npz_path.parent / "scene.xml"
+    for f in (npz_path, xml_path):
+        if not f.is_file():
+            print(f"[trajopt] {f} not found", file=sys.stderr)
+            return 1
+
+    data = np.load(npz_path, allow_pickle=True)
+    names = [str(s) for s in data["stage_names"]]
+    stage = data["stage"]
+    print(f"[trajopt] {npz_path}: {len(data['t'])} frames, {float(data['t'][-1]):.2f}s, "
+          f"{len(names)} stages")
+    print("[trajopt] " + " -> ".join(names))
+    model = mujoco.MjModel.from_xml_path(str(xml_path))
+    replay(model, mujoco.MjData(model), data["qpos"], float(data["fps"]),
+           labels=[f"{int(s)} {names[int(s)]}" for s in stage])
+    return 0
 
 
 if __name__ == "__main__":

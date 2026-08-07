@@ -61,7 +61,7 @@ def _whole_q(scene: TrajOptScene, traj: Trajectory) -> Optional[np.ndarray]:
     return out
 
 
-def _qpos(scene: TrajOptScene, traj: Trajectory) -> np.ndarray:
+def scene_qpos(scene: TrajOptScene, traj: Trajectory) -> np.ndarray:
     """(T, nq) full-scene MuJoCo qpos — robot floating base + joints + chair free joint."""
     out = np.zeros((traj.n, scene.model.nq))
     for i in range(traj.n):
@@ -97,6 +97,7 @@ def _motion_lib_entry(traj: Trajectory, qpos: np.ndarray, obj_quat: np.ndarray) 
         "object_rot": obj_quat[:, [1, 2, 3, 0]].astype(np.float32),  # xyzw
         "hand_dof": traj.hand_q.astype(np.float32),
         "contact": traj.contact,
+        "foot_contact": traj.foot_contact,
         "stage": traj.stage,
     }
 
@@ -113,7 +114,7 @@ def save(
     out_dir.mkdir(parents=True, exist_ok=True)
     written: Dict[str, Path] = {}
 
-    qpos = _qpos(scene, traj)
+    qpos = scene_qpos(scene, traj)
     obj_quat = np.stack([Pose(traj.obj_p[i], rot_exp(traj.obj_rv[i])).quat_wxyz()
                          for i in range(traj.n)])
     # The sim's `object` body is the staged asset, whose own frame is a yaw offset from the
@@ -138,6 +139,8 @@ def save(
         object_pos_asset_frame=obj_pos_asset,
         object_quat_wxyz_asset_frame=obj_quat_asset,
         contact=traj.contact,
+        foot_contact=traj.foot_contact,
+        foot_placement=traj.foot_place,
         stage=traj.stage,
         stage_names=np.array(traj.stage_names),
         durations=traj.durations,

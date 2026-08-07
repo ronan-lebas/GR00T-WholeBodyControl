@@ -9,11 +9,14 @@ The structure follows FARO (Ciebielski et al., "FARO: Feasibility-Aware Robot Mo
 Optimization", arXiv:2607.18362), adapted to this repo's dependency set (MuJoCo + scipy;
 no casadi/acados):
 
-    plans.py    contact-mode sequences (FARO §II-A) and the hardcoded plan library
+    plans.py    contact-mode sequences (FARO §II-A) and the hardcoded plan library.
+                An interface is a palm *or a foot*, so a plan says where the robot
+                steps as well as what it grasps
     chair.py    the manipulated object: box proxy + semantic contact patches
     scene.py    MuJoCo scene (G1 + chair) with FK / distance / limit queries
     kso.py      mode + edge feasibility filters (FARO eq. 14) and the kinematic
-                sequence optimization over keyframes (eq. 15)
+                sequence optimization over keyframes (eq. 15), whose decision
+                variables include the in-patch grasp points and the stance placements
     trajectory.py  stage retiming and the dense per-frame IK polish that turns
                 keyframes into a 50 Hz contact-consistent trajectory
     dynamics.py quasi-static / centroidal feasibility pass replacing FARO's full

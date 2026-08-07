@@ -15,7 +15,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import tempfile
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 import xml.etree.ElementTree as ET
 
 import mujoco
@@ -72,7 +72,14 @@ NOMINAL_JOINTS: Dict[str, float] = {
 HAND_OPEN = np.zeros(6)
 HAND_CLOSED = np.array([1.0, 0.6, 1.1, 1.1, 1.1, 1.1])
 
+# Smallest radius the spurious-zero probe descends to (see TrajOptScene._distance). Below a
+# couple of millimetres a zero is taken at face value: at that separation the difference
+# between touching and nearly touching does not change any verdict here.
+_DISTANCE_PROBE_MIN = 0.002
+
+FOOT_SIDES = ("left", "right")
 FOOT_BODIES = ("left_ankle_roll_link", "right_ankle_roll_link")
+FOOT_BODY = dict(zip(FOOT_SIDES, FOOT_BODIES))
 
 # Robot bodies kept clear of the chair. Hands and wrists are excluded on purpose: they are
 # *supposed* to touch, and their placement is governed by the contact constraints instead.
@@ -95,14 +102,34 @@ GRASP_ARM_BODIES = (
     "{side}_wrist_yaw_link", "{side}_base_link",
 )
 
-# Self-collision pairs that actually matter for a two-hand chair carry.
-SELF_COLLISION_BODY_PAIRS = (
-    ("left_base_link", "right_base_link"),
-    ("left_base_link", "torso_link"), ("right_base_link", "torso_link"),
-    ("left_base_link", "pelvis"), ("right_base_link", "pelvis"),
-    ("left_elbow_link", "torso_link"), ("right_elbow_link", "torso_link"),
-    ("left_base_link", "left_knee_link"), ("right_base_link", "right_knee_link"),
-    ("left_wrist_yaw_link", "torso_link"), ("right_wrist_yaw_link", "torso_link"),
+# The arm from the shoulder yaw joint down. A two-hand task brings both of these into the
+# same small volume in front of the chest, so *every* left link has to be checked against
+# *every* right one — listing only the hands lets the left palm sit inside the right wrist,
+# which is exactly what happened before this was enumerated.
+ARM_CHAIN = (
+    "{side}_shoulder_yaw_link", "{side}_elbow_link", "{side}_wrist_roll_link",
+    "{side}_wrist_pitch_link", "{side}_wrist_yaw_link", "{side}_base_link",
+)
+# Against the chest, the shoulder yaw link is excluded: it sits 3 cm from the torso in the
+# nominal stance, inside COLLISION_MARGIN, so checking it would report a permanent
+# violation of a clearance the robot's own geometry does not have.
+TORSO_CHECKED_ARM = ARM_CHAIN[1:]
+
+SELF_COLLISION_BODY_PAIRS = tuple(
+    [(a.format(side="left"), b.format(side="right")) for a in ARM_CHAIN for b in ARM_CHAIN]
+    + [
+        (a.format(side=s), t)
+        for s in ("left", "right")
+        for a in TORSO_CHECKED_ARM
+        for t in ("torso_link", "pelvis")
+    ]
+    # An arm swinging down past its own thigh, and the leg-on-leg pairs that keep a step
+    # from swinging one foot through the other.
+    + [(f"{s}_base_link", f"{s}_knee_link") for s in ("left", "right")]
+    + [
+        ("left_ankle_roll_link", "right_ankle_roll_link"),
+        ("left_knee_link", "right_knee_link"),
+    ]
 )
 
 
@@ -168,13 +195,22 @@ class TrajOptScene:
 
         self.couplings = self._joint_couplings()
         self.limits = self._joint_limits()
+        self.hand_range = {
+            side: (
+                np.array([m.jnt_range[m.joint(n).id][0] for n in names]),
+                np.array([m.jnt_range[m.joint(n).id][1] for n in names]),
+            )
+            for side, names in HAND_JOINT_NAMES.items()
+        }
         self.palm_local = {side: self._palm_frame(side) for side in ("left", "right")}
         self.chair_pairs, self.self_pairs, self.hand_chair_pairs = self._collision_pairs()
-        self.foot_bids = [m.body(n).id for n in FOOT_BODIES]
-        self.foot_sole_geoms = [self._sole_geom(n) for n in FOOT_BODIES]
+        self.foot_bids = {s: m.body(n).id for s, n in zip(FOOT_SIDES, FOOT_BODIES)}
+        self.foot_sole_geoms = {s: self._sole_geom(n) for s, n in zip(FOOT_SIDES, FOOT_BODIES)}
+        self.sole_local = {s: self._sole_local(s) for s in FOOT_SIDES}
 
         self.nominal = self._nominal_stance()
-        self.foot_targets = self._foot_targets()
+        self.foot_nominal, self.ground_z = self._foot_nominal()
+        self.body_reach = self._body_reach()
 
     # ------------------------------------------------------------------ #
     # model construction
@@ -279,33 +315,65 @@ class TrajOptScene:
     def _palm_frame(self, side: str) -> Pose:
         """Palm contact frame in the hand base link, derived from the model's fingers.
 
-        +z of the returned frame is the palm's outward normal (the face that presses on an
-        object); the origin sits at the centre of the palm pad. Derived rather than
-        hardcoded so it stays right for either hand and survives MJCF changes.
+        +z of the returned frame is the palm's outward normal — the face the fingers curl
+        *toward*, which is the one that may press on an object; +y is the finger direction;
+        the origin sits on the palm surface. Derived rather than hardcoded so it stays right
+        for either hand and survives MJCF changes.
+
+        The normal comes from where the fingertips travel when the fingers flex. Taking it
+        from the thumb instead (an obvious-looking shortcut) gives the hand's *lateral*
+        axis on this model — the BrainCo thumb rests roughly in the plane of the palm — and
+        pressing that on a patch puts the edge and back of the hand against the object.
         """
-        d = mujoco.MjData(self.model)
-        d.qpos[:] = self.model.qpos0
-        mujoco.mj_kinematics(self.model, d)
-        base = self.model.body(f"{side}_base_link").id
-        p0, R0 = d.xpos[base].copy(), d.xmat[base].reshape(3, 3).copy()
+        m = self.model
+        d = mujoco.MjData(m)
+        fingers = ("index", "middle", "ring", "pinky")
 
-        def local(body_name: str) -> np.ndarray:
-            bid = self.model.body(body_name).id
-            return R0.T @ (d.xpos[bid] - p0)
+        def tips(closure: float) -> np.ndarray:
+            """(4, 3) fingertip positions in the hand base frame at a given flexion."""
+            d.qpos[:] = m.qpos0
+            for name in HAND_JOINT_NAMES[side]:
+                j = m.joint(name).id
+                lo, hi = m.jnt_range[j]
+                d.qpos[m.jnt_qposadr[j]] = lo + closure * (hi - lo)
+            for dep, ref, poly, dep_q0, ref_q0 in self.couplings:
+                d.qpos[dep] = dep_q0 + np.polyval(poly[::-1], d.qpos[ref] - ref_q0)
+            mujoco.mj_kinematics(m, d)
+            base = m.body(f"{side}_base_link").id
+            p0, R0 = d.xpos[base].copy(), d.xmat[base].reshape(3, 3).copy()
+            return np.stack(
+                [R0.T @ (d.xpos[m.body(f"{side}_{f}_tip_Link").id] - p0) for f in fingers]
+            )
 
-        fingers = np.stack(
-            [local(f"{side}_{f}_tip_Link") for f in ("index", "middle", "ring", "pinky")]
-        ).mean(0)
-        finger_dir = fingers / np.linalg.norm(fingers)
-        thumb = local(f"{side}_thumb_tip_Link")
-        # Palm normal: the thumb-ward component orthogonal to the finger direction — the
-        # fingers curl toward the palm face, so that is where a grasped object sits.
-        n = thumb - finger_dir * float(thumb @ finger_dir)
+        open_tips = tips(0.0)
+        flex = tips(0.75) - open_tips
+        finger_dir = open_tips.mean(0)
+        finger_dir /= np.linalg.norm(finger_dir)
+        n = flex.mean(0)
+        n -= finger_dir * float(n @ finger_dir)  # drop the part that is just the fingers curling up
         n /= np.linalg.norm(n)
-        origin = finger_dir * 0.06 + n * 0.02
-        t = np.cross(n, finger_dir)
-        Rm = np.stack([t, finger_dir, n], axis=1)  # columns: x, y, z(=normal)
+        finger_dir -= n * float(finger_dir @ n)
+        finger_dir /= np.linalg.norm(finger_dir)
+
+        # Pad on the palm surface: the hand's collision mesh is bounded by a box in its own
+        # frame, and the palm is the face of that box the normal points through.
+        gid = self._palm_geom(side)
+        Rg = np.zeros(9)
+        mujoco.mju_quat2Mat(Rg, m.geom_quat[gid])
+        Rg = Rg.reshape(3, 3)
+        surface = float(m.geom_size[gid][int(np.argmax(np.abs(Rg.T @ n)))])
+        origin = np.asarray(m.geom_pos[gid], dtype=float) + n * surface
+
+        Rm = np.stack([np.cross(finger_dir, n), finger_dir, n], axis=1)  # x, y, z(=normal)
         return Pose(origin, Rm)
+
+    def _palm_geom(self, side: str) -> int:
+        """The hand base link's collision geom (the palm shell)."""
+        bid = self.model.body(f"{side}_base_link").id
+        return next(
+            g for g in range(self.model.ngeom)
+            if int(self.model.geom_bodyid[g]) == bid and int(self.model.geom_contype[g]) != 0
+        )
 
     def _collision_pairs(self):
         """``(chair_pairs, self_pairs, hand_chair_pairs)`` as lists of (geom_a, geom_b) ids.
@@ -353,6 +421,17 @@ class TrajOptScene:
         ]
         return min(cands, key=lambda g: self.model.geom_pos[g][2])
 
+    def _sole_local(self, side: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Sole geom's ``(offset, rotation, (hx, hy))`` in its ankle body's frame."""
+        g = self.foot_sole_geoms[side]
+        Rm = np.zeros(9)
+        mujoco.mju_quat2Mat(Rm, self.model.geom_quat[g])
+        return (
+            np.asarray(self.model.geom_pos[g], dtype=float),
+            Rm.reshape(3, 3),
+            np.asarray(self.model.geom_size[g][:2], dtype=float),
+        )
+
     # ------------------------------------------------------------------ #
     # configuration / kinematics
     # ------------------------------------------------------------------ #
@@ -396,10 +475,21 @@ class TrajOptScene:
         """Whole-robot CoM (pelvis subtree — i.e. everything but the chair)."""
         return self.data.subtree_com[self.pelvis_bid].copy()
 
-    def foot_polygon(self) -> np.ndarray:
-        """(N, 2) world xy corners of both foot soles (their convex hull is the support)."""
+    def sole_polygon(self, side: str, ankle: Pose) -> np.ndarray:
+        """(4, 2) world xy corners of a foot sole, given that foot's ankle pose."""
+        off, Rg, half = self.sole_local[side]
+        c = ankle.apply(off)
+        Rw = ankle.Rm @ Rg
+        return np.array(
+            [(c + Rw @ np.array([sx * half[0], sy * half[1], 0.0]))[:2]
+             for sx in (-1.0, 1.0) for sy in (-1.0, 1.0)]
+        )
+
+    def foot_polygon(self, sides: Sequence[str] = FOOT_SIDES) -> np.ndarray:
+        """(N, 2) world xy corners of the given foot soles (their hull is the support)."""
         pts = []
-        for g in self.foot_sole_geoms:
+        for side in sides:
+            g = self.foot_sole_geoms[side]
             c = self.data.geom_xpos[g]
             Rm = self.data.geom_xmat[g].reshape(3, 3)
             hx, hy = self.model.geom_size[g][:2]
@@ -414,6 +504,10 @@ class TrajOptScene:
         ``mj_geomDistance`` runs a convex solver per pair, which dominates the cost of a
         residual evaluation, so pairs whose bounding spheres are already further apart than
         ``distmax`` are skipped by a vectorized test first.
+
+        Guarded against ``mj_geomDistance`` inventing contacts: for mesh pairs it sometimes
+        returns exactly 0 for geoms that are centimetres apart, and an unguarded 0 reads as
+        a collision the optimizer then flees. See ``_distance``.
         """
         a, b = pairs[:, 0], pairs[:, 1]
         centers = self.data.geom_xpos
@@ -424,10 +518,31 @@ class TrajOptScene:
         )
         out = np.full(len(pairs), distmax)
         for i in np.flatnonzero(gap < distmax):
-            out[i] = mujoco.mj_geomDistance(
-                self.model, self.data, int(a[i]), int(b[i]), distmax, None
-            )
+            # The bounding-sphere gap is itself a valid lower bound on the true distance.
+            out[i] = max(self._distance(int(a[i]), int(b[i]), distmax), float(gap[i]))
         return out
+
+    def _distance(self, ga: int, gb: int, distmax: float) -> float:
+        """``mj_geomDistance`` with its spurious zeros filtered out.
+
+        A *saturated* return — the query radius itself — is a proof that the true distance
+        is at least that radius. The failure only ever goes one way (0 instead of a real,
+        larger value) and the radius at which it starts depends on the pose, not just the
+        pair, so it cannot be dodged by picking a good ``distmax``. Instead a zero is
+        re-queried at successively smaller radii: the first probe that comes back non-zero
+        is either the true distance or a proof it exceeds that probe, and both are safe to
+        return. Only zeros pay for this, which is a few queries in a few thousand.
+        """
+        d = mujoco.mj_geomDistance(self.model, self.data, ga, gb, distmax, None)
+        if d != 0.0:
+            return d
+        r = distmax
+        while r > _DISTANCE_PROBE_MIN:
+            r *= 0.5
+            probe = mujoco.mj_geomDistance(self.model, self.data, ga, gb, r, None)
+            if probe != 0.0:
+                return probe
+        return 0.0  # genuinely touching, as far as anything here can tell
 
     # ------------------------------------------------------------------ #
     # nominal stance
@@ -444,25 +559,72 @@ class TrajOptScene:
         floor = self.model.geom("floor").id
         gap = min(
             mujoco.mj_geomDistance(self.model, self.data, floor, g, 2.0, None)
-            for g in self.foot_sole_geoms
+            for g in self.foot_sole_geoms.values()
         )
         base_p[2] -= gap
         self.set_state(base_p, base_rv, qj, {"left": HAND_OPEN, "right": HAND_OPEN})
         return {"base_p": base_p, "base_rv": base_rv, "qj": qj}
 
-    def _foot_targets(self) -> List[Pose]:
-        """Foot poses of the nominal stance — the feet stay planted there throughout.
+    def _foot_nominal(self) -> Tuple[Dict[str, Pose], float]:
+        """Ankle poses of the nominal stance, and the sole height of a foot on the ground.
 
-        The sim stack runs the robot with ``--static-base`` (no stepping), so a reference
-        that keeps both feet in place is the one the controller can actually track.
+        This is where the robot *starts*; a stepping plan is free to place later stances
+        elsewhere (see ``kso.StanceEpisode``).
         """
         n = self.nominal
         self.set_state(n["base_p"], n["base_rv"], n["qj"])
-        return [self.body_pose(name) for name in FOOT_BODIES]
+        poses = {s: self.body_pose(FOOT_BODY[s]) for s in FOOT_SIDES}
+        sole_z = float(
+            np.mean([self.data.geom_xpos[g][2] for g in self.foot_sole_geoms.values()])
+        )
+        return poses, sole_z
+
+    def _body_reach(self) -> float:
+        """How far the standing robot's body sticks out in front of its ankles, meters.
+
+        The knee, in the nominal crouch. Measured with the geoms' bounding spheres, so it
+        is an over-estimate — which is the right side to err on for something used to decide
+        how close to stand to an object.
+        """
+        n = self.nominal
+        self.set_state(n["base_p"], n["base_rv"], n["qj"])
+        bids = {self.model.body(b).id for b in CHAIR_AVOID_BODIES}
+        front = max(
+            float(self.data.geom_xpos[g][0] + self.model.geom_rbound[g])
+            for g in range(self.model.ngeom)
+            if int(self.model.geom_bodyid[g]) in bids and int(self.model.geom_contype[g]) != 0
+        )
+        return front - float(np.mean([p.p[0] for p in self.foot_nominal.values()]))
+
+    def foot_placement(self, side: str, xy_yaw: np.ndarray) -> Pose:
+        """Ankle pose of a foot planted flat on the floor at ``(x, y, yaw)``.
+
+        Height and tilt are those of the nominal stance: a planted foot lies on the ground,
+        so a placement only has the three in-plane degrees of freedom.
+        """
+        nom = self.foot_nominal[side]
+        return Pose(
+            np.array([xy_yaw[0], xy_yaw[1], nom.p[2]]),
+            rot_exp(np.array([0.0, 0.0, xy_yaw[2]])) @ nom.Rm,
+        )
+
+    def nominal_placement(self, side: str) -> np.ndarray:
+        """``(x, y, yaw)`` of the nominal stance for one foot."""
+        nom = self.foot_nominal[side]
+        return np.array([nom.p[0], nom.p[1], float(Pose(nom.p, nom.Rm).yaw())])
+
+    def foot_height(self, side: str) -> float:
+        """Sole clearance above the floor of the current configuration."""
+        return float(self.data.geom_xpos[self.foot_sole_geoms[side]][2]) - self.ground_z
 
     # ------------------------------------------------------------------ #
 
     def hand_posture(self, closed: float) -> Dict[str, np.ndarray]:
-        """Finger joints for a grasp closure in [0, 1] (0 = open, 1 = closed)."""
+        """Finger joints for a grasp closure in [0, 1] (0 = open, 1 = closed).
+
+        Clipped to the model's ranges: the BrainCo thumb metacarpal does not reach 0 (its
+        range starts at ~35 deg), and an out-of-range value silently swings the thumb into
+        the palm in FK, which is not where it is on the robot.
+        """
         q = HAND_OPEN + float(np.clip(closed, 0.0, 1.0)) * (HAND_CLOSED - HAND_OPEN)
-        return {"left": q.copy(), "right": q.copy()}
+        return {side: np.clip(q, lo, hi) for side, (lo, hi) in self.hand_range.items()}

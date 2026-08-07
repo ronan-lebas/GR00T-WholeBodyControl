@@ -18,7 +18,7 @@ import numpy as np
 
 from gear_sonic.trajopt import kso as K
 from gear_sonic.trajopt.plans import HANDS, ContactPlan
-from gear_sonic.trajopt.scene import TrajOptScene
+from gear_sonic.trajopt.scene import FOOT_BODY, TrajOptScene
 from gear_sonic.trajopt.se3 import Pose, interp_pose, rot_exp, rot_log
 
 # Fractions of the URDF's motor limits a *reference* trajectory should use. The URDF
@@ -29,6 +29,15 @@ MAX_BASE_SPEED = 0.35  # m/s of pelvis translation
 MAX_BASE_OMEGA = 1.0  # rad/s of pelvis rotation
 MIN_STAGE_TIME = 0.4  # s
 MAX_STAGE_TIME = 12.0  # s
+GRAVITY = 9.81
+QUINTIC_VEL_PEAK = 1.875  # a quintic stage profile peaks at this * Δ/T
+# m of ZMP excursion a stage's own centre-of-mass motion may account for: the margin the
+# balance constraint asked that stage's support to keep, so acceleration is allowed to spend
+# exactly the room the geometry reserved and no more. Joint velocity limits say nothing about
+# any of this, and a stepping plan is full of stages whose whole job is to move the CoM a long
+# way sideways — a 24 cm weight transfer inside 0.7 s throws the ZMP half a metre out while
+# every joint is still at 3 % of its limit.
+ZMP_BUDGET = {2: K.BALANCE_MARGIN, 1: K.BALANCE_MARGIN_SS}
 
 
 @dataclass
@@ -43,6 +52,9 @@ class StagePath:
     start: Pose  # object pose at u = 0
     end: Pose  # object pose at u = 1
     mode_index: int
+    # Foot placements bracketing the stage: (x, y, yaw) per side at u = 0 and u = 1. They
+    # are equal for a planted foot and differ by exactly one step for a swinging one.
+    stance: Sequence[Dict[str, np.ndarray]] = ()
     residual: Dict[str, float] = field(default_factory=dict)
     _spline: object = field(default=None, repr=False)
 
@@ -78,6 +90,8 @@ class Trajectory:
     obj_rv: np.ndarray  # (T, 3) canonical chair frame, rotation vector
     stage: np.ndarray  # (T,) index of the contact stage
     contact: np.ndarray  # (T, 2) bool, [left, right] hand in contact
+    foot_contact: np.ndarray  # (T, 2) bool, [left, right] foot planted
+    foot_place: np.ndarray  # (T, 2, 3) the (x, y, yaw) each foot is planted at / heading to
     stage_names: List[str]
     durations: np.ndarray  # (n_stages,)
 
@@ -98,7 +112,8 @@ def _stage_problem(
     scene: TrajOptScene,
     mode,
     chair_poses: Sequence[Pose],
-    uv: Dict[str, np.ndarray],
+    grasp: Dict[str, np.ndarray],
+    stance: Sequence[Dict[str, np.ndarray]],
     ends: Sequence[np.ndarray],
     weights: K.Weights,
 ) -> K.KinematicProblem:
@@ -110,14 +125,35 @@ def _stage_problem(
     every constraint — zig-zags through configuration space. Sampled in time that reads as
     metre-per-second-squared CoM accelerations and throws the balance check off completely.
     The coupling term makes the sequence a path.
+
+    Contacts (point *and* bearing) and stance placements are frozen at the values KSO chose,
+    so this pass only fills in geometry: the interior knots of a step stage are where the
+    swing itself is generated, since KSO only ever sees the instants at either end of it.
     """
     n = len(chair_poses)
     episodes = [
-        K.Episode(side=side, patch=mode.patch(side), frames=list(range(n)), uv_index=0,
-                  uv_fixed=np.asarray(uv[side], dtype=float))
+        K.Episode(side=side, patch=mode.patch(side), frames=list(range(n)), var_index=0,
+                  fixed=np.asarray(grasp[side], dtype=float))
         for side in HANDS
         if mode.patch(side) is not None
     ]
+    stances = []
+    for side in HANDS:
+        if mode.planted(side):
+            stances.append(
+                K.StanceEpisode(side=side, frames=list(range(n)), var_index=0,
+                                fixed=np.asarray(stance[0][side], dtype=float))
+            )
+        else:
+            # The swing's take-off and landing placements, attached to the two clamped end
+            # knots. Every knot in between is then a swing frame that knows where it came
+            # from and where it is going, which is what shapes the step.
+            stances += [
+                K.StanceEpisode(side=side, frames=[0], var_index=0,
+                                fixed=np.asarray(stance[0][side], dtype=float)),
+                K.StanceEpisode(side=side, frames=[n - 1], var_index=0,
+                                fixed=np.asarray(stance[1][side], dtype=float)),
+            ]
     free_hands = sum(mode.patch(s) is None for s in HANDS)
     specs = [
         K.FrameSpec(
@@ -126,7 +162,7 @@ def _stage_problem(
         )
         for i, pose in enumerate(chair_poses)
     ]
-    return K.KinematicProblem(scene, specs, episodes, weights)
+    return K.KinematicProblem(scene, specs, episodes, weights, stances=stances)
 
 
 def solve_path(
@@ -152,16 +188,17 @@ def solve_path(
     path_weights.smooth = 12.0
     for s, mode in enumerate(plan.modes):
         kf_a, kf_b = keyframes[s], keyframes[s + 1]
-        # The in-patch contact locations are whatever KSO settled on for this stage's
-        # episode (identical at both ends of the stage — that is what a no-slip contact is).
-        uv = {side: kf_b["uv"][side] if side in kf_b["uv"] else kf_a["uv"][side]
-              for side in HANDS if mode.patch(side) is not None}
+        # Whatever KSO settled on for this stage's contact episode — the same at both ends
+        # of the stage, which is what a no-slip, no-twist contact means.
+        grasp = {side: kf_b["grasp"][side] if side in kf_b["grasp"] else kf_a["grasp"][side]
+                 for side in HANDS if mode.patch(side) is not None}
+        stance = [kf_a["stance"], kf_b["stance"]]
         u = np.linspace(0.0, 1.0, max(3, knots_per_stage))
         ends = [
             np.concatenate([kf["base_p"], kf["base_rv"], kf["qj"]]) for kf in (kf_a, kf_b)
         ]
         poses = [interp_pose(kf_a["object"], kf_b["object"], ui) for ui in u]
-        prob = _stage_problem(scene, mode, poses, uv, ends, path_weights)
+        prob = _stage_problem(scene, mode, poses, grasp, stance, ends, path_weights)
         # Seed with the straight line between the two keyframes: already contact-plausible
         # (both ends are), so the solve is a correction rather than a search.
         guess = prob.initial_guess()
@@ -188,7 +225,8 @@ def solve_path(
                 )
         stages.append(
             StagePath(u=u, base_p=base_p, base_rv=base_rv, qj=qj, closure=closure,
-                      start=kf_a["object"], end=kf_b["object"], mode_index=s, residual=worst)
+                      start=kf_a["object"], end=kf_b["object"], mode_index=s,
+                      stance=stance, residual=worst)
         )
     if verbose:
         print(f"[trajopt] path: {len(stages)} stages, "
@@ -211,11 +249,22 @@ def stage_durations(
     stages: Sequence[StagePath],
     plan: ContactPlan,
     limits,
+    scene: TrajOptScene,
     vel_scale: float = DEFAULT_VEL_SCALE,
+    fps: float = 50.0,
 ) -> np.ndarray:
-    """Per-stage duration: the plan's nominal, stretched until velocity limits hold.
+    """Per-stage duration: the plan's nominal, stretched until the stage is quasi-static.
 
-    A quintic stage profile peaks at 1.875 * Δ/T, which is what the limits are applied to.
+    Two families of bound. Joint and base *velocity* limits, which is what a reference has
+    always had to respect; and the *acceleration* its own centre-of-mass motion implies,
+    which is what makes a weight transfer take as long as it physically does. The second is
+    the one that matters for stepping: shifting the CoM from over one foot to over the other
+    is a large, slow motion that leaves every joint velocity far below its limit, so timing
+    it by velocity alone produces a reference that tips over.
+
+    Doing it here rather than leaving it to ``dynamics.retime_until_feasible`` also keeps
+    the repair local — retiming scales every stage together, so one fast weight shift would
+    otherwise stretch the entire trajectory several-fold to fix itself.
     """
     out = []
     for s, stage in enumerate(stages):
@@ -229,12 +278,50 @@ def stage_durations(
         vmax = limits.velocity * vel_scale
         need = [
             plan.durations[s],
-            1.875 * float(np.max(rate_q / np.maximum(vmax, 1e-6))),
-            1.875 * rate_p / MAX_BASE_SPEED,
-            1.875 * rate_r / MAX_BASE_OMEGA,
+            QUINTIC_VEL_PEAK * float(np.max(rate_q / np.maximum(vmax, 1e-6))),
+            QUINTIC_VEL_PEAK * rate_p / MAX_BASE_SPEED,
+            QUINTIC_VEL_PEAK * rate_r / MAX_BASE_OMEGA,
         ]
-        out.append(float(np.clip(max(need), MIN_STAGE_TIME, MAX_STAGE_TIME)))
+        trial = float(np.clip(max(need), MIN_STAGE_TIME, MAX_STAGE_TIME))
+        budget = ZMP_BUDGET[max(1, sum(plan.modes[s].stance))]
+        out.append(
+            float(np.clip(_zmp_time(scene, stage, trial, fps, budget), trial, MAX_STAGE_TIME))
+        )
     return np.asarray(out)
+
+
+def _zmp_time(
+    scene: TrajOptScene, stage: StagePath, trial: float, fps: float, budget: float
+) -> float:
+    """Duration at which this stage's own CoM motion keeps the ZMP inside ``budget``.
+
+    The acceleration is *measured* on the stage as it will actually be sampled, not inferred
+    from the quintic time law. Those differ by a lot: the timing profile is smooth, but the
+    configuration path is a spline through knots the IK placed independently in the arm's
+    null space, and its curvature in the path parameter contributes to the acceleration on
+    equal terms. Assuming the profile shape alone under-predicted a stepping stage's ZMP
+    excursion by more than an order of magnitude.
+
+    Everything here scales as 1/T², so one measurement at ``trial`` gives the answer
+    directly instead of the geometric search ``dynamics.retime_until_feasible`` would run —
+    and gives it per stage, rather than stretching the whole trajectory to fix one of them.
+    """
+    n = max(8, int(round(trial * fps)) + 1)
+    u = _quintic(np.linspace(0.0, 1.0, n))
+    com = np.empty((n, 3))
+    for i, ui in enumerate(u):
+        cfg = stage.config(float(ui))
+        scene.set_state(
+            cfg[0:3], cfg[3:6], cfg[6:],
+            scene.hand_posture(float(np.interp(ui, stage.u, stage.closure))),
+            stage.object_pose(float(ui)),
+        )
+        com[i] = scene.robot_com()
+    dt = trial / (n - 1)
+    acc = np.gradient(np.gradient(com, dt, axis=0, edge_order=2), dt, axis=0, edge_order=2)
+    peak = float(np.max(np.linalg.norm(acc[:, :2], axis=1)))
+    height = float(com[:, 2].mean())
+    return trial * float(np.sqrt(peak * height / (GRAVITY * budget)))
 
 
 def sample(
@@ -257,6 +344,8 @@ def sample(
     obj_rv = np.zeros((n, 3))
     stage_idx = np.zeros(n, dtype=int)
     contact = np.zeros((n, 2), dtype=bool)
+    foot_contact = np.zeros((n, 2), dtype=bool)
+    foot_place = np.zeros((n, 2, 3))
 
     for i, ti in enumerate(t):
         s = int(np.clip(np.searchsorted(edges, ti, side="right") - 1, 0, len(stages) - 1))
@@ -274,10 +363,15 @@ def sample(
         stage_idx[i] = s
         mode = plan.modes[s]
         contact[i] = [mode.patch("left") is not None, mode.patch("right") is not None]
+        foot_contact[i] = [mode.planted("left"), mode.planted("right")]
+        for k, side in enumerate(HANDS):
+            a, b = stage.stance[0][side], stage.stance[1][side]
+            foot_place[i, k] = a if mode.planted(side) else (1 - u) * a + u * b
 
     return Trajectory(
         fps=fps, t=t, base_p=base_p, base_rv=base_rv, qj=qj, hand_q=hand_q,
         obj_p=obj_p, obj_rv=obj_rv, stage=stage_idx, contact=contact,
+        foot_contact=foot_contact, foot_place=foot_place,
         stage_names=[m.name for m in plan.modes], durations=np.asarray(durations),
     )
 
@@ -292,8 +386,13 @@ def contact_drift(
 ) -> Dict[str, float]:
     """Largest contact / foot error introduced by interpolating between path knots."""
     patches = scene.chair.patches()
-    worst = {"contact_pos": 0.0, "contact_normal": 0.0, "feet": 0.0, "collision": 0.0}
+    worst = {"contact_pos": 0.0, "contact_normal": 0.0, "twist_deg": 0.0, "feet": 0.0,
+             "step_height": 0.0, "collision": 0.0}
     worst_pair = ""
+    # Palm orientation in the object frame at the instant each contact episode began. A
+    # grasp that holds cannot change it, so any growth here is the hand rotating on the
+    # object — the thing that makes a wrapped grip impossible.
+    held: Dict[str, np.ndarray] = {}
     pairs = np.asarray(list(scene.chair_pairs) + list(scene.self_pairs), dtype=int)
     for i in range(traj.n):
         mode = plan.modes[int(traj.stage[i])]
@@ -305,8 +404,15 @@ def contact_drift(
         for side in HANDS:
             name = mode.patch(side)
             if name is None:
+                held.pop(side, None)
                 continue
             palm = scene.palm_pose(side)
+            rel = obj.Rm.T @ palm.Rm
+            held.setdefault(side, rel)
+            worst["twist_deg"] = max(
+                worst["twist_deg"],
+                float(np.degrees(np.linalg.norm(rot_log(held[side].T @ rel)))),
+            )
             # The in-patch coordinate is not stored per frame; measure the perpendicular
             # error only (distance along the patch normal + normal misalignment), which is
             # what "the hand left the surface" means.
@@ -316,10 +422,17 @@ def contact_drift(
             worst["contact_normal"] = max(
                 worst["contact_normal"], float(np.linalg.norm(palm.Rm[:, 2] + n))
             )
-        for name, target in zip(("left_ankle_roll_link", "right_ankle_roll_link"),
-                                scene.foot_targets):
-            pose = scene.body_pose(name)
-            worst["feet"] = max(worst["feet"], float(np.abs(pose.p - target.p).max()))
+        for k, side in enumerate(HANDS):
+            pose = scene.body_pose(FOOT_BODY[side])
+            if traj.foot_contact[i, k]:
+                target = scene.foot_placement(side, traj.foot_place[i, k])
+                worst["feet"] = max(worst["feet"], float(np.abs(pose.p - target.p).max()))
+            else:
+                # How high the foot actually gets. Reported rather than checked as a
+                # violation: a swing frame includes the instants of lift-off and touchdown,
+                # where the foot is *supposed* to be on the floor, so a minimum over the
+                # swing is always zero and says nothing.
+                worst["step_height"] = max(worst["step_height"], scene.foot_height(side))
         d = scene.distances(pairs, K.COLLISION_MARGIN + 0.05)
         j = int(np.argmax(K.COLLISION_MARGIN - d))
         if float(K.COLLISION_MARGIN - d[j]) > worst["collision"]:

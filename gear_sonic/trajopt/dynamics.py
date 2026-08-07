@@ -30,7 +30,7 @@ import mujoco
 import numpy as np
 
 from gear_sonic.trajopt import kso as K
-from gear_sonic.trajopt.plans import HANDS, ContactPlan
+from gear_sonic.trajopt.plans import FEET, HANDS, ContactPlan
 from gear_sonic.trajopt.scene import TrajOptScene
 from gear_sonic.trajopt.trajectory import Trajectory, sample
 
@@ -51,8 +51,17 @@ TORQUE_FRACTION = 0.8  # of the URDF effort limit a reference may ask for
 # centimetre for a fraction of a second is well inside what tracking absorbs; demanding a
 # hard zero on a robot whose feet are 17 cm long, reaching a chair half a metre away,
 # stretches every trajectory to a minute of slow motion instead.
-ZMP_TOLERANCE = 0.01  # m
-MAX_TOTAL_TIME = 25.0  # s: past this, slowing down is not fixing anything
+ZMP_TOLERANCE = 0.01  # m, double support
+# Single support has to be judged against the same *physical* slack, not the same fraction
+# of the polygon: one sole is only 6 cm wide, so a centimetre out is a third of the way to
+# tipping over the edge rather than a rounding error.
+ZMP_TOLERANCE_SS = 0.004  # m
+# When to give up on retiming. The stretch factor is the meaningful one — if four times
+# slower still does not fit, the violation is not inertial and never will be — but a
+# stepping plan has half again as many stages as a standing one, so an absolute ceiling
+# alone would reject it for being long rather than for being wrong.
+MAX_STRETCH = 4.0
+MAX_TOTAL_TIME = 45.0  # s
 
 
 @dataclass
@@ -67,13 +76,17 @@ class DynamicsReport:
     duration: float  # s
     ok: bool
     detail: str = ""
+    torque_enforced: bool = True  # False = the ratio was measured but not allowed to veto
     per_frame: Dict[str, np.ndarray] = field(default_factory=dict, repr=False)
 
     def summary(self) -> str:
+        torque = f"torque={self.torque_ratio:.2f}"
+        if not self.torque_enforced:
+            torque += "(ignored)"
         return (
             f"T={self.duration:.2f}s zmp_margin={self.zmp_margin*100:.1f}cm "
             f"friction={self.friction_margin:.1f}N grasp_moment={self.grasp_moment_ratio:.2f} "
-            f"torque={self.torque_ratio:.2f} vel={self.velocity_ratio:.2f} "
+            f"{torque} vel={self.velocity_ratio:.2f} "
             f"|f|max={self.hand_force_max:.1f}N -> {'ok' if self.ok else self.detail}"
         )
 
@@ -131,8 +144,16 @@ def analyze(
     traj: Trajectory,
     plan: ContactPlan,
     patch_half: float = 0.05,
+    enforce_torque: bool = True,
 ) -> DynamicsReport:
-    """Run the whole feasibility pass over a sampled trajectory."""
+    """Run the whole feasibility pass over a sampled trajectory.
+
+    ``enforce_torque=False`` still measures the torque ratio and reports it, but stops it
+    vetoing the plan — the inverse-dynamics estimate here is the crudest check of the set
+    (angular-momentum rate dropped, ground reaction applied at the sole centre, only 80 % of
+    the URDF limit allowed), so being able to look at a trajectory it refuses is how you
+    find out whether the refusal was the robot or the model.
+    """
     dt = 1.0 / traj.fps
     n = traj.n
     patches = scene.chair.patches()
@@ -166,9 +187,8 @@ def analyze(
     base_al = np.gradient(base_w, dt, axis=0, edge_order=2)
     hand_bodies = {s: scene.model.body(f"{s}_base_link").id for s in HANDS}
 
-    support = K._convex_edges(scene.foot_polygon())
-
     zmp_margin = np.full(n, np.inf)
+    zmp_tol = np.full(n, ZMP_TOLERANCE)
     fric_margin = np.full(n, np.inf)
     fn_min = np.inf
     moment_ratio = 0.0
@@ -178,6 +198,16 @@ def analyze(
     for i in range(n):
         mode = plan.modes[int(traj.stage[i])]
         sides = [s for s in HANDS if mode.patch(s) is not None]
+        # Support is whatever is on the ground *now*: during a step that is a single foot,
+        # which is where the ZMP margin of a stepping reference is actually decided.
+        feet = [s for s in FEET if traj.foot_contact[i, FEET.index(s)]] or list(FEET)
+        zmp_tol[i] = ZMP_TOLERANCE if len(feet) > 1 else ZMP_TOLERANCE_SS
+        support = K._convex_edges(
+            np.concatenate([
+                scene.sole_polygon(s, scene.foot_placement(s, traj.foot_place[i, FEET.index(s)]))
+                for s in feet
+            ])
+        )
         pose = traj.object_pose(i)
 
         # ---- wrench the hands must apply to the object -----------------------
@@ -265,15 +295,20 @@ def analyze(
         torque_ratio = max(
             torque_ratio,
             _torque_ratio(scene, traj, i, qdot[i], qddot[i], base_v[i], base_a[i],
-                          base_w[i], base_al[i], ext_b, ext_p, ext_f, grf),
+                          base_w[i], base_al[i], ext_b, ext_p, ext_f, grf, feet),
         )
 
     vel_ratio = float(np.max(np.abs(qdot) / scene.limits.velocity))
     ok = True
     detail = []
-    if float(zmp_margin.min()) < -ZMP_TOLERANCE:
+    over = zmp_margin + zmp_tol  # negative where the ZMP is past what that support allows
+    if float(over.min()) < 0.0:
         ok = False
-        detail.append(f"ZMP leaves the support polygon by {-zmp_margin.min()*100:.1f} cm")
+        j = int(np.argmin(over))
+        detail.append(
+            f"ZMP leaves the {'single' if zmp_tol[j] < ZMP_TOLERANCE else 'double'}-support "
+            f"polygon by {-zmp_margin[j]*100:.1f} cm at t={traj.t[j]:.2f}s"
+        )
     if np.isfinite(fric_margin).any() and float(np.nanmin(fric_margin)) < 0.0:
         ok = False
         detail.append(f"friction cone violated by {-np.nanmin(fric_margin):.1f} N")
@@ -283,7 +318,7 @@ def analyze(
     if moment_ratio > 1.0:
         ok = False
         detail.append(f"patch moment {moment_ratio:.2f}x what the contact can hold")
-    if torque_ratio > 1.0:
+    if torque_ratio > 1.0 and enforce_torque:
         ok = False
         detail.append(f"joint torque {torque_ratio:.2f}x the usable limit")
     if vel_ratio > 1.0:
@@ -301,6 +336,7 @@ def analyze(
         duration=float(traj.t[-1]),
         ok=ok,
         detail="; ".join(detail),
+        torque_enforced=enforce_torque,
         per_frame={"zmp_margin": zmp_margin, "friction_margin": fric_margin},
     )
 
@@ -324,13 +360,14 @@ def _torque_ratio(
     ext_p: np.ndarray,
     ext_f: np.ndarray,
     grf: np.ndarray,
+    feet: List[str],
 ) -> float:
     """Rough inverse-dynamics torque check for one frame.
 
     ``M q'' + C`` comes from MuJoCo's RNE; the external wrenches (hand reactions and the
-    ground reaction, split evenly between the feet) are mapped to joint space through the
-    contact Jacobians. Angular-momentum rate is neglected — the reference is slow by
-    construction — so this is a magnitude check, not a certificate.
+    ground reaction, split evenly between the planted feet) are mapped to joint space
+    through the contact Jacobians. Angular-momentum rate is neglected — the reference is
+    slow by construction — so this is a magnitude check, not a certificate.
     """
     m, d = scene.model, scene.data
     pose = traj.object_pose(i)
@@ -355,10 +392,13 @@ def _torque_ratio(
     for bid, p, f in zip(ext_b, ext_p, ext_f):
         mujoco.mj_jac(m, d, jacp, jacr, p, bid)
         tau -= jacp.T @ f
-    # Ground reaction, halved between the feet at their sole centres.
-    for gid in scene.foot_sole_geoms:
+    # Ground reaction, split between the planted feet at their sole centres. During single
+    # support one leg carries all of it, which is exactly when this check has something to
+    # say — a stepping reference asks far more of the stance hip than a standing one.
+    for side in feet:
+        gid = scene.foot_sole_geoms[side]
         mujoco.mj_jac(m, d, jacp, jacr, d.geom_xpos[gid], int(m.geom_bodyid[gid]))
-        tau -= jacp.T @ (grf / len(scene.foot_sole_geoms))
+        tau -= jacp.T @ (grf / len(feet))
     used = np.abs(tau[dofs]) / np.maximum(scene.limits.effort * TORQUE_FRACTION, 1e-6)
     return float(used.max())
 
@@ -378,6 +418,7 @@ def retime_until_feasible(
     max_rounds: int = 6,
     growth: float = 1.4,
     verbose: bool = True,
+    enforce_torque: bool = True,
 ) -> Tuple[Trajectory, DynamicsReport, np.ndarray]:
     """Stretch the stage durations until the dynamic checks pass (FARO's time scaling).
 
@@ -387,19 +428,20 @@ def retime_until_feasible(
     motors). Those stop the loop with the reason attached, so the caller can drop the plan.
     """
     dur = np.array(durations, dtype=float)
+    total0 = float(dur.sum())
     traj = sample(stages, plan, dur, scene, fps=fps)
-    report = analyze(scene, traj, plan)
+    report = analyze(scene, traj, plan, enforce_torque=enforce_torque)
     for _ in range(max_rounds):
         if report.ok:
             break
-        if report.grasp_moment_ratio > 1.0 and report.zmp_margin >= 0.0:
+        if report.grasp_moment_ratio > 1.0 and report.zmp_margin >= -ZMP_TOLERANCE_SS:
             break  # static: no amount of slowing down helps
-        if dur.sum() * growth > MAX_TOTAL_TIME:
+        if dur.sum() * growth > min(MAX_TOTAL_TIME, total0 * MAX_STRETCH):
             break
         dur = dur * growth
         if verbose:
             print(f"[trajopt] dynamics: {report.detail} -> stretching to "
                   f"{dur.sum():.1f}s total")
         traj = sample(stages, plan, dur, scene, fps=fps)
-        report = analyze(scene, traj, plan)
+        report = analyze(scene, traj, plan, enforce_torque=enforce_torque)
     return traj, report, dur

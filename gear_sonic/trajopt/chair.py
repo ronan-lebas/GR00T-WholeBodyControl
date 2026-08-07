@@ -115,6 +115,16 @@ class ChairSpec:
         return (self.total_height - self.seat_height) / 2.0
 
     @property
+    def sweep_radius(self) -> float:
+        """Radius the chair occupies about its own vertical axis, whatever its yaw.
+
+        The corner distance, not the face distance: turning the chair in place brings a
+        corner several centimetres closer to whatever stands beside it than the flat face
+        ever was, which is what decides how close a robot can work.
+        """
+        return float(np.hypot(self.half_depth, self.half_width))
+
+    @property
     def com(self) -> np.ndarray:
         """Chair-frame centre of mass (crude: seat + backrest + legs, uniform density)."""
         parts = [
