@@ -84,6 +84,18 @@ ARM_ANIM_OMEGA = 3.0
 # Seconds to smoothly decay the arm sine to 0 after it is toggled off (fast but not a snap).
 ARM_ANIM_FADE_OUT_S = 0.4
 
+# Crouch (toggled with 'z'): commanded planner base height, in metres. The deploy
+# treats [0.5, 0.72) as IDEL_SQUAT (>= 0.72 is standing, < 0.5 becomes a kneel),
+# and standing height is 0.78874.
+LOCOMOTION_SQUAT = 4
+CROUCH_HEIGHT = 0.60
+CROUCH_STAND_HEIGHT = 0.78874
+CROUCH_ENGAGE_HEIGHT = 0.72  # same threshold the quest manager uses
+CROUCH_RAMP_S = 1.5
+# Height quantum: the deploy replans the whole planner rollout on ANY height
+# change, so the ramp is stepped rather than streamed at 50 Hz.
+CROUCH_QUANTUM = 0.02
+
 
 def _smoothstep(x: float) -> float:
     """Clamp x to [0, 1] and apply cubic smoothstep easing (0->0, 1->1, zero slope at ends)."""
@@ -202,6 +214,10 @@ def main():
     stream_mode = 5  # 5 = StreamMode.PLANNER_VR_3PT
 
     finger_tracking_enabled = False
+    crouch_enabled = False
+    crouch_ramp_t = 0.0   # loop-clock time at which the last crouch toggle happened
+    crouch_from = CROUCH_STAND_HEIGHT  # height the current ramp started from
+    crouch_height = CROUCH_STAND_HEIGHT
     arm_z_animation_enabled = False
     arm_anim_start_t = 0.0   # loop-clock time at which the arm sine was last (re)started
     arm_anim_fade_t = 0.0    # loop-clock time at which the fade-out began
@@ -212,6 +228,7 @@ def main():
     retarget_src = "video_retarget module" if args.video_retarget else "per-joint full-range cosine sweep, ~6 s period"
     print(f"  f  - Toggle finger tracking ({retarget_src})")
     print("  a  - Toggle arm Z animation (wrists move up/down in sine wave)")
+    print(f"  z  - Toggle crouch (planner squat, base height -> {CROUCH_HEIGHT:.2f}m)")
     if args.hand == "brainco":
         print("       BrainCo: 6 DOF, values [0.0=open .. 1.0=closed], 7th slot padded")
     else:
@@ -251,6 +268,14 @@ def main():
                         arm_anim_fading = True
                     state = "ENABLED" if arm_z_animation_enabled else "DISABLED"
                     print(f"Pressed 'a': Arm Z animation {state}")
+                elif c == 'z':
+                    # Restart the ramp from wherever the height currently is, so
+                    # toggling mid-ramp reverses smoothly instead of snapping.
+                    crouch_from = crouch_height
+                    crouch_enabled = not crouch_enabled
+                    crouch_ramp_t = t
+                    state = "CROUCHING" if crouch_enabled else "STANDING"
+                    print(f"Pressed 'z': {state}")
 
             # 3. Generate Mocked 3-Point VR Data
             # Coordinate System: X-forward, Y-left, Z-up
@@ -303,6 +328,19 @@ def main():
                     left_hand_joints  = make_demo_joints(t, args.hand, is_left=True)
                     right_hand_joints = make_demo_joints(t, args.hand, is_left=False)
 
+            # 4b. Crouch: ramp the commanded base height and pick the locomotion
+            # mode to match. Squat is a static planner mode, so movement/speed
+            # stay neutral; -1.0 height means "stand at the mode default".
+            target = CROUCH_HEIGHT if crouch_enabled else CROUCH_STAND_HEIGHT
+            alpha = _smoothstep((t - crouch_ramp_t) / CROUCH_RAMP_S)
+            crouch_height = crouch_from + alpha * (target - crouch_from)
+            if crouch_height < CROUCH_ENGAGE_HEIGHT:
+                planner_mode = LOCOMOTION_SQUAT
+                planner_height = round(crouch_height / CROUCH_QUANTUM) * CROUCH_QUANTUM
+            else:
+                planner_mode = 0            # LocomotionMode.IDLE
+                planner_height = -1.0       # "use the mode default" = stand
+
             # 5. Send the Manager State (topic: "manager_state")
             # This tells the C++ state machine that we are staying in VR_3PT mode.
             manager_state_msg = pack_pose_message(
@@ -320,11 +358,11 @@ def main():
             # and optionally the finger joint targets (left_hand_joints /
             # right_hand_joints fields in the wire format).
             planner_msg = build_planner_message(
-                mode=0,                     # LocomotionMode.IDLE = 0
+                mode=planner_mode,          # IDLE, or IDEL_SQUAT while crouching
                 movement=[0.0, 0.0, 0.0],   # Joystick movement
                 facing=[1.0, 0.0, 0.0],     # Joystick yaw
                 speed=-1.0,
-                height=-1.0,
+                height=planner_height,
                 upper_body_position=None,
                 left_hand_position=left_hand_joints,
                 right_hand_position=right_hand_joints,

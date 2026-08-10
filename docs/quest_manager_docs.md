@@ -66,6 +66,7 @@ read the robot's measured joint angles for recalibration.
 | `vr_3pt_orientation` | `[12]` | scalar-first quaternions for the same 3 rows |
 | `left/right_hand_position` | `[7]` | BrainCo: 6 normalized motors `[0=open, 1=closed]` + 1 padding slot |
 | `mode` + `movement[3]` + `speed` + `facing[3]` | — | locomotion command |
+| `mode` + `height` | — | crouch command (`IDEL_SQUAT` + target base height, or `-1.0` = stand) |
 
 **Key subtlety on positions:** the wrist rows are *key-frame points*, i.e. the
 fixed local offsets (`[0.18, ∓0.025, 0]` for wrists, `[0, 0, 0.35]` above the
@@ -316,12 +317,14 @@ elif now - self._last_vel_wall > self._VEL_STALE_SEC:
 ### 6.4 `compute()` return signature
 
 ```python
-(vr_position (9,), vr_orientation (12,), yaw_rel (float), head_vel (3,))
+(vr_position (9,), vr_orientation (12,), yaw_rel (float), head_vel (3,), head_drop (float))
 ```
 
 - `vr_position`/`vr_orientation`: body-relative targets in the root frame.
 - `yaw_rel`: operator heading change since calibration → send as `facing`.
 - `head_vel`: planar head velocity (m/s, z=0) in R0 frame → drives walking.
+- `head_drop`: how far the head has sunk below its calibration height (m,
+  positive down) → drives crouching.
 
 ---
 
@@ -464,6 +467,7 @@ exit (`__exit__`).
 | `p` | pause / resume teleop (freeze robot, smooth resume) |
 | `c` | toggle data collection |
 | `x` | toggle data abort |
+| `-` / `=` | crouch deeper / stand back up (trim on top of the head-height crouch) |
 | `q` | stop policy and exit |
 | `k` | (replay) pause / resume playback |
 | `←` / `→` | (replay) step one frame back / forward |
@@ -573,7 +577,55 @@ Subtleties:
 - Note: the **head ROW** of `vr_position` stays fixed; walking is a separate
   planner command, *not* a moving torso target.
 
-### 11.6 Main loop — `run()`
+### 11.6 Crouching — `_crouch_command`
+
+Maps the operator's head **drop** below the calibration height to the planner's
+`height` command:
+
+```python
+drop = 0.0 if disable_crouch else max(0.0, head_drop) * crouch_scale
+drop += self.crouch_trim                      # '-' / '=' keyboard offset
+# Hysteresis, same shape as walking
+self._crouching = drop >= (0.5 * crouch_deadband if self._crouching else crouch_deadband)
+if not self._crouching:
+    return -1.0                               # "stand at the mode default"
+
+height = clip(PLANNER_STAND_HEIGHT - drop, crouch_min_height, CROUCH_ENGAGE_HEIGHT)
+return round(height / crouch_quantum) * crouch_quantum
+```
+
+The height semantics come from the deploy, which is the authority here
+(`ros2_input_handler.hpp`): `>= 0.72` is standing, `[0.5, 0.72)` is
+`IDEL_SQUAT`, below `0.5` becomes `IDEL_KNEEL`. `PLANNER_STAND_HEIGHT =
+0.78874` is `PlannerConfig::default_height`. The default `crouch_min_height`
+of `0.5` keeps a headset drop from ever commanding a kneel.
+
+Subtleties:
+
+- **Crouch wins over walking.** `IDEL_SQUAT` is a *static* planner mode and the
+  deploy forces `speed = -1` for it (`zmq_manager.hpp`), so the robot cannot
+  translate while crouched — the two commands cannot coexist. Turning in place
+  via `facing` still works. Lifting this would need a different locomotion mode
+  or a policy retrained with `command_z` (the release config drops it; the
+  tokenizer is literally `unitoken_all_noz`).
+- **Quantization is load-bearing, not cosmetic.** The deploy replans the entire
+  planner rollout on *any* height change, so an unquantized 50 Hz stream would
+  force a replan every tick. With the default `0.02 m` quantum a full
+  stand→squat→stand cycle costs a few dozen replans instead of thousands.
+- **No target compensation is needed.** `vr_position` is pelvis-relative
+  downstream and the tracker's `v(t)` is head-relative, so an operator who
+  crouches *with* their hands moves the arms down together with the pelvis,
+  while one who crouches keeping their hands on a table gets a rising `v(t)`
+  that holds the hands world-fixed as the pelvis descends. Both fall out of the
+  existing math.
+- **Independent of `--static-base` / `--disable-walk`.** Squatting does not
+  translate the base, so it is useful in all three modes.
+- The crouch trim and the engage latch are **reset at every calibration**,
+  because the reference head height is re-captured there. The ramp always
+  streams `height = -1.0`, so the robot stands during a ramp and picks the
+  crouch back up from zero when teleop re-engages.
+
+### 11.7 Main loop — `run()`
 
 Runs at `target_fps` (default 50 Hz). Each iteration:
 
@@ -581,16 +633,19 @@ Runs at `target_fps` (default 50 Hz). Each iteration:
    data-abort toggles).
 2. `frame = source.get_frame()`; update calibration countdown.
 3. If in VR_3PT mode and a frame exists:
-   - `tracker.compute(frame)` → pos, quat, yaw_rel, head_vel
+   - `tracker.compute(frame)` → pos, quat, yaw_rel, head_vel, head_drop
    - `_compute_hands(frame)`
-   - `_apply_pause_resume(...)` → possibly frozen/blended pos, quat, facing_yaw
-   - `_walk_command(head_vel)` → mode, movement, speed
+   - `_apply_pause_resume(...)` → possibly frozen/blended pos, quat,
+     facing_yaw, head_drop
+   - `_crouch_command(head_drop)` → height. If engaged, mode is `IDEL_SQUAT`
+     with zero movement; otherwise `_walk_command(head_vel)` → mode, movement,
+     speed.
    - Publish the **planner** message with `facing = [cos(facing_yaw),
-     sin(facing_yaw), 0]`, `height = -1.0`, hand positions, and the VR 3-point
-     position/orientation.
+     sin(facing_yaw), 0]`, the commanded `height`, hand positions, and the VR
+     3-point position/orientation.
 4. Always publish the **manager_state** message (stream mode + toggles).
 5. Every 5 s, print a status line (state, quest data ok/waiting, planner
-   msg/s, fingers on/off, walk state).
+   msg/s, fingers on/off, walk state, crouch height).
 6. Sleep to maintain the target period.
 
 On exit (clean or `KeyboardInterrupt`), sends the policy **STOP** command and
@@ -615,6 +670,12 @@ closes sockets.
 | `--walk-deadband` | 0.08 | head speed (m/s) above which walking starts |
 | `--walk-speed-scale` | 1.0 | scale from operator head speed to robot walk speed |
 | `--walk-min-speed` / `--walk-max-speed` | 0.2 / 0.8 | clamp on commanded walk speed |
+| `--disable-crouch` | off | ignore head height; the `-`/`=` trim still crouches |
+| `--crouch-scale` | 1.0 | commanded height drop per metre of head drop |
+| `--crouch-deadband` | 0.07 | head drop (m) at which the crouch engages; disengages at half |
+| `--crouch-min-height` | 0.5 | lower clamp on commanded height — keeps us in squat, never kneel |
+| `--crouch-quantum` | 0.02 | height quantization; every distinct value forces a planner replan |
+| `--crouch-step` | 0.05 | height change per `-`/`=` press |
 | `--np-retarget` | off | force the pure-numpy finger retargeter |
 | `--replay` | None | NPZ trajectory to replay instead of live Quest |
 | `--rest-hold-sec` / `--rest-interp-sec` | 1.0 / 1.0 | (replay) rest-pose hold + blend durations |
@@ -633,6 +694,10 @@ python quest_manager_thread_server.py --static-base
 
 # Replay a recorded trajectory
 python quest_manager_thread_server.py --replay data/quest/traj_xxx.npz
+
+# Replay a synthetic crouch test motion (generate it first with
+# generate_mock_quest_data.py --styles crouch)
+python quest_manager_thread_server.py --replay data/quest/mock/traj_crouch.npz
 ```
 
 ---

@@ -36,6 +36,11 @@
 # back at its spawn pose (between episodes); '0' full sim reset (recovery — pause with
 # 'p' first).
 #
+# Crouching (manager pane): the operator's head dropping below the calibration height
+# commands a planner squat; '-' / '=' trim it deeper / back up. Works with or without
+# --static-base. While crouched the robot cannot walk (squat is a static planner mode)
+# but still turns in place. With --mock-quest, 'z' in the mock pane crouches instead.
+#
 # All host flags are baked in from the config block below (override via env).
 #
 #   --print / -n   show the exact command(s) without running (safe to test).
@@ -405,10 +410,10 @@ Sim manipulation stack (no robot — everything on this machine):
   deploy     docker/run-ros2-dev.sh container; inside, sources setup_env.sh and runs
              './deploy.sh sim --input-type zmq_manager --zmq-host $DEPLOY_ZMQ_HOST --yes' (auto-typed in tmux)
   relay      Quest relay (TCP 10000 + ZMQ 5559) + ego-view image relay    — single, foreground
-  manager    Quest teleop manager (binds 5556; b=object reset, 0=full reset) — single, foreground
+  manager    Quest teleop manager (binds 5556; -/= crouch, b=object reset, 0=full reset) — single, foreground
   recorder   dataset recorder                                             — single, foreground
   viewer     camera viewer                                                — single, foreground
-  mock       mock_quest_streamer (binds 5556) — run INSTEAD of relay+manager
+  mock       mock_quest_streamer (binds 5556; z=crouch) — run INSTEAD of relay+manager
   teardown   parking pane: focus it and press Enter to kill the whole stack
   kill       kill the '$SESSION' tmux session (+ remove the relay container)
 

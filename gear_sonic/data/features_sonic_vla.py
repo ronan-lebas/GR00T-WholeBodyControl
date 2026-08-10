@@ -97,6 +97,11 @@ def get_modality_config_sonic_vla(robot_model: RobotModel) -> dict:
                 "original_key": "observation.init_base_quat",
                 "rotation_type": "quaternion",
             },
+            "base_trans_target": {
+                "start": 0,
+                "end": 3,
+                "original_key": "observation.base_trans_target",
+            },
         },
         "action": {
             "delta_heading": {
@@ -256,6 +261,13 @@ def get_features_sonic_vla(robot_model: RobotModel) -> dict:
             "dtype": "float64",
             "shape": (4,),
             "names": ["init_base_qw", "init_base_qx", "init_base_qy", "init_base_qz"],
+        },
+        # Reference base pose from the planner motion the WBC tracks; z is the
+        # reference pelvis height (the realized crouch).
+        "observation.base_trans_target": {
+            "dtype": "float64",
+            "shape": (3,),
+            "names": ["base_trans_target_x", "base_trans_target_y", "base_trans_target_z"],
         },
         "teleop.delta_heading": {
             "dtype": "float64",

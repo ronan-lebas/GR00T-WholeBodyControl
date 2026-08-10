@@ -33,6 +33,13 @@ Output ("planner" topic, robot ROOT frame, X-forward, Y-left, Z-up):
                        only turns in place via facing). --static-base goes
                        further: no walk AND facing pinned to neutral, so the
                        base stays put and only the arms/hands move.
+    mode + height      crouch: the operator's head DROP below the calibration
+                       height (plus the '-'/'=' keyboard trim) commands an
+                       IDEL_SQUAT with a target base height. Independent of
+                       --static-base / --disable-walk. Squat is a static planner
+                       mode, so while crouched the robot cannot walk (it still
+                       turns via facing); crouch therefore wins over walking.
+                       Disable the head channel with --disable-crouch.
 
 Usage:
     # Live Quest (relay container must be running, see run_quest_relay.py)
@@ -58,6 +65,7 @@ Keyboard:
     f          toggle finger retargeting
     p          pause / resume teleop (freeze robot, smooth resume)
     c          toggle data collection        x   toggle data abort
+    - / =      crouch deeper / stand back up (trim added to the head-height crouch)
     b          reset the sim box to its spawn pose (between episodes)
     0          FULL sim reset (recovery; robot snaps to default pose — pause first)
     q          stop policy and exit
@@ -125,7 +133,14 @@ PHASE_TELEOP = 2
 LOCOMOTION_IDLE = 0
 LOCOMOTION_SLOW_WALK = 1
 LOCOMOTION_WALK = 2
+LOCOMOTION_SQUAT = 4  # IDEL_SQUAT: static pose, the deploy forces speed=-1 for it
 _WALK_MODES = {"slow": LOCOMOTION_SLOW_WALK, "walk": LOCOMOTION_WALK}
+
+# Base-height command semantics, mirroring the deploy's own mapping in
+# ros2_input_handler.hpp (>=0.72 stand, [0.5, 0.72) squat, <0.5 kneel).
+PLANNER_STAND_HEIGHT = 0.78874  # PlannerConfig::default_height
+CROUCH_ENGAGE_HEIGHT = 0.72  # at or above this the deploy treats the command as standing
+HEIGHT_DEFAULT = -1.0  # wire sentinel: "use the mode default"
 
 # Wire format always carries 7 hand values; BrainCo uses the first 6
 # (normalized [0=open, 1=closed]) and the 7th slot is padding.
@@ -379,6 +394,13 @@ class QuestThreePointTracker:
     turns that velocity into a planner movement_direction + speed so the robot
     walks when the operator walks. (The head ROW of vr_position stays fixed;
     walking is a separate planner command, not a moving torso target.)
+
+    Crouch: compute() also returns how far the head has sunk below its
+    calibration height, which the manager maps to a planner height command. No
+    compensation is needed on the targets here — vr_position is pelvis-relative
+    downstream, and v(t) above is head-relative, so an operator who crouches
+    with their hands moves the arms down with the pelvis, while one who crouches
+    keeping their hands put gets a rising v(t) that holds the hands in place.
     """
 
     # Head-velocity low-pass time constant (s) and the staleness window after
@@ -417,6 +439,7 @@ class QuestThreePointTracker:
         self._link_ref: dict[str, np.ndarray] = {}
         self._rot_ref: dict[str, sRot] = {}
         self._torso_pos = np.zeros(3)
+        self._head_z_cal = 0.0
         # Head planar velocity tracking (R0 frame), reset on each calibration.
         self._prev_head_pos: np.ndarray | None = None
         self._prev_ts: float | None = None
@@ -435,6 +458,7 @@ class QuestThreePointTracker:
         self._r0_inv = self._r0.inv()
 
         head_pos = np.asarray(frame["head_pos"], dtype=np.float64)
+        self._head_z_cal = float(head_pos[2])
         for side in _SIDES:
             wrist_pos = np.asarray(frame[f"{side}_wrist_pos"], dtype=np.float64)
             self._v_cal[side] = self._r0_inv.apply(wrist_pos - head_pos)
@@ -512,15 +536,17 @@ class QuestThreePointTracker:
         elif now - self._last_vel_wall > self._VEL_STALE_SEC:
             self._head_vel = np.zeros(3)
 
-    def compute(self, frame: dict) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+    def compute(self, frame: dict) -> tuple[np.ndarray, np.ndarray, float, np.ndarray, float]:
         """One Quest frame -> (vr_position (9,), vr_orientation (12,), yaw_rel,
-        head_vel (3,)).
+        head_vel (3,), head_drop).
 
         Positions/orientations are body-relative targets in the robot root
         frame; yaw_rel is the operator heading change since calibration and
         must be sent as the planner ``facing`` direction to turn the robot;
         head_vel is the operator's planar head velocity (m/s, z=0) in the fixed
-        R0 frame, used to drive base locomotion.
+        R0 frame, used to drive base locomotion; head_drop is how far the
+        operator's head has sunk below its calibration height (m, positive
+        down), used to drive the crouch.
         """
         if not self._calibrated:
             raise RuntimeError("compute() called before calibrate()")
@@ -554,7 +580,8 @@ class QuestThreePointTracker:
         pos[2] = self._torso_pos + self._HEAD_OFFSET
         quat[2] = np.array([1.0, 0.0, 0.0, 0.0])
 
-        return pos.flatten(), quat.flatten(), yaw_rel, self._head_vel.copy()
+        head_drop = self._head_z_cal - float(head_pos[2])
+        return pos.flatten(), quat.flatten(), yaw_rel, self._head_vel.copy(), head_drop
 
 
 # ---------------------------------------------------------------------------
@@ -991,6 +1018,13 @@ class QuestManager:
         # the speed deadband so the robot does not flap between IDLE and walk.
         self.walk_mode = _WALK_MODES[args.walk_mode]
         self._walking = False
+        # Crouch (head-height squatting). `crouch_trim` is the keyboard offset in
+        # metres added on top of the head drop; `_crouching` adds hysteresis around
+        # the engage deadband; `_height_cmd` is the last height actually sent
+        # (quantized), kept for the status line.
+        self.crouch_trim = 0.0
+        self._crouching = False
+        self._height_cmd = HEIGHT_DEFAULT
         self.resume_ramp_start: float | None = None
         # Countdown state: (deadline, kind) with kind in {"start", "recalib"}
         self.pending_calib: tuple[float, str] | None = None
@@ -1005,6 +1039,7 @@ class QuestManager:
         self.frozen_pos: np.ndarray | None = None
         self.frozen_quat: np.ndarray | None = None
         self.frozen_yaw: float = 0.0
+        self.frozen_drop: float = 0.0
         self.frozen_hands: dict[str, list[float] | None] = {"left": None, "right": None}
         self.last_hands: dict[str, list[float] | None] = {"left": None, "right": None}
         # facing_yaw = yaw_rel - yaw_offset: the offset rebases the operator's
@@ -1046,6 +1081,12 @@ class QuestManager:
         self.tracker.calibrate(frame, body_q_29=body_q)
         self.pose_filter.reset()
         self._last_compute_t = None
+        # The crouch reference (head z) was just re-captured, so the trim stacked on
+        # top of it is stale — drop it, and stand up. The ramp that precedes this
+        # already streams height=-1.0, so this is the hand-off point, not a jump.
+        self.crouch_trim = 0.0
+        self._crouching = False
+        self.frozen_drop = 0.0
         if kind == "start":
             self.yaw_offset = 0.0
             self.last_facing_yaw = 0.0
@@ -1163,7 +1204,7 @@ class QuestManager:
                 movement=[0.0, 0.0, 0.0],
                 facing=[1.0, 0.0, 0.0],
                 speed=-1.0,
-                height=-1.0,
+                height=HEIGHT_DEFAULT,  # always ramp standing; crouch is reset at calibration
                 vr_3pt_position=pos.tolist(),
                 vr_3pt_orientation=quat.tolist(),
             )
@@ -1240,6 +1281,13 @@ class QuestManager:
         elif key == "x":
             toggle_da = True
             print("[QuestManager] Data abort toggle sent")
+        elif key in ("-", "_", "=", "+"):
+            # Trim added to the head-drop crouch; also the only crouch source for
+            # replay / --disable-crouch. Same '-' down / '=' up convention as the
+            # deploy's own keyboard_handler.
+            step = self.args.crouch_step if key in ("-", "_") else -self.args.crouch_step
+            self.crouch_trim = max(0.0, self.crouch_trim + step)
+            print(f"[QuestManager] Crouch trim {self.crouch_trim:+.2f}m")
         elif key == "b":
             self.reset_box_count += 1
             print("[QuestManager] Box reset sent (sim teleports the box back to spawn)")
@@ -1285,8 +1333,8 @@ class QuestManager:
         return hands
 
     def _apply_pause_resume(
-        self, pos: np.ndarray, quat: np.ndarray, yaw_rel: float, hands: dict
-    ) -> tuple[np.ndarray, np.ndarray, float, dict]:
+        self, pos: np.ndarray, quat: np.ndarray, yaw_rel: float, hands: dict, drop: float
+    ) -> tuple[np.ndarray, np.ndarray, float, dict, float]:
         facing_yaw = _wrap(yaw_rel - self.yaw_offset)
 
         if self.teleop_paused:
@@ -1294,8 +1342,15 @@ class QuestManager:
                 self.frozen_pos = pos.copy()
                 self.frozen_quat = quat.copy()
                 self.frozen_yaw = facing_yaw
+                self.frozen_drop = drop
                 self.frozen_hands = dict(hands)
-            return self.frozen_pos, self.frozen_quat, self.frozen_yaw, self.frozen_hands
+            return (
+                self.frozen_pos,
+                self.frozen_quat,
+                self.frozen_yaw,
+                self.frozen_hands,
+                self.frozen_drop,
+            )
 
         if self.resume_ramp_start is not None and self.frozen_pos is not None:
             if self.resume_rebase_pending:
@@ -1318,7 +1373,8 @@ class QuestManager:
                         for i in range(3)
                     ]
                 )
-        return pos, quat, facing_yaw, hands
+                drop = (1.0 - alpha) * self.frozen_drop + alpha * drop
+        return pos, quat, facing_yaw, hands, drop
 
     def _walk_command(self, head_vel: np.ndarray) -> tuple[int, list[float], float]:
         """Map operator head planar velocity (R0 frame) to a planner movement.
@@ -1351,6 +1407,35 @@ class QuestManager:
         )
         return self.walk_mode, [float(direction[0]), float(direction[1]), 0.0], cmd_speed
 
+    def _crouch_command(self, head_drop: float) -> float:
+        """Operator head drop (m, positive down) -> planner base-height command.
+
+        Returns the target height in metres, or HEIGHT_DEFAULT (-1.0) meaning
+        "stand". The keyboard trim is added to the head drop, so '-'/'=' work on
+        their own (replay, mock) and as an offset on top of live head tracking.
+
+        The result is quantized: the deploy replans the whole planner rollout on
+        ANY height change (g1_deploy_onnx_ref.cpp height_changed), so a raw 50 Hz
+        stream would force a replan every tick.
+        """
+        drop = 0.0 if self.args.disable_crouch else max(0.0, head_drop) * self.args.crouch_scale
+        drop += self.crouch_trim
+
+        # Hysteresis so the operator does not flap in and out of squat at the
+        # engage boundary (each transition is a planner replan).
+        deadband = self.args.crouch_deadband
+        self._crouching = drop >= (0.5 * deadband if self._crouching else deadband)
+        if not self._crouching:
+            return HEIGHT_DEFAULT
+
+        height = np.clip(
+            PLANNER_STAND_HEIGHT - drop, self.args.crouch_min_height, CROUCH_ENGAGE_HEIGHT
+        )
+        quantum = max(self.args.crouch_quantum, 1e-3)
+        # round() again to kill the float noise, so equal buckets compare equal
+        # (the deploy detects "height changed" by comparison).
+        return round(round(height / quantum) * quantum, 4)
+
     # -- main loop ------------------------------------------------------------------
 
     def run(self) -> None:
@@ -1358,7 +1443,7 @@ class QuestManager:
         print(
             "[QuestManager] Controls: s=ramp-to-calib / s-again=calibrate+teleop  "
             "r=recalibrate  f=fingers  p=pause  c=collect  x=abort  "
-            "b=box-reset  0=FULL-sim-reset  q=quit"
+            "-/= crouch-deeper/stand  b=box-reset  0=FULL-sim-reset  q=quit"
             + ("  k=replay-pause  arrows=step" if self.source.is_replay else "")
         )
         last_report = time.time()
@@ -1397,16 +1482,24 @@ class QuestManager:
                     if self._run_ramp():
                         sent += 1
                 elif self.phase == PHASE_TELEOP and frame is not None:
-                    pos, quat, yaw_rel, head_vel = self.tracker.compute(frame)
+                    pos, quat, yaw_rel, head_vel, head_drop = self.tracker.compute(frame)
                     dt = 0.0 if self._last_compute_t is None else t_start - self._last_compute_t
                     self._last_compute_t = t_start
                     pos, quat = self.pose_filter(pos, quat, dt)
                     hands = self._compute_hands(frame)
-                    pos, quat, facing_yaw, hands = self._apply_pause_resume(
-                        pos, quat, yaw_rel, hands
+                    pos, quat, facing_yaw, hands, head_drop = self._apply_pause_resume(
+                        pos, quat, yaw_rel, hands, head_drop
                     )
                     self.last_facing_yaw = facing_yaw
-                    mode, movement, speed = self._walk_command(head_vel)
+                    # Crouch wins over walking: IDEL_SQUAT is a static planner mode
+                    # (the deploy forces speed=-1 for it), so the two cannot coexist.
+                    height = self._crouch_command(head_drop)
+                    self._height_cmd = height
+                    if height >= 0.0:
+                        mode, movement, speed = LOCOMOTION_SQUAT, [0.0, 0.0, 0.0], -1.0
+                        self._walking = False
+                    else:
+                        mode, movement, speed = self._walk_command(head_vel)
                     # --static-base pins the base heading: never turn the robot.
                     facing = (
                         [1.0, 0.0, 0.0]
@@ -1419,7 +1512,7 @@ class QuestManager:
                             movement=movement,
                             facing=facing,
                             speed=speed,
-                            height=-1.0,
+                            height=height,
                             left_hand_position=hands["left"],
                             right_hand_position=hands["right"],
                             vr_3pt_position=pos.tolist(),
@@ -1461,6 +1554,7 @@ class QuestManager:
                             else ("walk" if self._walking else "idle")
                         )
                     )
+                    crouch = "off" if self._height_cmd < 0.0 else f"{self._height_cmd:.2f}"
                     latency = (
                         f" | frame-age avg={1e3 * lat_sum / lat_n:.0f}ms "
                         f"max={1e3 * lat_max:.0f}ms"
@@ -1471,7 +1565,7 @@ class QuestManager:
                         f"[QuestManager] {state} | quest={data} | "
                         f"{sent / (now - last_report):.1f} planner msg/s | "
                         f"fingers={'on' if self.finger_tracking else 'off'} | "
-                        f"walk={walk}{latency}"
+                        f"walk={walk} | crouch={crouch}{latency}"
                     )
                     last_report = now
                     lat_sum, lat_max, lat_n = 0.0, 0.0, 0
@@ -1586,6 +1680,45 @@ def main() -> None:
         type=float,
         default=0.8,
         help="upper clamp on commanded walk speed (m/s)",
+    )
+    parser.add_argument(
+        "--disable-crouch",
+        action="store_true",
+        help="ignore the operator's head height; the '-'/'=' crouch trim still works",
+    )
+    parser.add_argument(
+        "--crouch-scale",
+        type=float,
+        default=1.0,
+        help="commanded base-height drop per metre of operator head drop",
+    )
+    parser.add_argument(
+        "--crouch-deadband",
+        type=float,
+        default=0.07,
+        help="operator head drop (m) below the calibration height at which the crouch "
+        "engages; the default lands engagement right at the deploy's 0.72m squat "
+        "boundary. Disengages at half this (hysteresis)",
+    )
+    parser.add_argument(
+        "--crouch-min-height",
+        type=float,
+        default=0.5,
+        help="lower clamp on the commanded base height (m). The deploy switches from "
+        "IDEL_SQUAT to IDEL_KNEEL below 0.5, so the default keeps squat",
+    )
+    parser.add_argument(
+        "--crouch-quantum",
+        type=float,
+        default=0.02,
+        help="quantization (m) of the commanded height; every distinct value forces a "
+        "planner replan",
+    )
+    parser.add_argument(
+        "--crouch-step",
+        type=float,
+        default=0.05,
+        help="height change (m) per '-'/'=' key press",
     )
     parser.add_argument(
         "--np-retarget",

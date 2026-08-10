@@ -886,6 +886,18 @@ class GrootDataCollector:
                 [1.0, 0.0, 0.0, 0.0], dtype=np.float64
             )
 
+        # Reference base translation from the planner-generated motion frame the WBC
+        # is tracking. Its z is the reference PELVIS HEIGHT, i.e. the crouch as the
+        # planner actually realized it (teleop.planner_height is only the request,
+        # which the planner ramps toward). Unlike object_gt's pelvis_in_world this
+        # exists on real hardware too, where nothing observes the true base height.
+        if "base_trans_target" in proprio:
+            frame_data["observation.base_trans_target"] = np.asarray(
+                proprio["base_trans_target"], dtype=np.float64
+            )
+        else:
+            frame_data["observation.base_trans_target"] = np.zeros(3, dtype=np.float64)
+
         if "delta_heading" in proprio:
             dh = proprio["delta_heading"]
             if isinstance(dh, np.ndarray):

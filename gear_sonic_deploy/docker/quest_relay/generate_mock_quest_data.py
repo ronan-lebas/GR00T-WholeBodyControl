@@ -43,6 +43,11 @@ Usage (from anywhere in the repo):
     python gear_sonic_deploy/docker/quest_relay/generate_mock_quest_data.py
     python gear_sonic_deploy/docker/quest_relay/generate_mock_quest_data.py \
         --output-dir data/quest --num-trajectories 5 --duration 17 --hz 90 --seed 0
+
+    # Crouch test motion for the manager's head-height -> planner height command
+    # (opt-in style; replay it with quest_manager_thread_server.py --replay):
+    python gear_sonic_deploy/docker/quest_relay/generate_mock_quest_data.py \
+        --styles crouch --num-trajectories 1 --duration 24 --output-dir data/quest/mock
 """
 
 import argparse
@@ -251,8 +256,26 @@ def _smoothstep(x: np.ndarray) -> np.ndarray:
     return x * x * (3 - 2 * x)
 
 
+def _crouch_profile(t: np.ndarray, depth: float) -> np.ndarray:
+    """Repeating stand -> squat -> stand head-drop profile (m, positive down).
+
+    One 10 s cycle: 2 s standing, 2 s down, 4 s held at ``depth``, 2 s back up.
+    The manager engages its crouch ~0.07 m into the descent, so the held phase is
+    what actually exercises a steady squat.
+    """
+    phase = np.mod(t, 10.0)
+    down = _smoothstep((phase - 2.0) / 2.0)
+    up = _smoothstep((phase - 8.0) / 2.0)
+    return depth * (down - up)
+
+
 def generate_trajectory(
-    seed: int, duration: float, hz: float, style: str, start_time: float
+    seed: int,
+    duration: float,
+    hz: float,
+    style: str,
+    start_time: float,
+    crouch_depth: float = 0.25,
 ) -> dict[str, np.ndarray]:
     """Procedurally synthesize one trajectory dict of stacked arrays."""
     rng = np.random.default_rng(seed)
@@ -270,7 +293,10 @@ def generate_trajectory(
         "reach": dict(head_amp=0.05, reach=0.30, curl_amp=0.6, walk=0.0, wave=0.0),
         "wave": dict(head_amp=0.04, reach=0.12, curl_amp=0.5, walk=0.0, wave=1.0),
         "walk": dict(head_amp=0.10, reach=0.20, curl_amp=0.4, walk=1.0, wave=0.0),
+        "crouch": dict(head_amp=0.02, reach=0.10, curl_amp=0.4, walk=0.0, wave=0.0),
     }[style]
+    # Styles whose head translates enough that the wrists must follow the body.
+    follow_head = style in ("walk", "crouch")
 
     # Per-trajectory random phases/frequencies keep variety while staying smooth.
     f_head = rng.uniform(0.15, 0.4)
@@ -290,6 +316,8 @@ def generate_trajectory(
         head_pos[:, 0] += 0.4 * drift
         head_pos[:, 1] += 0.3 * drift * np.sin(0.5 * np.pi * drift)
         head_pos[:, 2] += 0.03 * np.sin(2 * np.pi * 1.8 * t)
+    if style == "crouch":
+        head_pos[:, 2] -= _crouch_profile(t, crouch_depth)
 
     head_quat = np.zeros((n, 4))
     yaw = 0.25 * sway * np.sin(2 * np.pi * f_head * 0.7 * t + ph[3])
@@ -309,7 +337,7 @@ def generate_trajectory(
         pos[:, 0] += reach * (0.5 + 0.5 * np.sin(2 * np.pi * f_arm * t + ph[5]))
         pos[:, 1] += side_sign * 0.4 * reach * np.sin(2 * np.pi * f_arm * 0.8 * t + ph[6])
         pos[:, 2] += reach * 0.7 * np.sin(2 * np.pi * f_arm * 1.1 * t + ph[7])
-        if style == "walk":
+        if follow_head:
             pos += head_pos - _HEAD_BASE  # wrists follow the body as it moves
         quat = np.zeros((n, 4))
         for i in range(n):
@@ -432,8 +460,14 @@ def main() -> int:
     )
     parser.add_argument(
         "--styles", nargs="+", default=["idle", "reach", "wave", "walk"],
-        choices=["idle", "reach", "wave", "walk"],
-        help="Motion styles to cycle through across trajectories.",
+        choices=["idle", "reach", "wave", "walk", "crouch"],
+        help="Motion styles to cycle through across trajectories. 'crouch' is opt-in: "
+        "it repeats a stand/squat/stand cycle to drive the manager's crouch command.",
+    )
+    parser.add_argument(
+        "--crouch-depth", type=float, default=0.25,
+        help="(crouch style) how far the head sinks below standing, in metres. "
+        "0.25 gives a commanded base height of ~0.54m, inside the squat band.",
     )
     args = parser.parse_args()
 
@@ -448,6 +482,7 @@ def main() -> int:
         traj = generate_trajectory(
             seed=seed, duration=args.duration, hz=args.hz, style=style,
             start_time=base_time + k * (args.duration + 1.0),
+            crouch_depth=args.crouch_depth,
         )
         save_trajectory(traj, out_dir, args.start_index + k, args.hz, style, seed)
     return 0
