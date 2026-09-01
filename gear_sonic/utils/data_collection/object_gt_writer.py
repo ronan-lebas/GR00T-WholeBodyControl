@@ -39,7 +39,7 @@ zero-velocity jump. All are sampled from the same physics step as the poses. See
 The writer also ensures the shared object mesh exists (under ``foundation_pose_data/``, where the
 visualizer looks for it) so ground-truth-only runs still have a mesh to render: a synthesized
 colored ``box.obj`` for the primitive cube, or a copy of the staged asset (``object.obj`` plus its
-convex hulls as ``object_collision_*.stl``) when the sim ran with a mesh object (``--chair``).
+convex hulls as ``object_collision_*.stl``) when the sim ran with a mesh object (``--object-asset``).
 """
 
 import json
@@ -63,6 +63,7 @@ class ObjectGtWriter:
         self._mesh_path = Path(dataset_root) / "foundation_pose_data" / "box.obj"
         self._episode_index: int | None = None
         self._rows: list[dict] = []
+        self._identity_checked = False
 
     def is_active(self) -> bool:
         """Whether an episode is currently open for writing."""
@@ -80,6 +81,7 @@ class ObjectGtWriter:
         timestamp: float,
         box_half_extents=None,
         object_mesh_dir=None,
+        object_name=None,
         pelvis_in_world=None,
         base_vel=None,
         object_vel=None,
@@ -121,10 +123,40 @@ class ObjectGtWriter:
             }
         )
         # Write the shared object mesh once (needed for ground-truth-only replay).
+        self._check_identity(object_name, box_half_extents)
         if object_mesh_dir:
             self._ensure_asset_mesh(object_mesh_dir)
         elif box_half_extents is not None and len(box_half_extents) == 3:
             self._ensure_box_mesh(box_half_extents)
+
+    def _check_identity(self, object_name, box_half_extents) -> None:
+        """Record which object this dataset holds, and warn if it ever changes.
+
+        The mesh writers below skip when their output already exists, so recording a *different*
+        object into an existing dataset root would silently keep the first object's mesh and make
+        every replay of the new episodes wrong. Datasets are named per run by default, so this
+        only bites on an explicit --dataset-name reuse — but it fails silently, hence the shout.
+        """
+        if self._identity_checked or not object_name:
+            return
+        self._identity_checked = True
+        path = self._mesh_path.parent / "object_meta.json"
+        meta = {
+            "name": str(object_name),
+            "box_half_extents": [float(v) for v in (box_half_extents or [])],
+        }
+        if path.exists():
+            previous = json.loads(path.read_text()).get("name")
+            if previous != meta["name"]:
+                print(
+                    f"[ObjectGt] WARNING: this dataset was recorded with object '{previous}' but "
+                    f"the sim is now running '{meta['name']}'. The stored mesh is NOT updated, so "
+                    "replays of these episodes will show the wrong object — record into a fresh "
+                    "dataset root instead."
+                )
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(meta, indent=2) + "\n")
 
     def _ensure_box_mesh(self, box_half_extents) -> None:
         if self._mesh_path.exists():
@@ -133,7 +165,7 @@ class ObjectGtWriter:
         write_colored_box_obj(self._mesh_path, box_half_extents)
 
     def _ensure_asset_mesh(self, object_mesh_dir) -> None:
-        """Copy a staged mesh asset (``--chair``) next to the dataset for replay.
+        """Copy a staged mesh asset (``--object-asset``) next to the dataset for replay.
 
         Landed as ``object.obj`` + ``object_collision_*.stl``, which the replay/contact tooling
         prefers over the synthesized ``box.obj``. The hulls travel too so ``process_contacts.py``

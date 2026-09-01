@@ -108,7 +108,7 @@ def resolve_paths(args) -> tuple[Path, Path, Path | None, Path | None]:
     )
 
     fp_data = traj / "foundation_pose_data"
-    # object.obj is the staged mesh asset (--chair recordings); box.obj is the synthesized
+    # object.obj is the staged mesh asset (--object-asset recordings); box.obj is the synthesized
     # cube of the tabletop task. Older recordings only have box.obj.
     mesh = fp_data / "object.obj"
     if not mesh.is_file():

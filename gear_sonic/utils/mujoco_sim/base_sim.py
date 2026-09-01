@@ -104,6 +104,9 @@ class DefaultEnv:
         # Staged asset dir for a mesh object (None for the primitive box); shipped with the
         # GT stream so the recorder copies the real mesh instead of synthesizing a cube.
         self.object_mesh_dir = None
+        # Identity of the manipulated object, shipped with the GT stream so a recording can
+        # be checked against the mesh sitting next to it.
+        self.object_name = None
         self._gt_box_body_id = None
         self._gt_ref_body_id = None
         # Lazily built in get_gt_state(): maps MuJoCo joint-velocity dof addresses to the
@@ -306,9 +309,11 @@ class DefaultEnv:
         quat = object_config["quat"]  # (w, x, y, z)
 
         vis_name = f"{OBJECT_BODY_NAME}_visual"
-        mesh_el = ET.SubElement(asset, "mesh")
-        mesh_el.set("name", vis_name)
-        mesh_el.set("file", str((asset_dir / meta["visual_mesh"]).resolve()))
+        visual_parts = meta.get("visual_parts")
+        if not visual_parts:
+            mesh_el = ET.SubElement(asset, "mesh")
+            mesh_el.set("name", vis_name)
+            mesh_el.set("file", str((asset_dir / meta["visual_mesh"]).resolve()))
         for i, fname in enumerate(meta["collision_meshes"]):
             m = ET.SubElement(asset, "mesh")
             m.set("name", f"{OBJECT_BODY_NAME}_col_{i}")
@@ -339,13 +344,30 @@ class DefaultEnv:
                 if object_config.get(key) is not None:
                     geom.set(key, str(object_config[key]))
 
-        visual = ET.SubElement(body, "geom")
-        visual.set("type", "mesh")
-        visual.set("mesh", vis_name)
-        visual.set("contype", "0")
-        visual.set("conaffinity", "0")
-        visual.set("mass", "0")
-        visual.set("rgba", object_config.get("rgba", "0.75 0.6 0.4 1"))
+        # ``visual_parts`` (make_primitive_asset.py) renders one colored geom per part, so
+        # graspable features — handles, rim, rails — read as distinct in the ego view. Assets
+        # without it fall back to the single combined visual mesh.
+        if visual_parts:
+            for i, part in enumerate(visual_parts):
+                name = f"{vis_name}_{i}"
+                m = ET.SubElement(asset, "mesh")
+                m.set("name", name)
+                m.set("file", str((asset_dir / part["mesh"]).resolve()))
+                geom = ET.SubElement(body, "geom")
+                geom.set("type", "mesh")
+                geom.set("mesh", name)
+                geom.set("contype", "0")
+                geom.set("conaffinity", "0")
+                geom.set("mass", "0")
+                geom.set("rgba", part.get("rgba", "0.75 0.6 0.4 1"))
+        else:
+            visual = ET.SubElement(body, "geom")
+            visual.set("type", "mesh")
+            visual.set("mesh", vis_name)
+            visual.set("contype", "0")
+            visual.set("conaffinity", "0")
+            visual.set("mass", "0")
+            visual.set("rgba", object_config.get("rgba", "0.75 0.6 0.4 1"))
 
     def _inject_scene_objects(
         self, xml_path: str, object_config: dict | None, table_config: dict | None
@@ -407,14 +429,17 @@ class DefaultEnv:
                 hi = np.asarray(object_config["meta"]["bbox_max"], dtype=float)
                 self.box_half_extents = ((hi - lo) / 2.0).tolist()
                 self.object_mesh_dir = str(Path(object_config["asset_dir"]).resolve())
+                self.object_name = object_config.get("name")
             else:
                 self.box_half_extents = [float(s) for s in object_config["size"]]
+                self.object_name = "held_box" if object_config.get("held") else "box"
 
         if self.render_depth_seg:
             self._setup_foundation_pose(object_config)
 
         self._setup_held_box(object_config)
         self._setup_object_reset(object_config)
+        self._warn_on_spawn_overlap(object_config)
 
         self.joint_class_map = self._get_dof_indices_by_class()
 
@@ -717,6 +742,34 @@ class DefaultEnv:
         # mj_resetData land the object in the same place (the box body carries no quat).
         quat = object_config.get("quat", (1.0, 0.0, 0.0, 0.0))
         self.box_spawn_pose = np.array([*object_config["pos"], *quat])
+
+    def _warn_on_spawn_overlap(self, object_config: dict | None):
+        """Warn if the object spawns interpenetrating the robot's reset pose.
+
+        The reset pose (qpos0, which '0' also restores) holds both forearms out in front at
+        z ~ 0.89, so an object tall enough to reach that band is spawned inside the hands and
+        is flung off the table on the first step — silently, long before the operator sees it.
+        Cheap to check here and it catches the whole class for any future asset.
+        """
+        if not object_config or object_config.get("held"):
+            return
+        mujoco.mj_forward(self.mj_model, self.mj_data)
+        obj_body = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, OBJECT_BODY_NAME)
+        hits = set()
+        for c in self.mj_data.contact[: self.mj_data.ncon]:
+            bodies = [self.mj_model.geom_bodyid[c.geom1], self.mj_model.geom_bodyid[c.geom2]]
+            if obj_body not in bodies:
+                continue
+            other = bodies[1] if bodies[0] == obj_body else bodies[0]
+            name = mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, other)
+            if name not in (None, "world", "table"):
+                hits.add(name)
+        if hits:
+            print(
+                f"[Sim] WARNING: the object spawns in contact with the robot ({sorted(hits)}). "
+                "It will be pushed off its spawn pose on the first step — move it with "
+                "--object-pos, or lower the surface with --table-height."
+            )
 
     def reset_object(self):
         """Teleport the free object back to its spawn pose (robot state untouched)."""
@@ -1432,6 +1485,7 @@ class BaseSimulator:
             # Staged asset dir for a mesh object (None for the primitive box): tells the
             # recorder to copy the real mesh instead of synthesizing a cube for replay.
             "object_mesh_dir": self.sim_env.object_mesh_dir,
+            "object_name": self.sim_env.object_name,
             "timestamp": time.time(),
         }
         try:

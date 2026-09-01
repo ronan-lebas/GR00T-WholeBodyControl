@@ -49,12 +49,15 @@ BOX_SOLIMP = "0.95 0.99 0.001 0.5 2"   # harder impedance near contact; reduces 
 
 TABLE_TOP_THICKNESS = 0.02  # tabletop half-thickness in meters
 
-# Chair task (--chair): a mesh object staged by scripts/prepare_object_asset.py from an
-# IKEA_interface download, spawned free-standing on the floor in front of the robot.
-CHAIR_POS_X = 0.55            # spawn distance in front of the robot, meters
-CHAIR_YAW = math.pi / 2       # backrest toward the robot for the SANDSBERG asset (see --chair-yaw)
-CHAIR_MASS = 0.2              # kg — deliberately light; the recording needs no physical mass
-CHAIR_FLOOR_CLEARANCE = 0.005  # spawn gap above the floor so it settles instead of interpenetrating
+# Mesh object (--object-asset): a staged asset dir (prepare_object_asset.py from an
+# IKEA_interface download, or make_primitive_asset.py for the built-in bimanual objects),
+# spawned free on the floor, or on the tabletop when combined with --table.
+OBJECT_POS_X = 0.55            # floor spawn distance in front of the robot, meters
+OBJECT_YAW = math.pi / 2       # fallback only: turns the SANDSBERG chair's backrest toward the
+                               # robot. Staged IKEA assets carry no spawn_yaw and rely on it; the
+                               # make_primitive_asset.py objects set their own (0 = long axis +x).
+OBJECT_MASS = 0.2              # kg — deliberately light; the recording needs no physical mass
+OBJECT_SURFACE_CLEARANCE = 0.005  # spawn gap above the surface so it settles, not interpenetrates
 
 # Held-box parameters live in this shared YAML (single source of truth, also read
 # by generate_hold_box_quest.py and iter_reset_pose.py). See load_held_box_params().
@@ -67,15 +70,25 @@ def load_held_box_params() -> dict:
         return yaml.safe_load(f)
 
 
-def build_chair_config(config: "ArgsConfig") -> dict:
-    """Build the mesh ``object_config`` for --chair from the staged asset dir."""
-    asset_dir = Path(config.chair_asset)
+def assert_fits_on_table(config: "ArgsConfig", pos, half_extents) -> None:
+    """Fail early if the object's footprint hangs off the tabletop."""
+    hx, hy = config.table_top_size
+    assert (
+        abs(pos[0] - config.table_pos[0]) + half_extents[0] <= hx
+        and abs(pos[1] - config.table_pos[1]) + half_extents[1] <= hy
+    ), f"object footprint at {tuple(pos)} does not fit on the tabletop"
+
+
+def build_mesh_object_config(config: "ArgsConfig") -> dict:
+    """Build the mesh ``object_config`` for --object-asset from the staged asset dir."""
+    asset_dir = Path(config.object_asset)
     if not asset_dir.is_absolute():
         asset_dir = Path(__file__).resolve().parents[2] / asset_dir
     meta_path = asset_dir / "object.json"
     if not meta_path.exists():
         raise FileNotFoundError(
-            f"{meta_path} not found — stage a chair first, e.g.\n"
+            f"{meta_path} not found — stage the asset first, e.g.\n"
+            "  python gear_sonic/scripts/make_primitive_asset.py handled_box\n"
             "  python gear_sonic/scripts/prepare_object_asset.py "
             "<IKEA_interface>/ikea_assets/SANDSBERG_10605424 --out data/objects/chair"
         )
@@ -83,25 +96,46 @@ def build_chair_config(config: "ArgsConfig") -> dict:
 
     # Precedence: CLI flag > per-asset default in object.json (spawn_yaw / spawn_pos /
     # spawn_mass, e.g. written by preview_chair_assets.py) > the constants above.
-    if config.chair_yaw is not None:
-        yaw = config.chair_yaw
+    if config.object_yaw is not None:
+        yaw = config.object_yaw
     else:
-        yaw = float(meta.get("spawn_yaw", CHAIR_YAW))
-    if config.chair_pos:
-        pos = tuple(config.chair_pos)
+        yaw = float(meta.get("spawn_yaw", OBJECT_YAW))
+    if config.object_mass is not None:
+        mass = config.object_mass
+    else:
+        mass = float(meta.get("spawn_mass", OBJECT_MASS))
+
+    lo = [float(v) for v in meta["bbox_min"]]
+    hi = [float(v) for v in meta["bbox_max"]]
+    half_extents = [(hi_i - lo_i) / 2.0 for lo_i, hi_i in zip(lo, hi)]
+    # The yaw only ever spins the object about z, so a quarter turn swaps its x/y footprint.
+    rotated = abs(math.cos(yaw)) < abs(math.sin(yaw))
+    footprint = (half_extents[1], half_extents[0]) if rotated else (half_extents[0], half_extents[1])
+    if config.object_pos:
+        pos = tuple(config.object_pos)
     elif meta.get("spawn_pos"):
         pos = tuple(float(v) for v in meta["spawn_pos"])
     else:
-        # z places the mesh's lowest collision point just above the floor, whatever the
+        # z places the mesh's lowest collision point just above the surface, whatever the
         # asset's own origin height is.
-        pos = (CHAIR_POS_X, 0.0, -float(meta["z_min"]) + CHAIR_FLOOR_CLEARANCE)
-    if config.chair_mass is not None:
-        mass = config.chair_mass
-    else:
-        mass = float(meta.get("spawn_mass", CHAIR_MASS))
+        surface = config.table_height if config.table else 0.0
+        z = surface - float(meta["z_min"]) + OBJECT_SURFACE_CLEARANCE
+        if config.table:
+            # Same "slightly toward the robot" spawn as the cube, but clamped so a long
+            # object (the 0.5 m bar) can't be placed hanging off the table edge.
+            reach_x = config.table_pos[0] - 0.1
+            margin = config.table_top_size[0] - footprint[0]
+            x = min(max(reach_x, config.table_pos[0] - margin), config.table_pos[0] + margin)
+            pos = (x, config.table_pos[1], z)
+        else:
+            pos = (OBJECT_POS_X, 0.0, z)
+
+    if config.table:
+        assert_fits_on_table(config, pos, footprint)
 
     return {
         "kind": "mesh",
+        "name": meta.get("name", asset_dir.name),
         "asset_dir": str(asset_dir),
         "meta": meta,
         "pos": pos,
@@ -142,9 +176,9 @@ def main(config: ArgsConfig):
     if config.dump_scene:
         wbc_config["dump_scene"] = config.dump_scene
 
-    assert not (config.chair and (config.box or config.held_box or config.table)), (
-        "--chair is its own scene (chair on the floor); it cannot be combined with "
-        "--box/--held-box/--table"
+    assert not (config.object_asset and (config.box or config.held_box)), (
+        "--object-asset spawns the manipulated object itself; it cannot be combined with "
+        "--box/--held-box (there is only ever one object)"
     )
 
     if config.table:
@@ -183,11 +217,7 @@ def main(config: ArgsConfig):
                         config.table_pos[1],
                         config.table_height + box_size[2] + 0.005,
                     )
-                hx, hy = config.table_top_size
-                assert (
-                    abs(box_pos[0] - config.table_pos[0]) + box_size[0] <= hx
-                    and abs(box_pos[1] - config.table_pos[1]) + box_size[1] <= hy
-                ), f"box footprint at {box_pos} does not fit on the tabletop"
+                assert_fits_on_table(config, box_pos, box_size)
                 box_mass = TABLE_BOX_MASS
             else:
                 box_size = tuple(config.box_size) if config.box_size else BOX_SIZE
@@ -204,8 +234,8 @@ def main(config: ArgsConfig):
                 "solimp": BOX_SOLIMP,
             }
 
-    if config.chair:
-        wbc_config["object_config"] = build_chair_config(config)
+    if config.object_asset:
+        wbc_config["object_config"] = build_mesh_object_config(config)
 
     if config.scene_reset:
         wbc_config["scene_reset_config"] = {
@@ -214,9 +244,10 @@ def main(config: ArgsConfig):
         }
 
     if config.record_box_gt:
-        assert (
-            spawn_box or config.chair
-        ), "record_box_gt requires --box, --held-box or --chair (there must be an object to track)"
+        assert spawn_box or config.object_asset, (
+            "record_box_gt requires --box, --held-box or --object-asset "
+            "(there must be an object to track)"
+        )
         wbc_config["record_box_gt"] = True
         wbc_config["box_gt_port"] = config.box_gt_port
 

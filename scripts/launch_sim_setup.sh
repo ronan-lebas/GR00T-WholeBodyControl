@@ -5,7 +5,7 @@
 # spawns the manipulation scene selected by --task in front of the (static-base)
 # robot and publishes the ego view on ZMQ 5555 exactly like the robot's camera server.
 #
-#   --task tabletop   (default) static table + graspable cube
+#   --task tabletop   (default) static table + a graspable object (see --object)
 #   --task chair      a chair (mesh asset) standing on the floor, to lift and reorient
 #
 # Default (no args) starts everything at once in one tmux window split into tiled
@@ -47,6 +47,14 @@
 #   --task NAME    tabletop (default) or chair; selects the scene the sim spawns and the
 #                  recorded task prompt. The chair asset must be staged first, see
 #                  gear_sonic/scripts/prepare_object_asset.py.
+#   --object NAME  (--task tabletop) what sits on the table: cube (default, the original 5 cm
+#                  cube) or one of the bimanual objects — plate (0.40 m board on rails), bar
+#                  (0.50 m square bar with end caps), handled-box (0.30x0.20x0.15 crate with
+#                  side handles and a top rim). All three are too long or too wide for one
+#                  hand, which is the point: they force coordinated two-hand manipulation.
+#                  Long axis is +x (away from the robot); SIM_EXTRA='--object-yaw 1.5708'
+#                  lays the plate/bar left-right instead. Missing assets are generated on the
+#                  spot by gear_sonic/scripts/make_primitive_asset.py.
 #   --chair-asset DIR  (--task chair) staged asset dir to spawn, default data/objects/chair.
 #                  Any staged chair works — compare candidates next to the robot with
 #                  gear_sonic/scripts/preview_chair_assets.py.
@@ -71,14 +79,23 @@ IMAGE_FPS="${IMAGE_FPS:-30}"                   # ego-view image relay cap (Quest
 # container can route to — the same host-IP target the deploy container uses. Auto-
 # detected from this host's primary IP when empty; override if auto-detection is wrong.
 CAMERA_RELAY_HOST="${CAMERA_RELAY_HOST:-}"
-TASK="${TASK:-tabletop}"                       # tabletop = table + graspable cube; chair = chair on the floor
+TASK="${TASK:-tabletop}"                       # tabletop = table + graspable object; chair = chair on the floor
+OBJECT="${OBJECT:-cube}"                       # (tabletop) cube | plate | bar | handled-box
 CHAIR_ASSET="${CHAIR_ASSET:-$REPO/data/objects/chair}"  # staged by prepare_object_asset.py
+OBJECT_ASSET_DIR="${OBJECT_ASSET_DIR:-$REPO/data/objects}"  # where the --object assets are staged
+# Tabletop height in meters, passed to the sim only when set. Left empty for short objects so
+# run_sim_loop.py's own 0.74 default applies; the per-object block below lowers it for an object
+# tall enough to foul the robot's reset pose (both forearms are extended forward at z ~ 0.89, so
+# anything reaching that band is spawned inside the hands and flung off the table).
+TABLE_HEIGHT="${TABLE_HEIGHT:-}"
 # Defaults below depend on TASK and are resolved after argument parsing.
 TASK_PROMPT="${TASK_PROMPT:-}"
 RENDER_DEPTH_SEG="${RENDER_DEPTH_SEG:-}"      # 1 = publish ego depth + box seg (FoundationPose).
-                                              # Default: 1 for tabletop (records FoundationPose-ready
-                                              # RGB-D + box mask), 0 for chair (the depth/seg path is
-                                              # box-only). Set explicitly to override.
+                                              # Default: 1 for the tabletop cube (records
+                                              # FoundationPose-ready RGB-D + box mask), 0 for every
+                                              # mesh object (chair, plate, bar, handled-box) since
+                                              # the depth/seg path masks a single box geom. Set
+                                              # explicitly to override — but only the cube can be 1.
 RECORD_BOX_GT="${RECORD_BOX_GT:-1}"           # 1 = sim publishes the box's exact pose and the recorder
                                               # stores it (object_gt/*.parquet), in parallel to
                                               # FoundationPose. Sim-only ground truth for comparison /
@@ -100,7 +117,8 @@ DATA_VENV="${DATA_VENV:-$REPO/.venv_data_collection}"
 SESSION="${SESSION:-g1_sim}"                   # tmux session name
 
 # Config vars propagated into each tmux window (so exported overrides survive).
-CONFIG_VARS=(REPO CAMERA_PORT IMAGE_FPS CAMERA_RELAY_HOST TASK TASK_PROMPT CHAIR_ASSET RENDER_DEPTH_SEG \
+CONFIG_VARS=(REPO CAMERA_PORT IMAGE_FPS CAMERA_RELAY_HOST TASK OBJECT TASK_PROMPT CHAIR_ASSET \
+             OBJECT_ASSET_DIR TABLE_HEIGHT RENDER_DEPTH_SEG \
              RECORD_BOX_GT BOX_GT_PORT \
              SIM_EXTRA DEPLOY_ZMQ_HOST DEPLOY_EXTRA MANAGER_EXTRA REPLAY_QUEST SIM_VENV TELEOP_VENV \
              DATA_VENV SESSION)
@@ -127,6 +145,8 @@ while [ $# -gt 0 ]; do
         --task=*) TASK="${1#*=}" ;;
         --chair-asset) CHAIR_ASSET="${2:?--chair-asset needs a staged asset dir}"; shift ;;
         --chair-asset=*) CHAIR_ASSET="${1#*=}" ;;
+        --object) OBJECT="${2:?--object needs a value (cube|plate|bar|handled-box)}"; shift ;;
+        --object=*) OBJECT="${1#*=}" ;;
         *) POS+=("$1") ;;
     esac
     shift
@@ -138,20 +158,59 @@ if [ "$MOCK_QUEST" -eq 1 ] && [ -n "$REPLAY_QUEST" ]; then
     exit 2
 fi
 
+# OBJECT_ASSET is set for every scene whose object is a staged mesh (everything but the cube);
+# empty means the sim spawns the primitive box instead.
+OBJECT_ASSET=""
 case "$TASK" in
     tabletop)
-        TASK_PROMPT="${TASK_PROMPT:-pick up the box}"
-        RENDER_DEPTH_SEG="${RENDER_DEPTH_SEG:-1}"
+        case "$OBJECT" in
+            cube)
+                TASK_PROMPT="${TASK_PROMPT:-pick up the box}"
+                RENDER_DEPTH_SEG="${RENDER_DEPTH_SEG:-1}"
+                ;;
+            plate)
+                TASK_PROMPT="${TASK_PROMPT:-pick up the plate with both hands}"
+                OBJECT_ASSET="$OBJECT_ASSET_DIR/plate"
+                ;;
+            bar)
+                TASK_PROMPT="${TASK_PROMPT:-pick up the bar with both hands}"
+                OBJECT_ASSET="$OBJECT_ASSET_DIR/bar"
+                ;;
+            handled-box|handled_box)
+                TASK_PROMPT="${TASK_PROMPT:-lift the box by its handles}"
+                OBJECT_ASSET="$OBJECT_ASSET_DIR/handled_box"
+                # 18 cm tall: on the standard 0.74 table its top would sit inside the robot's
+                # reset-pose hands. A 0.58 table keeps it a comfortable reach below them.
+                TABLE_HEIGHT="${TABLE_HEIGHT:-0.58}"
+                ;;
+            *)
+                echo "ERROR: unknown --object '$OBJECT' (expected cube, plate, bar or handled-box)." >&2
+                exit 2
+                ;;
+        esac
         ;;
     chair)
+        if [ "$OBJECT" != "cube" ]; then
+            echo "ERROR: --object applies to --task tabletop; --task chair spawns the chair asset." >&2
+            exit 2
+        fi
         TASK_PROMPT="${TASK_PROMPT:-lift and turn the chair}"
-        RENDER_DEPTH_SEG="${RENDER_DEPTH_SEG:-0}"
+        OBJECT_ASSET="$CHAIR_ASSET"
         ;;
     *)
         echo "ERROR: unknown --task '$TASK' (expected tabletop or chair)." >&2
         exit 2
         ;;
 esac
+
+# The depth/seg export masks one box geom, so it only exists for the primitive cube. Refuse an
+# explicit 1 rather than silently letting the sim disable it mid-run.
+RENDER_DEPTH_SEG="${RENDER_DEPTH_SEG:-0}"
+if [ -n "$OBJECT_ASSET" ] && [ "$RENDER_DEPTH_SEG" -eq 1 ]; then
+    echo "ERROR: RENDER_DEPTH_SEG=1 needs the primitive cube (--task tabletop --object cube);" >&2
+    echo "  the ego depth/segmentation path masks a single box geom, not a mesh object." >&2
+    exit 2
+fi
 
 # emit <cmd...>: print the shell-quoted command, then run it unless --print.
 emit() {
@@ -205,16 +264,25 @@ run_single() {
         sim)
             # --detach-gantry: start with the robot released from the virtual gantry
             # (same as pressing '9' in the viewer), so it stands on the policy alone.
-            if [ "$TASK" = "chair" ]; then
-                if [ ! -f "$CHAIR_ASSET/object.json" ]; then
-                    echo "ERROR: no staged chair at $CHAIR_ASSET (missing object.json)." >&2
-                    echo "  python gear_sonic/scripts/prepare_object_asset.py <ikea_assets>/<CHAIR> --out $CHAIR_ASSET" >&2
+            if [ -n "$OBJECT_ASSET" ] && [ ! -f "$OBJECT_ASSET/object.json" ]; then
+                if [ "$TASK" = "chair" ]; then
+                    echo "ERROR: no staged chair at $OBJECT_ASSET (missing object.json)." >&2
+                    echo "  python gear_sonic/scripts/prepare_object_asset.py <ikea_assets>/<CHAIR> --out $OBJECT_ASSET" >&2
                     exit 2
                 fi
-                sim_args=(--chair --chair-asset "$CHAIR_ASSET")
+                # The --object shapes are deterministic built-ins, so stage them on demand
+                # rather than making the user run a separate command first.
+                echo "# [sim] staging $OBJECT asset -> $OBJECT_ASSET"
+                emit "$SIM_VENV/bin/python" "$REPO/gear_sonic/scripts/make_primitive_asset.py" \
+                    "$(basename "$OBJECT_ASSET")" --out "$OBJECT_ASSET" --force
+            fi
+            if [ -n "$OBJECT_ASSET" ]; then
+                sim_args=(--object-asset "$OBJECT_ASSET")
+                [ "$TASK" = "tabletop" ] && sim_args+=(--table)
             else
                 sim_args=(--table --box)
             fi
+            [ -n "$TABLE_HEIGHT" ] && sim_args+=(--table-height "$TABLE_HEIGHT")
             sim_args+=(--detach-gantry --enable-image-publish --enable-offscreen
                        --camera-port "$CAMERA_PORT")
             [ "$RENDER_DEPTH_SEG" -eq 1 ] && sim_args+=(--render-depth-seg)
@@ -393,20 +461,26 @@ launch_tmux() {
 
 usage() {
     cat >&2 <<EOF
-Usage: $0 [all|sim|deploy|relay|manager|recorder|viewer|mock|teardown|kill] [--task tabletop|chair] [--chair-asset DIR] [--mock-quest] [--replay-quest [npz]] [--print]
+Usage: $0 [all|sim|deploy|relay|manager|recorder|viewer|mock|teardown|kill] [--task tabletop|chair] [--object cube|plate|bar|handled-box] [--chair-asset DIR] [--mock-quest] [--replay-quest [npz]] [--print]
 
 Sim manipulation stack (no robot — everything on this machine):
   (no args)  start sim + deploy + relay + manager + recorder + viewer (+ teardown) as tiled panes
   all        same as no args
-  --task NAME   manipulation scene: 'tabletop' (default, table + graspable cube) or 'chair'
+  --task NAME   manipulation scene: 'tabletop' (default, table + graspable object) or 'chair'
                 (chair standing on the floor, to lift and reorient). Also sets the recorded
                 task prompt and the depth/seg default. Applies to single-component mode too.
+  --object NAME (--task tabletop) object on the table: 'cube' (default, 5 cm cube) or one of the
+                bimanual objects — 'plate' (0.40 m board on rails), 'bar' (0.50 m square bar with
+                end caps), 'handled-box' (0.30x0.20x0.15 crate, side handles + top rim). Each is
+                too large for one hand, so it forces two-hand coordination. Long axis is +x;
+                SIM_EXTRA='--object-yaw 1.5708' lays the plate/bar left-right. Assets are staged
+                on demand into $OBJECT_ASSET_DIR.
   --chair-asset DIR  staged chair asset to spawn (default $CHAIR_ASSET); preview candidates
                 with gear_sonic/scripts/preview_chair_assets.py
   --mock-quest  (with all/no-args) swap relay+manager for mock_quest_streamer
   --replay-quest [npz]  (with all/no-args) manager replays the NPZ (default:
                 data/quest/traj_20260605_182839_000.npz), relay pane dropped
-  sim        MuJoCo sim: --task scene + ego-view publisher on ZMQ $CAMERA_PORT — single, foreground
+  sim        MuJoCo sim: --task/--object scene + ego-view publisher on ZMQ $CAMERA_PORT — single, foreground
   deploy     docker/run-ros2-dev.sh container; inside, sources setup_env.sh and runs
              './deploy.sh sim --input-type zmq_manager --zmq-host $DEPLOY_ZMQ_HOST --yes' (auto-typed in tmux)
   relay      Quest relay (TCP 10000 + ZMQ 5559) + ego-view image relay    — single, foreground
@@ -422,7 +496,8 @@ Recording writes, with RECORD_BOX_GT=1, the sim's exact object pose to object_gt
 Replay a recording with
 'python gear_sonic/scripts/visualize_robot_object_trajectory.py [--ground-truth]'.
 
-Resolved config: TASK=$TASK  CAMERA_PORT=$CAMERA_PORT  RENDER_DEPTH_SEG=$RENDER_DEPTH_SEG  RECORD_BOX_GT=$RECORD_BOX_GT
+Resolved config: TASK=$TASK  OBJECT=$OBJECT  CAMERA_PORT=$CAMERA_PORT  RENDER_DEPTH_SEG=$RENDER_DEPTH_SEG  RECORD_BOX_GT=$RECORD_BOX_GT
+                 OBJECT_ASSET='$OBJECT_ASSET'  TABLE_HEIGHT='$TABLE_HEIGHT'  TASK_PROMPT='$TASK_PROMPT'
                  MANAGER_EXTRA='$MANAGER_EXTRA'  SIM_EXTRA='$SIM_EXTRA'  SESSION=$SESSION
 Point the Quest Unity app at THIS machine's Wi-Fi/LAN IP : 10000.
 Override any config via env vars (see the config block at the top of this file).

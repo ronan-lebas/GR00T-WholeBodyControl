@@ -3,7 +3,7 @@
 ``IKEA_interface`` (https://github.com/leggedrobotics/IKEA_interface) downloads an IKEA product
 and emits a single-link URDF plus ``visual.stl`` and CoACD convex ``collision_*.stl`` (meters,
 Z-up, resting on z=0). This script repackages one such directory into the self-contained layout
-``run_sim_loop.py --chair`` expects::
+``run_sim_loop.py --object-asset`` expects::
 
     <out>/visual.obj              # visual.stl re-exported as OBJ (the replay visualizer loads
                                   # a single .obj, so OBJ keeps sim and replay on one mesh)
@@ -15,7 +15,7 @@ parsing and gives one inspectable directory that both the sim and the offline re
 tooling point at.
 
 Note: the IKEA API no longer returns product weights, so every generated URDF carries a bogus
-5.0 kg. ``mass`` is kept in the metadata for reference only — the sim overrides it (``--chair-mass``
+5.0 kg. ``mass`` is kept in the metadata for reference only — the sim overrides it (``--object-mass``
 / ``CHAIR_MASS``) and rescales the inertia tensor accordingly.
 
 Usage (needs gear_sonic[sim] — trimesh):

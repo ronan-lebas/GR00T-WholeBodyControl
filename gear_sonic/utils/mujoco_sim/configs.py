@@ -401,30 +401,30 @@ class SimLoopConfig(BaseConfig):
     """Explicit box half-extents override (x, y, z). Default: tabletop cube with --table,
     else the floor-box constant in run_sim_loop.py."""
 
-    chair: bool = False
-    """Spawn a chair (mesh object) on the floor in front of the robot instead of the
-    table+box tabletop scene. Mutually exclusive with --box/--held-box/--table."""
+    object_asset: Optional[str] = None
+    """Spawn a staged mesh object (visual.obj + collision_*.stl + object.json) from this
+    directory instead of the primitive box; mutually exclusive with --box/--held-box, and
+    combinable with --table (tabletop) or used alone (object on the floor). Relative paths are
+    resolved against the repo root. Assets come from scripts/prepare_object_asset.py (an
+    IKEA_interface download, e.g. data/objects/chair) or scripts/make_primitive_asset.py (the
+    built-in bimanual objects: data/objects/{plate,bar,handled_box}). Compare candidates
+    against the robot with scripts/preview_chair_assets.py."""
 
-    chair_asset: str = "data/objects/chair"
-    """Staged chair asset directory (as produced by scripts/prepare_object_asset.py from an
-    IKEA_interface download): visual.obj + collision_*.stl + object.json. Relative paths are
-    resolved against the repo root. Any staged dir works — compare candidates against the
-    robot with scripts/preview_chair_assets.py."""
+    object_pos: Optional[tuple[float, float, float]] = None
+    """Mesh-object spawn position override (x, y, z) in meters. Default: the asset's
+    ``spawn_pos`` in object.json, else a spawn on the tabletop (with --table) or on the floor,
+    with z placing the object's lowest collision point just above the surface."""
 
-    chair_pos: Optional[tuple[float, float, float]] = None
-    """Chair spawn position override (x, y, z) in meters. Default: the asset's ``spawn_pos``
-    in object.json, else (CHAIR_POS_X, 0, z) with z placing the chair's lowest collision point
-    5 mm above the floor."""
+    object_yaw: Optional[float] = None
+    """Mesh-object spawn yaw in radians about +z. Default: the asset's ``spawn_yaw`` in
+    object.json (written by preview_chair_assets.py with 'w'), else OBJECT_YAW. The right yaw
+    is per-asset — e.g. pi/2 turns the shipped SANDSBERG chair's backrest toward the robot,
+    and lays the plate/bar left-right instead of front-back."""
 
-    chair_yaw: Optional[float] = None
-    """Chair spawn yaw in radians about +z. Default: the asset's ``spawn_yaw`` in object.json
-    (written by preview_chair_assets.py with 'w'), else CHAIR_YAW — which turns the backrest
-    toward the robot for the shipped SANDSBERG asset only; the right yaw is per-asset."""
-
-    chair_mass: Optional[float] = None
-    """Chair mass in kg. Default: the asset's ``spawn_mass`` in object.json, else CHAIR_MASS in
-    run_sim_loop.py. Deliberately light — the recordings don't need a physical mass, and IKEA's
-    API reports a bogus constant anyway."""
+    object_mass: Optional[float] = None
+    """Mesh-object mass in kg. Default: the asset's ``spawn_mass`` in object.json, else
+    OBJECT_MASS in run_sim_loop.py. Deliberately light — the recordings don't need a physical
+    mass, and IKEA's API reports a bogus constant anyway."""
 
     dump_scene: Optional[str] = None
     """Write the fully injected scene XML to this path at startup (debugging aid; open it with

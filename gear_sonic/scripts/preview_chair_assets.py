@@ -1,8 +1,9 @@
-"""Side-by-side previewer for chair assets: the G1 standing next to a candidate chair.
+"""Side-by-side previewer for staged object assets: the G1 standing next to a candidate.
 
-Loads the robot scene plus every candidate asset, spawned exactly where ``run_sim_loop.py
---chair`` would put it, and lets you cycle assets / spin them in place from the keyboard so
-you can judge size and grasp affordance against the real robot.
+Loads the robot scene plus every candidate asset, spawned on the floor exactly where
+``run_sim_loop.py --object-asset`` would put it, and lets you cycle assets / spin them in place
+from the keyboard so you can judge size and grasp affordance against the real robot. Works on
+any staged asset — IKEA chairs and the make_primitive_asset.py bimanual objects alike.
 
     python gear_sonic/scripts/preview_chair_assets.py                    # everything staged
     python gear_sonic/scripts/preview_chair_assets.py /scratch/rlebas1/IKEA_interface/ikea_assets
@@ -20,6 +21,7 @@ Keys (viewer window):
 The staged dir of the asset you settle on goes straight into the stack:
 
     CHAIR_ASSET=data/objects/<name> ./scripts/launch_sim_setup.sh --task chair
+    ./scripts/launch_sim_setup.sh --task tabletop --object <plate|bar|handled-box>
 """
 
 import argparse
@@ -36,7 +38,7 @@ import mujoco.viewer
 import numpy as np
 
 from gear_sonic.scripts.prepare_object_asset import prepare
-from gear_sonic.scripts.run_sim_loop import CHAIR_FLOOR_CLEARANCE, CHAIR_POS_X, CHAIR_YAW
+from gear_sonic.scripts.run_sim_loop import OBJECT_POS_X, OBJECT_SURFACE_CLEARANCE, OBJECT_YAW
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SCENE = REPO_ROOT / "gear_sonic/data/robot_model/model_data/g1/with_brainco/scene_41dof.xml"
@@ -102,13 +104,13 @@ def resolve_assets(paths: list[Path]) -> list[Path]:
 
 
 def spawn_pose(meta: dict) -> tuple[tuple[float, float, float], float]:
-    """The (pos, yaw) run_sim_loop.py --chair would use for this asset."""
+    """The (pos, yaw) run_sim_loop.py would use on the floor for this asset."""
     pos = meta.get("spawn_pos") or (
-        CHAIR_POS_X,
+        OBJECT_POS_X,
         0.0,
-        -float(meta["z_min"]) + CHAIR_FLOOR_CLEARANCE,
+        -float(meta["z_min"]) + OBJECT_SURFACE_CLEARANCE,
     )
-    yaw = meta.get("spawn_yaw", CHAIR_YAW)
+    yaw = meta.get("spawn_yaw", OBJECT_YAW)
     return tuple(float(v) for v in pos), float(yaw)
 
 
@@ -248,7 +250,7 @@ class Previewer:
             viewer.cam.azimuth = 135
             viewer.cam.elevation = -15
             viewer.cam.distance = 3.5
-            viewer.cam.lookat[:] = (CHAIR_POS_X / 2, 0.0, 0.7)
+            viewer.cam.lookat[:] = (OBJECT_POS_X / 2, 0.0, 0.7)
             while viewer.is_running():
                 viewer.sync()
                 time.sleep(1.0 / 60.0)
