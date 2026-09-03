@@ -219,6 +219,8 @@ models/
 # Downloaded from HuggingFace (hf download)
 sample_data/
 sonic_release/
+low_latency/
+sonic_v1_1/
 
 
 third_party/Revo_xml
