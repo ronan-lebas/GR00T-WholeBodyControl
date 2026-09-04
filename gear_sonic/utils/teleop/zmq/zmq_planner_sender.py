@@ -28,7 +28,11 @@ def _build_header(fields: list, version: int = 1, count: int = 1) -> bytes:
 
 
 def build_command_message(
-    start: bool, stop: bool, planner: bool, delta_heading: float | None = None
+    start: bool,
+    stop: bool,
+    planner: bool,
+    delta_heading: float | None = None,
+    reanchor: bool = False,
 ) -> bytes:
     """
     Assemble a 'command' topic message:
@@ -36,6 +40,8 @@ def build_command_message(
       - stop: u8 (1=stop control)
       - planner: u8 (1=planner mode, 0=streamed motion)
       - delta_heading: f32 (optional, yaw relative to heading command in radians)
+      - reanchor: u8 (optional, 1=re-anchor the planner context and heading state on
+        the robot's current base orientation; sent after a sim scene reset)
     Returns: bytes ready to send via socket.send()
     """
     fields = [
@@ -55,6 +61,10 @@ def build_command_message(
         # Append delta_heading field to header and payload
         fields.append({"name": "delta_heading", "dtype": "f32", "shape": [1]})
         payload += struct.pack("<f", float(delta_heading))
+
+    if reanchor:
+        fields.append({"name": "reanchor", "dtype": "u8", "shape": [1]})
+        payload += struct.pack("B", 1)
 
     header = _build_header(fields, version=1, count=1)
 

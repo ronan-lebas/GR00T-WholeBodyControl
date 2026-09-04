@@ -67,7 +67,11 @@ Keyboard:
     c          toggle data collection        x   toggle data abort
     - / =      crouch deeper / stand back up (trim added to the head-height crouch)
     b          reset the sim box to its spawn pose (between episodes)
-    0          FULL sim reset (recovery; robot snaps to default pose — pause first)
+    0          FULL sim reset (recovery; robot snaps to default pose — pause first).
+               A 'reanchor' command goes out right behind it, re-initializing the
+               deploy's planner and heading anchor on the post-reset pose, so the
+               policy holds the spawn heading instead of steering back to the
+               pre-reset one.
     q          stop policy and exit
     k          (replay) pause / resume playback
     <- / ->    (replay) step one frame back / forward
@@ -1034,6 +1038,9 @@ class QuestManager:
         # so a late-joining or briefly-stalled subscriber never misses one).
         self.reset_box_count = 0
         self.reset_sim_count = 0
+        # Set by '0'; consumed right after the manager_state publish that carries the
+        # reset, so the deploy re-anchors on the already-reset robot. See run().
+        self._reanchor_pending = False
 
         # Last commanded targets; reused while paused / blended on resume.
         self.frozen_pos: np.ndarray | None = None
@@ -1293,9 +1300,11 @@ class QuestManager:
             print("[QuestManager] Box reset sent (sim teleports the box back to spawn)")
         elif key == "0":
             self.reset_sim_count += 1
+            self._reanchor_pending = True
             print(
-                "[QuestManager] FULL SIM RESET sent — robot snaps to default pose; "
-                "pause teleop ('p') first for a clean recovery"
+                "[QuestManager] FULL SIM RESET sent — robot snaps to default pose and the "
+                "policy heading is re-anchored on it (pause teleop with 'p' first for a "
+                "clean recovery)"
             )
         elif key == "k" and self.source.is_replay:
             self.source.toggle_pause()
@@ -1306,6 +1315,24 @@ class QuestManager:
         return False, toggle_dc, toggle_da
 
     # -- per-loop helpers ---------------------------------------------------------
+
+    def _maybe_send_reanchor(self) -> None:
+        """Send the post-reset re-anchor command, after the reset it belongs to.
+
+        Call this right after the manager_state publish carrying the incremented
+        reset counter: one PUB socket delivers in order, so the sim has the reset
+        before the deploy has the re-anchor, and the deploy then re-initializes its
+        planner on the already-snapped robot.
+        """
+        if not self._reanchor_pending:
+            return
+        self._reanchor_pending = False
+        if self.phase == PHASE_OFF:
+            return
+        self.pub.send(
+            build_command_message(start=False, stop=False, planner=True, reanchor=True)
+        )
+        print("[QuestManager] Re-anchor sent — policy heading realigned with the reset pose")
 
     def _update_countdown(self, frame: dict | None) -> None:
         if self.pending_calib is None:
@@ -1533,6 +1560,7 @@ class QuestManager:
                         topic="manager_state",
                     )
                 )
+                self._maybe_send_reanchor()
 
                 now = time.time()
                 if now - last_report >= 5.0:

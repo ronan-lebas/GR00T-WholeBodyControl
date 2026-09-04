@@ -7,8 +7,9 @@
  *
  *   Topic      | Purpose
  *   -----------|--------
- *   command    | High-level control (start / stop / mode switch).
- *              | Wire format: `{ start: bool, stop: bool, planner: bool, delta_heading?: f32 }`
+ *   command    | High-level control (start / stop / mode switch / re-anchor).
+ *              | Wire format: `{ start: bool, stop: bool, planner: bool, delta_heading?: f32,
+ *              |                 reanchor?: bool }`
  *   planner    | Per-frame locomotion commands (mode, movement, facing, speed, height,
  *              | optional upper-body / hand / VR data).  Active in PLANNER mode.
  *   pose       | Streamed motion frames (joint_pos, joint_vel, body_quat, …).
@@ -167,6 +168,7 @@ class ZMQManager : public InputInterface {
       report_temperature_flag_ = false;
       start_control_ = false;
       stop_control_ = false;
+      reanchor_control_ = false;
       
       // Handle stdin shortcuts
       char ch;
@@ -241,6 +243,9 @@ class ZMQManager : public InputInterface {
           }
           if (latest_command_.stop) {
             stop_control_ = true;
+          }
+          if (latest_command_.reanchor) {
+            reanchor_control_ = true;
           }
 
           // Handle mode switching
@@ -528,6 +533,57 @@ class ZMQManager : public InputInterface {
         return;
       }
 
+      // Handle re-anchor request (sent by the teleop manager after a simulator
+      // scene reset).
+      if (reanchor_control_) {
+        reanchor_control_ = false;
+        if (!operator_state.start || !planner_state.enabled) {
+          std::cout << "[ZMQManager] Re-anchor ignored (control not started)" << std::endl;
+        } else {
+          {
+            std::lock_guard<std::mutex> lock(current_motion_mutex);
+            operator_state.play = false;
+            // Park on a snapshot of the current motion: planner_motion_ is emptied by
+            // the re-initialization below, and a zero-length current_motion stops the
+            // control loop.
+            auto temp_motion = std::make_shared<MotionSequence>(*current_motion);
+            temp_motion->name = "temporary_motion";
+            current_motion = temp_motion;
+            reinitialize_heading = true;
+          }
+          planner_state.initialized = false;
+          std::cout << "[ZMQManager] Re-anchoring planner and heading to the current robot pose"
+                    << std::endl;
+
+          // Wait for the planner to hand over a freshly generated motion. A timeout
+          // here is not fatal: the planner keeps retrying, and the robot holds the
+          // snapshot meanwhile.
+          bool switched = false;
+          auto wait_start = std::chrono::steady_clock::now();
+          constexpr auto PLANNER_INIT_TIMEOUT = std::chrono::seconds(5);
+          while (planner_state.enabled && !switched) {
+            {
+              std::lock_guard<std::mutex> lock(current_motion_mutex);
+              switched = (current_motion->name == "planner_motion");
+            }
+            if (switched) break;
+            if (std::chrono::steady_clock::now() - wait_start > PLANNER_INIT_TIMEOUT) {
+              std::cerr << "[ZMQManager] Planner re-anchor timed out after 5s — resuming on the "
+                           "previous motion" << std::endl;
+              break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+          }
+
+          {
+            std::lock_guard<std::mutex> lock(current_motion_mutex);
+            operator_state.play = true;
+          }
+          last_has_vr_3point_control_ = false;
+          std::cout << "[ZMQManager] Re-anchor " << (switched ? "done" : "incomplete") << std::endl;
+        }
+      }
+
       // Handle start control
       if (start_control_ && !operator_state.start) {
         operator_state.start = true;
@@ -679,11 +735,12 @@ class ZMQManager : public InputInterface {
       
       if (hdr.fields.empty() || bufs.empty()) return;
       
-      int start_idx = -1, stop_idx = -1, planner_idx = -1;
+      int start_idx = -1, stop_idx = -1, planner_idx = -1, reanchor_idx = -1;
       for (size_t i = 0; i < hdr.fields.size(); ++i) {
         if (hdr.fields[i].name == "start") start_idx = static_cast<int>(i);
         else if (hdr.fields[i].name == "stop") stop_idx = static_cast<int>(i);
         else if (hdr.fields[i].name == "planner") planner_idx = static_cast<int>(i);
+        else if (hdr.fields[i].name == "reanchor") reanchor_idx = static_cast<int>(i);
       }
       
       if (start_idx < 0 || stop_idx < 0 || planner_idx < 0) {
@@ -750,6 +807,26 @@ class ZMQManager : public InputInterface {
         }
       }
       
+      // Decode reanchor (optional field: absent in messages from older senders)
+      if (reanchor_idx >= 0) {
+        const auto& reanchor_buf = bufs[reanchor_idx];
+        const auto& reanchor_field = hdr.fields[reanchor_idx];
+        if (reanchor_field.dtype == "bool" || reanchor_field.dtype == "u8") {
+          uint8_t val = 0;
+          if (reanchor_buf.size >= sizeof(uint8_t)) {
+            std::memcpy(&val, reanchor_buf.data, sizeof(uint8_t));
+            cmd.reanchor = (val != 0);
+          }
+        } else if (reanchor_field.dtype == "i32") {
+          int32_t val = 0;
+          if (reanchor_buf.size >= sizeof(int32_t)) {
+            std::memcpy(&val, reanchor_buf.data, sizeof(int32_t));
+            if (needs_swap) val = byte_swap(val);
+            cmd.reanchor = (val != 0);
+          }
+        }
+      }
+
       // Update buffer with OR logic to accumulate start/stop signals
       std::lock_guard<std::mutex> lock(command_mutex_);
       
@@ -757,11 +834,13 @@ class ZMQManager : public InputInterface {
       if (!latest_command_.valid) {
         latest_command_.start = false;
         latest_command_.stop = false;
+        latest_command_.reanchor = false;
       }
       
       // Accumulate start/stop with OR logic
       latest_command_.start = latest_command_.start || cmd.start;
       latest_command_.stop = latest_command_.stop || cmd.stop;
+      latest_command_.reanchor = latest_command_.reanchor || cmd.reanchor;
       latest_command_.planner = cmd.planner;  // Overwrite (mode should be latest)
       latest_command_.valid = true;
       
@@ -1247,6 +1326,7 @@ class ZMQManager : public InputInterface {
     bool report_temperature_flag_ = false;  ///< Set by 'F'/'f' keyboard shortcut.
     bool start_control_ = false;   ///< Start request from command message.
     bool stop_control_ = false;    ///< Stop request from command message.
+    bool reanchor_control_ = false;  ///< Re-anchor request from command message.
 
     /// True once the planner has been initialised and is generating motions.
     bool is_planner_ready_ = false;

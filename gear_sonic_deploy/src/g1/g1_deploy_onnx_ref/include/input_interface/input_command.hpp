@@ -29,11 +29,11 @@
  * @brief Wire format for the ZMQ "command" topic.
  *
  * Packed binary layout sent by the remote controller:
- *   { start: bool, stop: bool, planner: bool, delta_heading?: f32/f64 }
+ *   { start: bool, stop: bool, planner: bool, delta_heading?: f32/f64, reanchor?: bool }
  *
  * Multiple messages between two update() calls are accumulated using OR logic
- * for start/stop (so a transient pulse is never lost), while the planner flag
- * is overwritten with the latest value.
+ * for start/stop/reanchor (so a transient pulse is never lost), while the planner
+ * flag is overwritten with the latest value.
  */
 struct CommandMessage {
   bool start = false;     ///< When true, request the control system to start.
@@ -43,6 +43,9 @@ struct CommandMessage {
   /// Optional absolute heading override (radians).  When set, the value is
   /// written directly into HeadingState.delta_heading.
   std::optional<double> delta_heading;
+  /// One-shot request to re-anchor the planner context and the heading state on
+  /// the robot's current base orientation (see ZMQManager::handlePlannerInput).
+  bool reanchor = false;
   bool valid = false;     ///< Set to true once a message has been decoded successfully.
 };
 
