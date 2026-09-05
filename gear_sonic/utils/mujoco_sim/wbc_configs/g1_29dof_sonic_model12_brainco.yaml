@@ -20,7 +20,7 @@ PRINT_SCENE_INFORMATION: True # Print link, joint and sensors information of rob
 ENABLE_ELASTIC_BAND: True # Virtual spring band, used for lifting h1
 
 SIMULATE_DT: 0.005  # Need to be larger than the runtime of viewer.sync()
-VIEWER_DT: 0.02  # Viewer update time
+VIEWER_DT: 0.05  # Viewer update time
 REWARD_DT: 0.02
 USE_SENSOR: False
 USE_HISTORY: True
