@@ -1,4 +1,6 @@
 #!/bin/bash
+# DEPRECATED — use setup_quest_wire.sh (direct Quest<->robot ethernet) instead.
+# Wifi is too unstable for control.
 # Bring up a WiFi Access Point (hotspot) ON THE ROBOT so the Quest can connect
 # directly to the robot instead of going Quest -> laptop -> robot.
 #

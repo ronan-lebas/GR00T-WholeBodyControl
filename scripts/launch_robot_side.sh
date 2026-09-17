@@ -3,16 +3,16 @@
 #
 # The whole real-time teleop path runs on the robot: BrainCo hand service, camera
 # server, deploy binary, Quest relay, and the Quest manager. Every ZMQ/DDS link is
-# localhost on the Jetson. The Quest connects to the robot's own WiFi AP (see the
-# 'ap' component / setup_ap.sh); the laptop only records data + drives the manager
-# keyboard over ssh + tmux attach. See deployment_setup.md.
+# localhost on the Jetson. The Quest is CABLED to the robot (see the 'wire'
+# component / setup_quest_wire.sh); the laptop only records data + drives the
+# manager keyboard over ssh + tmux attach. See ROBOT_TELEOP_README.md.
 #
 # Default (no args) starts everything at once in one tmux window split into tiled
 # panes, one per component, in startup order (hand -> camera -> deploy -> relay ->
-# manager). The 'ap' component is NOT started by default — run it once up front
-# (re-running it drops the Quest link while the AP profile is recreated):
+# manager). The 'wire' component is NOT started by default — run it once up front
+# (re-running it drops the Quest link while the profile is recreated):
 #
-#   ./scripts/launch_robot_side.sh ap         # bring up the WiFi AP (run once)
+#   ./scripts/launch_robot_side.sh wire       # bring up the wired Quest link (run once)
 #   ./scripts/launch_robot_side.sh            # tmux: hand+camera+deploy+relay+manager
 #   ./scripts/launch_robot_side.sh all        # same as above
 #   ./scripts/launch_robot_side.sh kill       # tear the tmux session down
@@ -20,7 +20,7 @@
 # Single-component mode (each runs in the foreground of the current terminal; this
 # is also what the tmux windows call under the hood):
 #
-#   ./scripts/launch_robot_side.sh ap         # WiFi AP (setup_ap.sh)
+#   ./scripts/launch_robot_side.sh wire       # wired Quest link (setup_quest_wire.sh)
 #   ./scripts/launch_robot_side.sh hand       # BrainCo hand service (first)
 #   ./scripts/launch_robot_side.sh camera     # composed camera server (ZMQ 5555)
 #   ./scripts/launch_robot_side.sh deploy     # g1_deploy_onnx_ref (DDS + ZMQ)
@@ -35,7 +35,7 @@ set -euo pipefail
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
 # ---------------------------------------------------------------------------
-# Config — override by exporting before you call, e.g. AP_SSID=my-ap EGO_VIEW_CAMERA=oak
+# Config — override by exporting before you call, e.g. WIRE_IFACE=enx0 EGO_VIEW_CAMERA=oak
 # ---------------------------------------------------------------------------
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 ZMQ_HOST="${ZMQ_HOST:-localhost}"             # deploy --zmq-host: manager is now on the robot
@@ -48,9 +48,8 @@ IMAGE_FPS="${IMAGE_FPS:-30}"                  # ego-view image relay cap (relay 
 ROBOT_IFACE="${ROBOT_IFACE:-}"               # optional -n for the hand service; empty = its own default iface
 HAND_USE_SYSTEMD="${HAND_USE_SYSTEMD:-0}"    # 0 = run the binary manually (default); 1 = systemctl restart brainco_hand.service
 MANAGER_EXTRA="${MANAGER_EXTRA:-}"           # e.g. "--static-base --log-latency"
-AP_SSID="${AP_SSID:-g1-teleop}"              # WiFi AP name the Quest joins
-AP_PASS="${AP_PASS:-groot1234}"              # WiFi AP passphrase (>= 8 chars)
-AP_IP="${AP_IP:-192.168.55.1}"               # AP gateway IP; Quest targets AP_IP:10000
+WIRE_IFACE="${WIRE_IFACE:-}"                 # USB-ethernet iface to the Quest; empty = auto-detect
+WIRE_IP="${WIRE_IP:-192.168.77.1}"           # robot-side gateway; Quest targets WIRE_IP:10000
 DATA_VENV="${DATA_VENV:-$REPO/.venv_data_collection}"
 TELEOP_VENV="${TELEOP_VENV:-$REPO/.venv_teleop}"
 SESSION="${SESSION:-g1_robot}"               # tmux session name
@@ -58,7 +57,7 @@ SESSION="${SESSION:-g1_robot}"               # tmux session name
 # Config vars propagated into each tmux window (so exported overrides survive).
 CONFIG_VARS=(REPO ZMQ_HOST DEPLOY_TARGET OUTPUT_TYPE EGO_VIEW_CAMERA OAK_SERIAL \
              CAMERA_PORT IMAGE_FPS ROBOT_IFACE HAND_USE_SYSTEMD MANAGER_EXTRA \
-             AP_SSID AP_PASS AP_IP DATA_VENV TELEOP_VENV SESSION)
+             WIRE_IFACE WIRE_IP DATA_VENV TELEOP_VENV SESSION)
 DEFAULT_COMPONENTS=(hand camera deploy relay manager)
 
 DRYRUN=0
@@ -118,11 +117,11 @@ run() {
 run_single() {
     COMPONENT="$1"
     case "$COMPONENT" in
-        ap)
-            # One-shot: bring up the robot's WiFi AP so the Quest connects direct.
-            ap_cmd=("$REPO/gear_sonic_deploy/scripts/setup_ap.sh"
-                    --ssid "$AP_SSID" --password "$AP_PASS" --ip "$AP_IP")
-            run - - "${ap_cmd[@]}"
+        wire)
+            # One-shot: bring up the direct Quest<->robot ethernet link (DHCP+NAT).
+            wire_cmd=("$REPO/gear_sonic_deploy/scripts/setup_quest_wire.sh" --ip "$WIRE_IP")
+            [ -n "$WIRE_IFACE" ] && wire_cmd+=(--interface "$WIRE_IFACE")
+            run - - "${wire_cmd[@]}"
             ;;
         hand)
             if [ "$HAND_USE_SYSTEMD" -eq 1 ]; then
@@ -150,7 +149,7 @@ run_single() {
             ;;
         relay)
             # Quest relay in Docker with host networking (no NAT hop; 'localhost'
-            # reaches the on-board camera server). Quest targets AP_IP:10000.
+            # reaches the on-board camera server). Quest targets WIRE_IP:10000.
             # No venv — run_quest_relay.py drives Docker via the system python3.
             run - - python3 "$REPO/gear_sonic_deploy/docker/quest_relay/run_quest_relay.py" \
                 --network-host \
@@ -214,12 +213,12 @@ launch_tmux() {
 
 usage() {
     cat >&2 <<EOF
-Usage: $0 [all|ap|hand|camera|deploy|relay|manager|kill] [--print]
+Usage: $0 [all|wire|hand|camera|deploy|relay|manager|kill] [--print]
 
 Robot-side components (everything-on-robot topology):
   (no args)  start hand + camera + deploy + relay + manager as tiled panes, then attach
   all        same as no args
-  ap         bring up the robot WiFi AP (setup_ap.sh) — run ONCE, not in defaults
+  wire       bring up the wired Quest link (setup_quest_wire.sh) — run ONCE, not in defaults
   hand       BrainCo hand service (must be up first)          — single, foreground
   camera     composed camera server, binds ZMQ $CAMERA_PORT           — single, foreground
   deploy     g1_deploy_onnx_ref: DDS + ZMQ (--zmq-host $ZMQ_HOST)      — single, foreground
@@ -227,16 +226,16 @@ Robot-side components (everything-on-robot topology):
   manager    Quest teleop manager (binds 5556; all sources local)      — single, foreground
   kill       kill the '$SESSION' tmux session
 
-Quest connects to the robot AP: join '$AP_SSID', target $AP_IP:10000.
+Quest is cabled to the robot: plug the adapter in, target $WIRE_IP:10000.
 Drive the manager from the laptop with:  ssh <robot> ; tmux attach -t $SESSION
 Resolved config: ZMQ_HOST=$ZMQ_HOST  CAMERA_PORT=$CAMERA_PORT  OUTPUT_TYPE=$OUTPUT_TYPE
-                 EGO_VIEW_CAMERA=$EGO_VIEW_CAMERA  AP_SSID=$AP_SSID  AP_IP=$AP_IP  SESSION=$SESSION
+                 EGO_VIEW_CAMERA=$EGO_VIEW_CAMERA  WIRE_IFACE=${WIRE_IFACE:-<auto>}  WIRE_IP=$WIRE_IP  SESSION=$SESSION
 Override any of these via env vars (see the config block at the top of this file).
 EOF
 }
 
 case "$MODE" in
-    ap|hand|camera|deploy|relay|manager)
+    wire|hand|camera|deploy|relay|manager)
         run_single "$MODE"
         ;;
     kill)

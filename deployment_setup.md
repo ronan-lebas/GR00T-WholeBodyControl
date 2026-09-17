@@ -1,25 +1,22 @@
 # Deployment Setup — Everything-on-Robot Topology
 
 This is the practical setup guide for the **standard topology**: the entire
-real-time teleop path runs **on the robot**, the **Quest connects to the robot's
-own WiFi AP**, and the **laptop only records datasets and drives the manager
-keyboard over `ssh`**.
+real-time teleop path runs **on the robot**, the **Quest is cabled directly to the
+robot**, and the **laptop only records datasets and drives the manager keyboard
+over `ssh`**.
 
 **Why this layout:** it kills the latency of the old Quest → laptop → robot path.
 Before, every pose crossed WiFi to the laptop, went through the relay + manager
 there, then crossed the ethernet cable to the robot — two network hops plus two
 app stages on the laptop. Now the relay, the manager (retargeting), the deploy
-binary, the camera server, and the hand service all run on the Jetson, so every
-ZMQ/DDS link is `localhost` on-board and the Quest is **one WiFi hop** from the
-robot.
+binary, the camera server, and the hand service all run on the Jetson, and the
+Quest reaches them over ethernet.
 
-> **Honest caveat:** the Quest link is still WiFi (to the robot's AP), so radio
-> jitter isn't eliminated the way a wire would. Use a **5 GHz** AP with good
-> antenna placement. The eventual jitter killer is a wired Quest — see
-> **"Future: three-way wired Quest"** at the end.
+> **WiFi is deprecated for teleop.** Both the old Quest→laptop WiFi path and the
+> robot WiFi AP (`setup_ap.sh`) are superseded by the cable (Wifi was unreliable).
 
 **Fastest path: the launch scripts.** `scripts/launch_robot_side.sh` brings up the
-AP + hand + camera + deploy + relay + manager on the robot;
+wired Quest link + hand + camera + deploy + relay + manager on the robot;
 `scripts/launch_laptop_side.sh` brings up the recorder + viewer on the laptop. Both
 bake in every host flag (see **Part 2 — Quick start**). The manual, flag-by-flag
 walkthrough follows for reference and troubleshooting.
@@ -31,12 +28,13 @@ so the laptop recorder can pull camera/state/manager streams over the cable.
 
 ---
 
-## 0. Your topology at a glance
+## 0. Topology at a glance
 
 ```
-   Quest ──WiFi (robot AP, 5GHz)──▶ ROBOT / Jetson  (everything real-time)
+   Quest ──ethernet cable────────▶ ROBOT / Jetson  (everything real-time)
                                     ┌──────────────────────────────────────┐
-                                    │ setup_ap.sh  → WiFi AP (192.168.55.1) │
+                                    │ setup_quest_wire.sh → DHCP+NAT        │
+                                    │                      (192.168.77.1)   │
                                     │ brainco_hand_service      (DDS)       │
                                     │ camera server             (ZMQ 5555)  │
                                     │ g1_deploy_onnx_ref  (DDS; SUB 5556,   │
@@ -143,30 +141,31 @@ Set the robot IP once (both scripts default to `ROBOT_IP=192.168.123.164`):
 export ROBOT_IP=192.168.123.164     # what you ssh to (verify: ip -br addr on the robot)
 ```
 
-### Step 2.0 — Bring up the robot WiFi AP (once)
+### Step 2.0 — Bring up the wired Quest link (once)
 
-`ssh` into the robot and start its AP so the Quest can join. This is a **one-shot**
-— run it once per boot, **not** on every relaunch (recreating the AP profile drops
-the Quest link):
+Plug the Quest and the laptop to the robot, then `ssh` into the robot. This is a **one-shot** —
+run it once per boot, **not** on every relaunch (recreating the profile drops the
+Quest link):
 
 ```bash
-# [ROBOT] — override SSID/pass/IP via AP_SSID / AP_PASS / AP_IP
-./scripts/launch_robot_side.sh ap
+# [ROBOT] — override iface/IP via WIRE_IFACE / WIRE_IP
+./scripts/launch_robot_side.sh wire
 #   … or call the script directly:
-# gear_sonic_deploy/scripts/setup_ap.sh --ssid g1-teleop --password groot1234 --ip 192.168.55.1
+# gear_sonic_deploy/scripts/setup_quest_wire.sh --interface enxXXXXXXXX --ip 192.168.77.1
 ```
 
-Defaults: SSID `g1-teleop`, password `groot1234`, AP IP `192.168.55.1` (5 GHz). The
-script preflights AP-mode support (`iw list`) and, if the onboard radio is
-client-only, tells you to use a USB WiFi dongle (`--interface <iface>`). Tear the AP
-down with `gear_sonic_deploy/scripts/setup_ap.sh down`.
+The script gives the robot-side adapter `192.168.77.1/24` with
+`ipv4.method shared`, so NetworkManager serves DHCP + NAT on that link and the
+Quest picks up an address by itself. It auto-detects the adapter only when exactly
+one ethernet interface has **no** IPv4 address, and refuses any interface that
+already carries one — so it can never steal the `192.168.123.x` DDS LAN or the
+laptop cable. Name the adapter with `--interface` if detection is ambiguous. Tear
+down with `gear_sonic_deploy/scripts/setup_quest_wire.sh down`.
 
-> **Single radio:** while it's an AP, the Jetson can't also be a WiFi *client* for
-> internet. During teleop that's fine — the laptop link is the ethernet cable.
-
-On the **Quest**: join WiFi **`g1-teleop`**, then point the Unity app's ROS-TCP
-connector at **`192.168.55.1:10000`**. Set the `ImageView` `DebayerMode` to `None`
-for the ego-view stream.
+On the **Quest**: nothing to configure on the headset (its ethernet defaults to
+DHCP) — just point the Unity app's ROS-TCP connector at **`192.168.77.1:10000`**.
+Set the `ImageView` `DebayerMode` to `None` for the ego-view stream. Confirm the
+headset got a lease with `ip neigh show dev <iface>` on the robot.
 
 ### Step 2.1 — Start the robot stack
 
@@ -218,7 +217,7 @@ Each script accepts one component name to run it alone in the foreground (handy 
 restarting one piece). Run with `-h` for usage + resolved config:
 
 ```bash
-# robot: ap | hand | camera | deploy | relay | manager      laptop: recorder | viewer
+# robot: wire | hand | camera | deploy | relay | manager    laptop: recorder | viewer
 ./scripts/launch_robot_side.sh deploy     # just (re)start deploy here
 ./scripts/launch_laptop_side.sh recorder  # just (re)start the recorder here
 ```
@@ -251,15 +250,15 @@ export ROBOT_IP=192.168.123.164        # whatever you ssh to
 Robot powered but **suspended/safe**, **e-stop in your hand**. `deploy.sh` runs
 unattended and starts commanding the robot immediately.
 
-### 3.1 — [ROBOT] WiFi AP
+### 3.1 — [ROBOT] Wired Quest link
 
 ```bash
 # [ROBOT]
-gear_sonic_deploy/scripts/setup_ap.sh --ssid g1-teleop --password groot1234 --ip 192.168.55.1
-# down:  gear_sonic_deploy/scripts/setup_ap.sh down
+gear_sonic_deploy/scripts/setup_quest_wire.sh --interface enxXXXXXXXX --ip 192.168.77.1
+# down:  gear_sonic_deploy/scripts/setup_quest_wire.sh down
 ```
 
-Quest joins `g1-teleop`, targets `192.168.55.1:10000`.
+Quest gets DHCP on `192.168.77.0/24` and targets `192.168.77.1:10000`.
 
 ### 3.2 — [ROBOT] BrainCo hand service (must be up first)
 
@@ -324,7 +323,7 @@ python3 gear_sonic_deploy/docker/quest_relay/run_quest_relay.py \
 ```
 
 Omit `--camera-host` for the plain relay (no camera in the headset). The Quest app
-targets the **robot AP IP : 10000** (`192.168.55.1:10000`).
+targets the **robot's wired IP : 10000** (`192.168.77.1:10000`).
 
 ### 3.6 — [ROBOT] Quest manager (binds 5556; all sources local)
 
@@ -380,28 +379,28 @@ python gear_sonic/scripts/run_camera_viewer.py \
 
 | Process | Runs on | Flag(s) | Value |
 |---|---|---|---|
-| WiFi AP (`setup_ap.sh`) | ROBOT | `--ssid/--password/--ip` | `g1-teleop` / … / `192.168.55.1` |
+| Wired Quest link (`setup_quest_wire.sh`) | ROBOT | `--interface/--ip` | USB-eth iface / `192.168.77.1` |
 | BrainCo hand service | ROBOT | `-n` | robot's `192.168.123.x` iface |
 | Camera server | ROBOT | `--port` | `5555` |
 | Deploy (`deploy.sh real`) | ROBOT | `--zmq-host` / `--output-type` | `localhost` / `all` (or `zmq`) |
 | Quest relay | ROBOT | `--network-host --camera-host` | (flag) / `localhost` |
-| Quest relay | — | Quest app target | robot **AP** IP : `10000` |
+| Quest relay | — | Quest app target | robot **wired** IP : `10000` |
 | Quest manager | ROBOT | `--relay-host` / `--feedback-host` | `localhost` / `localhost` |
 | Data recorder | LAPTOP | `--camera/--sonic/--state-zmq-host` | all `$ROBOT_IP` |
 | Camera viewer | LAPTOP | `--camera-host` | `$ROBOT_IP` |
 | Manager control | LAPTOP | (ssh) | `ssh <robot> ; tmux attach -t g1_robot` |
 
 **Rule of thumb:** on the robot everything is `localhost`; on the laptop every
-source host is `$ROBOT_IP`. The Quest targets the robot's **AP** IP (not the
-`192.168.123.x` address, and not the laptop).
+source host is `$ROBOT_IP`. The Quest targets the robot's **wired** IP
+(`192.168.77.1`) — not the `192.168.123.x` address, and not the laptop.
 
 ---
 
 ## Quick "is it working?" checks
 
-- Quest sees SSID `g1-teleop`, joins, and Unity connects to `192.168.55.1:10000` →
-  AP + relay good. If not: check `setup_ap.sh` succeeded (`iw list` AP support) and
-  the relay pane is up.
+- Quest's Unity app connects to `192.168.77.1:10000` → wired link + relay good.
+  If not: `ip neigh show dev <iface>` on the robot should list the headset (no
+  entry = cable/adapter/PD problem), and check the relay pane is up.
 - `ping -c3 $ROBOT_IP` from the laptop replies → NIC/cable good (Part 1) → recorder
   can reach the robot.
 - Deploy banner shows **Resolved interface = the Jetson's internal `192.168.123.x`
@@ -417,21 +416,3 @@ source host is `$ROBOT_IP`. The Quest targets the robot's **AP** IP (not the
   is `$ROBOT_IP`.
 - Ego-view **not in headset** → relay started without `--camera-host`, or Unity
   `DebayerMode` ≠ `None`, or the camera server isn't up.
-
----
-
-## Future: three-way wired Quest (lowest jitter)
-
-The remaining WiFi is the **Quest ↔ robot AP** link. A wired Quest removes it
-entirely. Options, easiest first:
-
-- **USB-C ethernet on the Quest + a small gigabit switch** shared with the robot
-  (and optionally the laptop), all on one subnet: the Quest targets the robot
-  directly over the wire, the AP is no longer needed, and the laptop stays only for
-  recording. Lowest latency and jitter.
-- **Quest tethered to the Jetson** via USB gadget/RNDIS networking (fiddlier; a
-  switch is cleaner).
-
-When a wired setup lands, point the Quest's Unity app at the robot's wired IP:`10000`
-instead of the AP IP, and skip `setup_ap.sh`. Everything else (relay + manager +
-deploy + camera on the robot, recorder on the laptop) is unchanged.
