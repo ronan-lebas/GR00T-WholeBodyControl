@@ -35,12 +35,13 @@ REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 ROBOT_IP="${ROBOT_IP:-192.168.123.164}"       # robot addr (what you ssh to); camera + deploy + manager live here
 CAMERA_PORT="${CAMERA_PORT:-5555}"
 TASK_PROMPT="${TASK_PROMPT:-pick up the box}"
+HAND_TYPE="${HAND_TYPE:-brainco}"          # recorder --hand-type: dex3 | brainco
 DATASET_NAME="${DATASET_NAME:-my_session}"
 DATA_VENV="${DATA_VENV:-$REPO/.venv_data_collection}"
 SESSION="${SESSION:-g1_laptop}"               # tmux session name
 
 # Config vars propagated into each tmux window (so exported overrides survive).
-CONFIG_VARS=(REPO ROBOT_IP CAMERA_PORT TASK_PROMPT DATASET_NAME DATA_VENV SESSION)
+CONFIG_VARS=(REPO ROBOT_IP CAMERA_PORT TASK_PROMPT HAND_TYPE DATASET_NAME DATA_VENV SESSION)
 DEFAULT_COMPONENTS=(recorder viewer)
 
 DRYRUN=0
@@ -98,8 +99,12 @@ run_single() {
         recorder)
             # Everything it reads is on the robot now: camera (5555), manager (5556),
             # and deploy state (5557) — all at ROBOT_IP over the ethernet cable.
+            # --hand-type brainco: the exporter defaults to dex3, and on BrainCo the
+            # hand q/action arrive normalized [0,1]; without it they are stored raw in
+            # fields that are radians everywhere else.
             run "$DATA_VENV" python "$REPO/gear_sonic/scripts/run_data_exporter.py" \
                 --task-prompt "$TASK_PROMPT" \
+                --hand-type "$HAND_TYPE" \
                 --camera-host "$ROBOT_IP" --camera-port "$CAMERA_PORT" \
                 --sonic-zmq-host "$ROBOT_IP" --sonic-zmq-port 5556 \
                 --state-zmq-host "$ROBOT_IP" --state-zmq-port 5557 \
@@ -171,7 +176,7 @@ Relay + manager now run on the robot. Drive the manager over ssh:
     ssh <robot> ; tmux attach -t g1_robot     (keys: s r f p c x q)
 The Quest connects to the robot's WiFi AP, not the laptop.
 
-Resolved config: ROBOT_IP=$ROBOT_IP  CAMERA_PORT=$CAMERA_PORT
+Resolved config: ROBOT_IP=$ROBOT_IP  CAMERA_PORT=$CAMERA_PORT  HAND_TYPE=$HAND_TYPE
                  DATASET_NAME=$DATASET_NAME  SESSION=$SESSION
 Override any config via env vars (see the config block at the top of this file).
 EOF
