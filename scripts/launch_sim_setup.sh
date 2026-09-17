@@ -106,7 +106,7 @@ SIM_EXTRA="${SIM_EXTRA:-}"                     # extra run_sim_loop.py flags, e.
 # manager (5556, bound on this host) is reached via host.docker.internal.
 DEPLOY_ZMQ_HOST="${DEPLOY_ZMQ_HOST:-host.docker.internal}"
 DEPLOY_EXTRA="${DEPLOY_EXTRA:-}"              # extra deploy.sh flags (inside the container)
-MANAGER_EXTRA="${MANAGER_EXTRA:---static-base}"  # default: static base (robot doesn't walk)
+MANAGER_EXTRA="${MANAGER_EXTRA---static-base}"   # default: static base (robot doesn't walk); "" = full motion
 # Non-empty => start the manager in replay mode (reads this NPZ instead of the live
 # Quest); set by --replay-quest [path]. The relay pane is dropped in replay mode.
 REPLAY_QUEST="${REPLAY_QUEST:-}"

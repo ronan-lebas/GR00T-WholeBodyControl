@@ -48,7 +48,12 @@ CAMERA_PORT="${CAMERA_PORT:-5555}"
 IMAGE_FPS="${IMAGE_FPS:-30}"                  # ego-view image relay cap (relay -> Quest)
 ROBOT_IFACE="${ROBOT_IFACE:-}"               # optional -n for the hand service; empty = its own default iface
 HAND_USE_SYSTEMD="${HAND_USE_SYSTEMD:-0}"    # 0 = run the binary manually (default); 1 = systemctl restart brainco_hand.service
-MANAGER_EXTRA="${MANAGER_EXTRA:-}"           # e.g. "--static-base --log-latency"
+# No colon in the expansion: MANAGER_EXTRA="" must mean "no flags / full motion",
+# and ${VAR:-d} would silently re-apply the default for an empty value (also when
+# each tmux pane re-evaluates this after env_prefix exports it).
+MANAGER_EXTRA="${MANAGER_EXTRA---static-base}"   # arms/hands only by default: no walk, no
+                                             # turn-in-place, no crouch. Relax deliberately,
+                                             # e.g. MANAGER_EXTRA="--disable-walk" or ""
 WIRE_IFACE="${WIRE_IFACE:-}"                 # USB-ethernet iface to the Quest; empty = auto-detect
 WIRE_IP="${WIRE_IP:-192.168.77.1}"           # robot-side gateway; Quest targets WIRE_IP:10000
 DATA_VENV="${DATA_VENV:-$REPO/.venv_data_collection}"
