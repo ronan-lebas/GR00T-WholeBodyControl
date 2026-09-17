@@ -366,9 +366,12 @@ run_single() {
             # 'b' = object reset, '0' = full sim reset (shipped via manager_state to the sim).
             # With REPLAY_QUEST set, the manager replays that NPZ instead of the live
             # Quest relay (press 's' to start playback once the policy is up).
+            # --enable-crouch: the manager defaults crouch OFF (untested on
+            # hardware); in sim it is a wanted feature, so turn it back on here.
             manager_args=(--relay-host localhost --relay-port 5559
                           --port 5556
-                          --feedback-host localhost --feedback-port 5557)
+                          --feedback-host localhost --feedback-port 5557
+                          --enable-crouch)
             [ -n "$REPLAY_QUEST" ] && manager_args+=(--replay "$REPLAY_QUEST")
             # shellcheck disable=SC2086
             run "$TELEOP_VENV" - python "$REPO/gear_sonic/scripts/quest_manager_thread_server.py" \

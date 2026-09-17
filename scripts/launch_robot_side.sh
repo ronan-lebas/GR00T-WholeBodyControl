@@ -41,6 +41,7 @@ REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 ZMQ_HOST="${ZMQ_HOST:-localhost}"             # deploy --zmq-host: manager is now on the robot
 DEPLOY_TARGET="${DEPLOY_TARGET:-real}"        # deploy.sh arg: 'real' auto-detects the Jetson iface
 OUTPUT_TYPE="${OUTPUT_TYPE:-all}"             # 'all' or 'zmq' (zmq skips ROS2)
+DEPLOY_EXTRA="${DEPLOY_EXTRA:-}"              # extra deploy.sh flags, e.g. --cp policy/sonic_v1_1/model
 EGO_VIEW_CAMERA="${EGO_VIEW_CAMERA:-realsense}"  # oak | realsense | usb | /path/to.mp4
 OAK_SERIAL="${OAK_SERIAL:-}"                  # optional --ego-view-device-id
 CAMERA_PORT="${CAMERA_PORT:-5555}"
@@ -55,7 +56,7 @@ TELEOP_VENV="${TELEOP_VENV:-$REPO/.venv_teleop}"
 SESSION="${SESSION:-g1_robot}"               # tmux session name
 
 # Config vars propagated into each tmux window (so exported overrides survive).
-CONFIG_VARS=(REPO ZMQ_HOST DEPLOY_TARGET OUTPUT_TYPE EGO_VIEW_CAMERA OAK_SERIAL \
+CONFIG_VARS=(REPO ZMQ_HOST DEPLOY_TARGET OUTPUT_TYPE DEPLOY_EXTRA EGO_VIEW_CAMERA OAK_SERIAL \
              CAMERA_PORT IMAGE_FPS ROBOT_IFACE HAND_USE_SYSTEMD MANAGER_EXTRA \
              WIRE_IFACE WIRE_IP DATA_VENV TELEOP_VENV SESSION)
 DEFAULT_COMPONENTS=(hand camera deploy relay manager)
@@ -144,8 +145,45 @@ run_single() {
             ;;
         deploy)
             # Manager is now on the robot too, so the command source is localhost.
-            run - "$REPO/gear_sonic_deploy" \
-                ./deploy.sh "$DEPLOY_TARGET" --zmq-host "$ZMQ_HOST" --output-type "$OUTPUT_TYPE"
+            deploy_cmd="source scripts/setup_env.sh && ./deploy.sh $DEPLOY_TARGET"
+            deploy_cmd="$deploy_cmd --input-type zmq_manager"
+            deploy_cmd="$deploy_cmd --zmq-host $ZMQ_HOST --output-type $OUTPUT_TYPE"
+            [ -n "$DEPLOY_EXTRA" ] && deploy_cmd="$deploy_cmd $DEPLOY_EXTRA"
+            # Deploy runs INSIDE the ROS2 container (docker/run-ros2-dev.sh), which
+            # drops into an interactive shell after its banner. --host-net is
+            # mandatory here: the deploy binary's DDS must reach the robot's real
+            # 192.168.123.x interface, which the bridge default (9fede6d, for
+            # rootless docker on the lab machine) cannot carry.
+            # In tmux, a watcher waits for the container's ready marker and types
+            # the deploy command into the pane; outside tmux, paste it yourself.
+            # deploy.sh then stops at its own [Y/n] prompt — the operator types y,
+            # which is the last gate before the robot is commanded.
+            echo "# [robot:deploy] container: docker/run-ros2-dev.sh --host-net"
+            echo "# [robot:deploy] command inside container: $deploy_cmd"
+            if [ "$DRYRUN" -eq 1 ]; then
+                printf '%q ' "$REPO/gear_sonic_deploy/docker/run-ros2-dev.sh" --host-net; echo
+                return 0
+            fi
+            if [ -n "${TMUX_PANE:-}" ]; then
+                (
+                    # 'Relays active' is the container startup script's last line,
+                    # right before it hands over to the interactive shell.
+                    for _ in $(seq 1 1800); do
+                        tmux display-message -p -t "$TMUX_PANE" '' >/dev/null 2>&1 || exit 0
+                        if tmux capture-pane -p -t "$TMUX_PANE" 2>/dev/null \
+                                | grep -q 'Relays active'; then
+                            sleep 1
+                            tmux send-keys -t "$TMUX_PANE" "$deploy_cmd" C-m
+                            exit 0
+                        fi
+                        sleep 1
+                    done
+                    echo "[robot:deploy] container never became ready; run manually: $deploy_cmd" >&2
+                ) &
+            else
+                echo "# Not inside tmux — paste the command above into the container shell."
+            fi
+            exec "$REPO/gear_sonic_deploy/docker/run-ros2-dev.sh" --host-net
             ;;
         relay)
             # Quest relay in Docker with host networking (no NAT hop; 'localhost'
@@ -221,7 +259,7 @@ Robot-side components (everything-on-robot topology):
   wire       bring up the wired Quest link (setup_quest_wire.sh) — run ONCE, not in defaults
   hand       BrainCo hand service (must be up first)          — single, foreground
   camera     composed camera server, binds ZMQ $CAMERA_PORT           — single, foreground
-  deploy     g1_deploy_onnx_ref: DDS + ZMQ (--zmq-host $ZMQ_HOST)      — single, foreground
+  deploy     g1_deploy_onnx_ref in the ROS2 container (--zmq-host $ZMQ_HOST)  — single, foreground
   relay      Quest relay (TCP 10000 + ZMQ 5559) + ego-view image relay — single, foreground
   manager    Quest teleop manager (binds 5556; all sources local)      — single, foreground
   kill       kill the '$SESSION' tmux session
@@ -229,6 +267,7 @@ Robot-side components (everything-on-robot topology):
 Quest is cabled to the robot: plug the adapter in, target $WIRE_IP:10000.
 Drive the manager from the laptop with:  ssh <robot> ; tmux attach -t $SESSION
 Resolved config: ZMQ_HOST=$ZMQ_HOST  CAMERA_PORT=$CAMERA_PORT  OUTPUT_TYPE=$OUTPUT_TYPE
+                 DEPLOY_EXTRA='$DEPLOY_EXTRA'
                  EGO_VIEW_CAMERA=$EGO_VIEW_CAMERA  WIRE_IFACE=${WIRE_IFACE:-<auto>}  WIRE_IP=$WIRE_IP  SESSION=$SESSION
 Override any of these via env vars (see the config block at the top of this file).
 EOF

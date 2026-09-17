@@ -39,7 +39,8 @@ Output ("planner" topic, robot ROOT frame, X-forward, Y-left, Z-up):
                        --static-base / --disable-walk. Squat is a static planner
                        mode, so while crouched the robot cannot walk (it still
                        turns via facing); crouch therefore wins over walking.
-                       Disable the head channel with --disable-crouch.
+                       The head channel is OFF unless --enable-crouch is passed;
+                       the '-'/'=' trim works either way.
 
 Usage:
     # Live Quest (relay container must be running, see run_quest_relay.py)
@@ -1290,7 +1291,7 @@ class QuestManager:
             print("[QuestManager] Data abort toggle sent")
         elif key in ("-", "_", "=", "+"):
             # Trim added to the head-drop crouch; also the only crouch source for
-            # replay / --disable-crouch. Same '-' down / '=' up convention as the
+            # replay / crouch-disabled. Same '-' down / '=' up convention as the
             # deploy's own keyboard_handler.
             step = self.args.crouch_step if key in ("-", "_") else -self.args.crouch_step
             self.crouch_trim = max(0.0, self.crouch_trim + step)
@@ -1445,7 +1446,7 @@ class QuestManager:
         ANY height change (g1_deploy_onnx_ref.cpp height_changed), so a raw 50 Hz
         stream would force a replan every tick.
         """
-        drop = 0.0 if self.args.disable_crouch else max(0.0, head_drop) * self.args.crouch_scale
+        drop = max(0.0, head_drop) * self.args.crouch_scale if self.args.enable_crouch else 0.0
         drop += self.crouch_trim
 
         # Hysteresis so the operator does not flap in and out of squat at the
@@ -1710,9 +1711,12 @@ def main() -> None:
         help="upper clamp on commanded walk speed (m/s)",
     )
     parser.add_argument(
-        "--disable-crouch",
+        "--enable-crouch",
         action="store_true",
-        help="ignore the operator's head height; the '-'/'=' crouch trim still works",
+        help="let the operator's head height drive the base-height crouch. Off by "
+        "default: it has never been validated on hardware, and an operator who ducks "
+        "or leans would make the robot squat (squat also blocks walking). The "
+        "'-'/'=' crouch trim works either way.",
     )
     parser.add_argument(
         "--crouch-scale",

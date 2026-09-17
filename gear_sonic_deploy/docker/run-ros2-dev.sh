@@ -4,6 +4,9 @@
 # Usage: ./run-ros2-dev.sh [OPTIONS]
 #   --rebuild, -r        : Force rebuild of Docker image
 #   --with-opengl, -gl   : Build custom CUDA+OpenGL base image (takes ~30min first time)
+#   --host-net, -hn      : Host networking (REQUIRED on the real robot: Unitree DDS
+#                          needs the real 192.168.123.x interface, which the default
+#                          bridge + port maps cannot carry)
 #   --help, -h          : Show this help message
 
 cd "$(dirname "$0")"
@@ -11,6 +14,10 @@ cd "$(dirname "$0")"
 # Parse arguments
 BUILD_CUDAGL=false
 FORCE_REBUILD=false
+# Default bridge networking + the -p maps and socat relays below exist for the
+# MuJoCo sim, whose SDK bridge lives on the host's loopback. On the real robot the
+# deploy binary must speak DDS on the actual robot LAN, so it needs host networking.
+HOST_NET="${HOST_NET:-false}"
 
 for arg in "$@"; do
     case $arg in
@@ -22,6 +29,10 @@ for arg in "$@"; do
             BUILD_CUDAGL=true
             shift
             ;;
+        --host-net|-hn)
+            HOST_NET=true
+            shift
+            ;;
         --help|-h)
             echo "G1 Deploy Docker Environment Launcher"
             echo ""
@@ -31,10 +42,12 @@ for arg in "$@"; do
             echo "  --rebuild, -r        Force rebuild of Docker image"
             echo "  --with-opengl, -gl   Build custom CUDA+OpenGL base image (for visualization/GUI)"
             echo "                       Takes ~30 minutes first time, needs ~5GB download"
+            echo "  --host-net, -hn      Host networking — REQUIRED on the real robot (DDS)"
             echo "  --help, -h          Show this help message"
             echo ""
             echo "Examples:"
-            echo "  ./run-ros2-dev.sh                    # Quick start with standard CUDA"
+            echo "  ./run-ros2-dev.sh                    # Quick start with standard CUDA (sim)"
+            echo "  ./run-ros2-dev.sh --host-net         # Real robot: DDS on the host interfaces"
             echo "  ./run-ros2-dev.sh --with-opengl      # Include OpenGL for RViz/Gazebo"
             echo "  ./run-ros2-dev.sh --rebuild          # Force rebuild"
             exit 0
@@ -399,13 +412,22 @@ else
     fi
 fi
 
+# Networking: host mode on the real robot (DDS needs the real interfaces), the
+# bridge + explicit port maps everywhere else. --add-host/-p are meaningless under
+# host networking, so they are only set in bridge mode.
+if [ "$HOST_NET" = true ]; then
+    # What the script used before 9fede6d; still what the (rootful) Jetson needs.
+    NET_SETTINGS="--network host --ipc host"
+    echo "🌐 Host networking (DDS reaches the robot LAN directly; no port maps)"
+else
+    NET_SETTINGS="--add-host host.docker.internal:$(hostname -I | awk '{print $1}') \
+        -p 5557:5557 -p 7410:7410/udp -p 7411:7411/udp"
+fi
+
 # Run the container with system-specific configuration
 docker run -it --rm \
     --name "$IMAGE_NAME" \
-    --add-host host.docker.internal:$(hostname -I | awk '{print $1}') \
-    -p 5557:5557 \
-    -p 7410:7410/udp \
-    -p 7411:7411/udp \
+    $NET_SETTINGS \
     $GPU_SETTINGS \
     -v "$(cd .. && pwd):/workspace/g1_deploy:rw" \
     -v "$(cd ../.. && pwd)/gear_sonic:/workspace/gear_sonic:rw" \
@@ -417,6 +439,7 @@ docker run -it --rm \
     -e NVIDIA_VISIBLE_DEVICES=all \
     -e NVIDIA_DRIVER_CAPABILITIES=all \
     -e SYSTEM_TYPE="$SYSTEM_TYPE" \
+    -e HOST_NET="$HOST_NET" \
     -e IS_JETSON="$IS_JETSON" \
     -e JETSON_MODEL="$JETSON_MODEL" \
     -w /workspace/g1_deploy \
@@ -506,6 +529,11 @@ docker run -it --rm \
         echo 'Ready for development! 🚀'
         echo ''
         
+        if [ \"\$HOST_NET\" = true ]; then
+            # Host networking: the container already shares the host's interfaces,
+            # so there is nothing to relay and DDS reaches the robot LAN directly.
+            echo '✅ Relays active (host networking — none needed)'
+        else
         echo '🔄 Starting UDP relays for simulation...'
         # Fallback: install socat automatically
         command -v socat >/dev/null 2>&1 || { apt-get update && apt-get install -y socat; }
@@ -514,6 +542,7 @@ docker run -it --rm \
         socat UDP4-LISTEN:7412,bind=127.0.0.1,fork UDP4:host.docker.internal:7412 &
         socat UDP4-LISTEN:7413,bind=127.0.0.1,fork UDP4:host.docker.internal:7413 &
         echo '✅ Relays active on ports 7412 and 7413'
+        fi
 
 
         exec bash
