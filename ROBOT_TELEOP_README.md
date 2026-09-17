@@ -149,15 +149,6 @@ the relay under `--network-host`, the on-robot manager, the container auto-type
 and its `[Y/n]` gate, and the `--input-type zmq_manager` path — i.e. nearly
 everything the first robot session depends on.
 
-```bash
-# sim in one terminal (the fake robot, on loopback)
-./scripts/launch_sim_setup.sh sim
-
-# the robot-side launcher in another, pointed at the sim
-DEPLOY_TARGET=sim ./scripts/launch_robot_side.sh relay
-DEPLOY_TARGET=sim ./scripts/launch_robot_side.sh manager
-DEPLOY_TARGET=sim ./scripts/launch_robot_side.sh deploy
-```
 
 **Attaching the Quest over USB (`adb reverse`).** 
 ```bash
@@ -167,6 +158,18 @@ adb reverse tcp:10000 tcp:10000
 
 The Quest app then should target **`127.0.0.1:10000`**.
 
+
+
+```bash
+# sim in one terminal (the fake robot, on loopback)
+./scripts/launch_sim_setup.sh sim
+
+# the robot-side launcher in another, pointed at the sim
+DEPLOY_TARGET=sim ./scripts/launch_robot_side.sh relay
+DEPLOY_TARGET=sim ./scripts/launch_robot_side.sh manager
+DEPLOY_TARGET=sim ./scripts/launch_robot_side.sh deploy
+source scripts/setup_env.sh && ./deploy.sh sim --input-type zmq_manager --zmq-host localhost --output-type all # in the container
+```
 
 **No headset? Two ways to drive it:**
 
