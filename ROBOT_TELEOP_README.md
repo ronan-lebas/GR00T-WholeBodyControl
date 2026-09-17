@@ -62,29 +62,14 @@ Upstream reference: **`docs/source/getting_started/installation_deploy.md`**
 **`docs/source/getting_started/download_models.md`**. This section only covers
 what is specific to this fork's robot setup.
 
-**(a) Docker with the NVIDIA runtime** — JetPack provides it:
+**(a) TensorRT.** Make sure the right version of TensorRT is installed on the robot.
 
-```bash
-docker info | grep -i -A3 runtime        # expect 'nvidia' among the runtimes
-sudo usermod -aG docker $USER            # then log out/in, if not already done
-```
-
-**(b) TensorRT.** Nothing to install on a Jetson: if
-`/usr/lib/aarch64-linux-gnu/libnvinfer.so` exists (it does under JetPack), the
-container stages JetPack's own TensorRT into `/opt/TensorRT` automatically. Only
-if that file is missing do you need a standalone install plus
-`export TensorRT_ROOT=$HOME/TensorRT` in `~/.bashrc` — the container mounts it.
-CUDA, ONNX Runtime, `just` and CMake all live **inside** the container; you do
-not install them on the Jetson.
-
-**(c) Download the policy + planner checkpoints from Hugging Face.** They are
+**(b) Download the policy + planner checkpoints from Hugging Face.** They are
 *not* in the repo and `git lfs pull` does not fetch them — the deploy binary
 exits with "Missing file" without them:
 
 ```bash
-pip install huggingface_hub                  # if not present
-python download_from_hf.py                   # → gear_sonic_deploy/policy/release/
-                                             #   + planner/target_vel/V2/
+uv run --no-project --with huggingface_hub python download_from_hf.py
 ```
 
 That lands `model_encoder.onnx`, `model_decoder.onnx`,
@@ -93,13 +78,13 @@ That lands `model_encoder.onnx`, `model_decoder.onnx`,
 both need the matching `--obs-config`, passed via `DEPLOY_EXTRA`). Do **not** use
 `--training` — that pulls a ~30 GB SMPL dataset you don't need on the robot.
 
-**(d) Build the container image once** (slow — arm64 base pull):
+**(c) Build the container image once**:
 
 ```bash
 gear_sonic_deploy/docker/run-ros2-dev.sh --host-net    # exit the shell once it comes up
 ```
 
-**(e) The two host-side venvs** (camera server + Quest manager run outside the
+**(d) The two host-side venvs** (camera server + Quest manager run outside the
 container):
 
 ```bash
@@ -114,26 +99,16 @@ must be up before the deploy binary:
 # submodule; needs unitree_sdk2 installed system-wide first
 cd gear_sonic_deploy/thirdparty/brainco_hand_service
 mkdir -p build && cd build && cmake .. && make -j6
-cd .. && bash setup_autostart.sh             # installs brainco_hand.service
 ```
 
-Confirm the deploy binary is built for BrainCo (it ships this way):
-
-```bash
-grep USE_BRAINCO_HANDS gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/hand_config.hpp
-# → #define USE_BRAINCO_HANDS 1     (compile-time; changing it requires a rebuild)
-```
-
-Test the hands standalone **before** touching the control stack:
+Test the hands standalone before touching the control stack:
 
 ```bash
 cd gear_sonic_deploy/thirdparty/brainco_hand_service/bin
-sudo ./brainco_hand_server -n <robot_iface>   # iface holding the 192.168.123.x address
+sudo ./brainco_hand_server
 sudo ./test_brainco_hand_server left          # fingers should fist + open
 sudo ./test_brainco_hand_server right
 ```
-
-Do not continue until both hands cycle.
 
 ### On the laptop
 
@@ -154,55 +129,44 @@ ping -c3 192.168.123.164                      # the robot — whatever you ssh t
 
 ---
 
-## 3. Rehearse in simulation first
+## 3. In sim
 
-Do this before you go near the robot. The MuJoCo stack runs the **same** deploy
+The MuJoCo stack runs the same deploy
 binary, manager, relay and recorder, so it exercises everything except the
-hardware itself — and it is where you learn the keyboard state machine without a
-robot in front of you.
-
-Run it on a machine with a GPU (your workstation, not the Jetson):
+hardware itself.
 
 ```bash
 bash install_scripts/install_mujoco_sim.sh    # .venv_sim
-python download_from_hf.py                    # same checkpoints as the robot
-./scripts/launch_sim_setup.sh -n              # -n prints the plan without running
-./scripts/launch_sim_setup.sh                 # tmux 'g1_sim', all panes
+uv run --no-project --with huggingface_hub python download_from_hf.py
+./scripts/launch_sim_setup.sh
 ```
 
-### 3.1 — Dress rehearsal: the robot launcher against the sim
+### 3.1 — Robot launcher against the sim
 
-If your machine has **rootful** Docker (not rootless) and the Quest cable, you can
-exercise the *robot-side* launcher itself with MuJoCo standing in for the robot —
-this covers `setup_quest_wire.sh`, `run-ros2-dev.sh --host-net`, the relay with
-`--network-host`, and the on-robot manager, i.e. nearly everything the first robot
-session depends on:
+On a laptop with **rootful** Docker you can run the *robot-side* launcher itself,
+with MuJoCo standing in for the robot. This covers `run-ros2-dev.sh --host-net`,
+the relay under `--network-host`, the on-robot manager, the container auto-type
+and its `[Y/n]` gate, and the `--input-type zmq_manager` path — i.e. nearly
+everything the first robot session depends on.
 
 ```bash
-# sim in one terminal (provides the fake robot on loopback)
+# sim in one terminal (the fake robot, on loopback)
 ./scripts/launch_sim_setup.sh sim
 
 # the robot-side launcher in another, pointed at the sim
-DEPLOY_TARGET=sim ./scripts/launch_robot_side.sh wire     # real Quest cable
 DEPLOY_TARGET=sim ./scripts/launch_robot_side.sh relay
 DEPLOY_TARGET=sim ./scripts/launch_robot_side.sh manager
 DEPLOY_TARGET=sim ./scripts/launch_robot_side.sh deploy
 ```
 
-Skip the `hand` component (no BrainCo hardware) and start `camera` only if one is
-plugged in. What this does **not** cover: DDS to real motors and hands, and the
-`192.168.123.x` laptop cable.
+**Attaching the Quest over USB (`adb reverse`).** 
+```bash
+adb devices           # headset must show 'device', not 'unauthorized'
+adb reverse tcp:10000 tcp:10000
+```
 
-> **Rootless Docker cannot do this.** Under rootless, `--network host` puts the
-> container in the rootless *network namespace*, not the real host — verified:
-> the host's `enp3s0` is invisible and you get a `tap0 10.0.2.100` instead. That
-> is why the bridge + port-map setup exists (commit `9fede6d`) and why the sim
-> launcher does not pass `--host-net`. On a rootless machine, test the sim stack
-> only (§3) and leave `--host-net` for the robot or a rootful laptop.
+The Quest app then should target **`127.0.0.1:10000`**.
 
-The deploy pane behaves exactly like the robot's — container, then `deploy.sh`,
-then the `[Y/n]` prompt — except it runs `deploy.sh sim` with `--yes` (no robot
-to endanger) and on bridge networking.
 
 **No headset? Two ways to drive it:**
 
@@ -211,21 +175,10 @@ to endanger) and on bridge networking.
 ./scripts/launch_sim_setup.sh --replay-quest     # replay a recorded NPZ
 ```
 
-**With a headset**, point the Quest app at that machine's LAN IP `:10000` (in sim
-the relay runs on the workstation, not behind the robot's wire).
-
 What to confirm before touching hardware:
 
 1. `s` twice → the robot tracks your wrists; `p`, `f`, `r`, `q` behave as §4.4 says.
 2. `c` starts/stops an episode and `x` aborts it, and a dataset lands on disk.
-3. You can read the deploy banner — the resolved interface, the checkpoint paths,
-   and `Encoder ... Input dimension` matching your obs config.
-
-Two differences from the robot that will *not* show up in sim: DDS to real
-motors/hands, and every network hop in §6. Sim proves the software, not the
-wiring.
-
----
 
 ## 4. Running a session on the robot
 
@@ -239,21 +192,13 @@ adapter, then on the **robot**:
 ```
 
 This gives the robot side `192.168.77.1/24` with NetworkManager serving DHCP +
-NAT, so the headset gets an address by itself — nothing to configure on the
-Quest. The script refuses any interface that already has an IPv4 address, so it
-cannot steal the DDS LAN or the laptop cable; pass `--interface enxXXXX` if
-auto-detection is ambiguous.
+NAT, so the headset gets an address by itself.
 
 Verify the headset got a lease: `ip neigh show dev <iface>`.
 
-In the Quest Unity app, point the ROS-TCP connector at **`192.168.77.1:10000`**
-and set `ImageView` `DebayerMode` to `None`.
+In the Quest Unity app, point the ROS-TCP connector at **`192.168.77.1:10000`**.
 
 ### 4.2 — Start the robot stack
-
-**Safety first: robot suspended, e-stop in hand.** `deploy.sh` builds and then
-starts commanding the robot; its `[Y/n]` prompt is the only gate, and you answer
-it by hand (§4.2 below) — nothing passes `--yes` on the robot.
 
 ```bash
 # [ROBOT]
@@ -261,9 +206,9 @@ it by hand (§4.2 below) — nothing passes `--yes` on the robot.
 ```
 
 One tmux session `g1_robot` with five labelled panes started in order: hand →
-camera → deploy → relay → manager. Wait for deploy to reach `WAIT_FOR_CONTROL`.
+camera → deploy → relay → manager.
 
-The **deploy pane** does three things by itself, then hands you the wheel:
+The **deploy pane** does three things by itself:
 
 1. starts the ROS2 container — `docker/run-ros2-dev.sh --host-net`;
 2. waits for its `Relays active` banner;
@@ -280,8 +225,7 @@ Proceed with deployment? [Y/n]:
 ```
 
 **Type `y` there when you are ready for the robot to be commanded.** That prompt
-is deliberately not bypassed on the robot. Outside tmux the command is printed
-rather than typed — paste it into the container shell yourself.
+is deliberately not bypassed on the robot.
 
 `--host-net` is mandatory here: the deploy binary's DDS has to reach the real
 `192.168.123.x` interface. The container's bridge default exists for rootless
@@ -292,10 +236,8 @@ image, then the TensorRT engine build from the ONNX (several minutes, cached
 afterwards — the cache lives next to the ONNX in the bind-mounted repo, so it
 survives container restarts).
 
-Useful overrides: `EGO_VIEW_CAMERA=oak OAK_SERIAL=...`, `OUTPUT_TYPE=zmq` (skips
-ROS2), `MANAGER_EXTRA="--static-base"`, and `DEPLOY_EXTRA="--cp
-policy/sonic_v1_1/model --obs-config policy/sonic_v1_1/observation_config.yaml"`
-to switch checkpoint (same knob as the sim launcher).
+The manager defaults to `MANAGER_EXTRA="--static-base"` — **arms and hands only,
+no walking, no turn-in-place, no crouch**. See §5 to relax that.
 
 ### 4.3 — Start the laptop side
 
@@ -310,13 +252,6 @@ The recorder passes `--hand-type brainco` (see Known risks #3). Set
 
 ### 4.4 — Drive it
 
-The manager's keyboard lives **on the robot**, so drive it over ssh:
-
-```bash
-# [LAPTOP]
-ssh <robot>
-tmux attach -t g1_robot          # then focus the 'manager' pane (Ctrl-b <arrow>)
-```
 
 | Key | Action |
 |---|---|
@@ -329,8 +264,7 @@ tmux attach -t g1_robot          # then focus the 'manager' pane (Ctrl-b <arrow>
 | `q` | stop (sends policy STOP) |
 | `b`, `0` | **simulator only — do not press on hardware** (see Known risks #4) |
 
-tmux: `Ctrl-b <arrow>` to move between panes, `Ctrl-b z` to zoom one, `Ctrl-b d`
-to detach. Tear down with `./scripts/launch_robot_side.sh kill`.
+Tear down with `./scripts/launch_robot_side.sh kill`.
 
 To stop cleanly: `q` in the manager, then Ctrl-C the deploy pane (it damps down).
 
@@ -341,16 +275,17 @@ To stop cleanly: `q` in the manager, then Ctrl-C the deploy pane (it damps down)
 The last end-to-end validation of **body motion** on the real robot was
 **2026-07-01** (tag `full-teleoperation-quest-works-on-robot`, commit `9f624c5`).
 Everything below was written after that and has only been exercised in MuJoCo, or
-on hardware for the hands/recording path only. None of it is known-broken — it is
-untested.
+on hardware for the hands/recording path only.
 
 1. **Wrist-target pipeline was re-tuned.** `--smooth-tau` dropped 0.05 → 0.02,
    `--pos-scale` is 0.7, and the ZMQ path was reworked (conflate +
    publish-on-receipt). These change what the policy receives every tick. If
    tracking feels wrong, `--smooth-tau 0.05` is the old behaviour.
-2. **Head-driven crouch is OFF by default** (`--enable-crouch` turns it on).
+2. **Locomotion is OFF by default on the robot launcher** (`--static-base`), and
+   **head-driven crouch is off in the manager itself** (`--enable-crouch` turns it
+   on).
    With it on, the operator's head dropping below the calibration height commands
-   an `IDEL_SQUAT` base height — anyone who ducks or leans makes the robot squat,
+   an `IDEL_SQUAT` base height,
    and while squatting it cannot walk. It has only ever run in MuJoCo. The
    `-`/`=` keyboard trim crouches regardless, which is the controlled way to try
    it first.
@@ -363,116 +298,46 @@ untested.
    deploy, which sets `play = false`, parks on a motion snapshot and **blocks up
    to 5 s** before resuming. It exists for MuJoCo scene resets. On hardware it
    would freeze tracking mid-session.
-5. **`r` behaves differently than it used to.** It now eases the robot back to
-   the reference pose over `--calib-ramp-sec` (3 s) before the countdown — a real
-   arm motion the old build did not perform.
-6. **The everything-on-robot topology has never been run end to end.** The relay
-   and manager moving onto the Jetson was written in July and only the Docker
-   image build was ever exercised there (hence the `pyzmq==25.1.2` pin). Expect
-   to debug the relay container and venv paths on the Jetson.
-   `run-ros2-dev.sh --host-net` is also new — the container has only ever been
-   run in bridge mode, against the MuJoCo sim.
-7. **`--input-type` was wrong on the robot launcher until now.** `deploy.sh`
-   defaults to `manager`, which builds an `InterfaceManager` around a
-   `ZMQEndpointInterface` — that subscribes to the `pose` topic only, so the
-   quest manager's `command` (START) and `planner` (VR targets) were never read
-   and the robot would have sat in `WAIT_FOR_CONTROL` forever. The launcher now
-   passes `--input-type zmq_manager`, matching the sim launcher. Mentioned
-   because `deployment_report.md` §4.5 still claims `manager` "subscribes to the
-   manager's command/planner topics" — it does not.
-8. **The wired Quest link is untested.** `setup_quest_wire.sh` is new. Its
-   refusal paths are verified, but the `up` path has never run against a real
-   adapter. If `nmcli` fights you, the manual equivalent is in the script header.
+5. **`r` makes the robot go to reference pose.**
+6. **The script to wire Quest up is untested.** `setup_quest_wire.sh` is new.
 
 ### Suggested bring-up order
 
-Robot suspended and e-stopped throughout, relaxing one constraint at a time:
+`launch_robot_side.sh` defaults to `--static-base`, so out of the box the robot
+moves **arms and hands only**.
 
-1. Hands only, no body: `MANAGER_EXTRA="--static-base"`.
+1. Arms/hands only — the default, no `MANAGER_EXTRA` needed.
 2. Add turn-in-place: `MANAGER_EXTRA="--disable-walk"`.
-3. Add walking: no extra flags.
-4. Try crouch with the `-`/`=` keys only, then `MANAGER_EXTRA="--enable-crouch"`.
-5. Only then record datasets.
+3. Add walking: `MANAGER_EXTRA=""` (explicitly empty — this overrides the default).
+4. Try crouch with the `-`/`=` keys first, then `MANAGER_EXTRA="--enable-crouch"`.
+
+The sim launcher defaults the same way, except it also passes `--enable-crouch`.
 
 ---
 
-## 6. Network gotchas
+## 6. Potential issues
 
-Most of what can go wrong on the robot is networking. These are the specific
-traps in this setup, roughly in order of how likely they are to bite.
-
-**1. The Quest gets an IP but Unity still won't connect.** This is the most
-likely failure. `ipv4.method shared` makes NetworkManager run DHCP and enable
-`net.ipv4.ip_forward` + masquerade, but it does **not** guarantee that inbound
-TCP 10000 to the robot is accepted — if `firewalld`/`ufw`/`nftables` is active on
-the Jetson, the DHCP lease succeeds while the relay port stays blocked. Check
-from the robot first, then from outside:
-
-```bash
-ss -ltnp | grep 10000                  # relay listening on 0.0.0.0:10000?
-sudo nft list ruleset | head -40       # or: sudo iptables -L INPUT -n
-```
-
-If it's a firewall, open the port on the Quest interface, e.g.
-`sudo ufw allow in on <wire-iface> to any port 10000 proto tcp`.
-
-**2. The deploy binary's interface is auto-detected, and the fallback is silent.**
-`deploy.sh real` looks for an interface holding `192.168.123.x`; if it finds
-none, it takes *the first non-loopback interface* with only a yellow warning —
-which, now that the Quest wire exists, can easily be `192.168.77.1`. DDS then
-goes nowhere while everything looks healthy. **Always read the
-`Resolved interface:` line in the deploy banner** and confirm it is the robot LAN
-port, not the Quest wire and not `docker0`.
-
-**3. The hand service and the deploy binary must be on the same interface.**
+**1. The hand service and the deploy binary must be on the same interface.**
 `launch_robot_side.sh` starts `brainco_hand_server` with **no `-n`** unless you
 set `ROBOT_IFACE`, so it uses its own default. If that differs from the
 interface deploy resolved, `rt/brainco/*` never meets and the arms move with dead
 fingers. Set it explicitly:
 `ROBOT_IFACE=<192.168.123.x iface> ./scripts/launch_robot_side.sh`.
 
-**4. Both containers need host networking, for different reasons.** The deploy
+**2. Both containers need host networking, for different reasons.** The deploy
 container needs `--host-net` so DDS sees the real robot LAN (its bridge default
 exists for rootless Docker on the lab machine). The relay container needs
 `--network-host` so `localhost:5555` reaches the on-board camera server and so
 port 10000 is bound on the Quest wire rather than behind Docker NAT. The launcher
 passes both; if you start either by hand, don't drop them.
 
-**5. ROS2 and Unitree DDS both live on domain 0.** With host networking, ROS2
-discovery would otherwise share the robot LAN with the motor traffic.
-`setup_env.sh` sets `ROS_LOCALHOST_ONLY=1`, which confines it — but the Quest
-pipeline never needs ROS2, so **`OUTPUT_TYPE=zmq` is the safer choice** and it
-also drops the ROS2 dependency from the build.
-
-**6. Nothing binds to localhost-only** — the manager (5556), deploy (5557) and
-camera server (5555) all bind `tcp://*`, so the laptop can reach them over the
-cable once routing works. If the recorder can't connect, it's the cable, the
-static IP, or a firewall — not a bind address.
-
-**7. Stale containers block a restart.** Both containers run under fixed names
+**3. Stale containers block a restart.** Both containers run under fixed names
 (`g1-deploy-dev`, `quest-relay`). If a pane was killed uncleanly you'll get
 "name already in use":
 
 ```bash
 docker rm -f g1-deploy-dev quest-relay
 ./scripts/launch_robot_side.sh kill      # then relaunch
-```
-
-**8. Power on the Quest's ethernet adapter.** Use a USB-C adapter with PD
-passthrough. Without it the headset runs the port off its own battery and the
-link drops mid-session — which looks like a teleop freeze, not a network fault.
-
-**9. Check the path end to end before trusting it:**
-
-```bash
-# [ROBOT] Quest got a lease?
-ip neigh show dev <wire-iface>
-# [ROBOT] all five ports listening?
-ss -ltnp | grep -E '5555|5556|5557|5559|10000'
-# [LAPTOP] robot reachable, and the recorder's three sources open?
-ping -c3 $ROBOT_IP
-for p in 5555 5556 5557; do timeout 2 bash -c "</dev/tcp/$ROBOT_IP/$p" \
-    && echo "$p open" || echo "$p CLOSED"; done
 ```
 
 ---
@@ -483,25 +348,11 @@ for p in 5555 5556 5557; do timeout 2 bash -c "</dev/tcp/$ROBOT_IP/$p" \
 |---|---|---|
 | Arms move, fingers dead | `brainco_hand_service` down, or on a different iface/DDS domain than deploy | `systemctl status brainco_hand`; both must be on the robot's `192.168.123.x` iface, domain 0 |
 | Never leaves `WAIT_FOR_CONTROL` | manager hasn't sent START | press `s` in the manager pane; check it is connected to the relay |
-| Unity won't connect | wired link, relay, or a firewall on port 10000 | see §6.1 — the usual cause is `ipv4.method shared` giving a lease while the firewall drops TCP 10000 |
-| Relay image fails to build | missing pyzmq pin (wrong branch) | you are not on `robot-deploy` — the Jetson's Python 3.8 has no cp38 aarch64 wheel for pyzmq ≥ 26 |
 | `Missing file` at deploy startup | checkpoints never downloaded | `python download_from_hf.py` (§2c) — `git lfs pull` does not fetch them |
 | Recorder hangs at startup | waiting for `robot_config` from deploy | deploy needs `--output-type all`/`zmq`; check `--state-zmq-host` |
 | Deploy talks DDS, robot ignores it | wrong interface resolved | check the "Resolved interface" banner is the internal `192.168.123.x` port |
 | Slow first start | rebuilding TRT engines from ONNX | expected on new hardware; cached afterwards |
-| Thumb curls wrong | `--brainco-thumb-swap` | applied automatically by `deploy.sh real`, never in `sim` |
 | Deploy container up, but no DDS to the robot | started without `--host-net` | the launcher passes it; if running by hand, `run-ros2-dev.sh --host-net` |
-| `No NVIDIA GPU support detected` from the container | nvidia runtime not configured | `docker info \| grep -i runtime`; on JetPack install `nvidia-container-toolkit` |
 | Deploy pane sits at a container shell | the auto-type watcher missed the ready marker | paste the printed `source scripts/setup_env.sh && ./deploy.sh …` yourself |
-| Deploy pane waits at `[Y/n]` | expected — this is the safety gate | type `y` once the robot is suspended and the e-stop is in hand |
+| Deploy pane waits at `[Y/n]` | expected — this is the safety gate | type `y` once the robot is ready to go |
 
----
-
-## 8. The other documents
-
-| Doc | Status |
-|---|---|
-| **this file** | current; the runbook |
-| `deployment_setup.md` | current for this topology and updated for the cable — the flag-by-flag manual walkthrough behind the launch scripts |
-| `docs/quest_manager_docs.md` | current; the deep dive on the manager (frames, calibration, retargeting, crouch) |
-| `deployment_report.md` | **partly stale** — architecture, ports, DDS and BrainCo sections are still accurate and worth reading, but it predates the launch scripts, says `brainco_hand_service` is untracked (it is a submodule now), and says `deploy.sh` has no confirmation prompt (it does; `-y` skips it) |

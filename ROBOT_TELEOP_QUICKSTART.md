@@ -86,12 +86,6 @@ export ROBOT_IP=192.168.123.164
 TASK_PROMPT="pick up the box" DATASET_NAME=session1 ./scripts/launch_laptop_side.sh
 ```
 
-**Drive** (manager keyboard is on the robot):
-
-```bash
-ssh <robot>
-tmux attach -t g1_robot
-```
 
 | Key | |
 |---|---|
