@@ -265,7 +265,7 @@ The recorder passes `--hand-type brainco` (see Known risks #3). Set
 | `r` | recalibrate — **ramps the robot back to the reference pose first** (3 s), then counts down |
 | `p` | pause / resume teleop |
 | `f` | toggle finger tracking |
-| `c` / `x` | start-stop recording an episode / abort it |
+| `c` / `x` | start-stop recording an episode / abort it **You need to kill the recorder pane with Ctrl-C to properly save the dataset** |
 | `-` / `=` | crouch deeper / stand up (works whether or not `--enable-crouch` is set) |
 | `q` | stop (sends policy STOP) |
 | `b`, `0` | **simulator only — do not press on hardware** (see Known risks #4) |
@@ -276,7 +276,17 @@ To stop cleanly: `q` in the manager, then Ctrl-C the deploy pane (it damps down)
 
 ---
 
-## 5. Known risks — read before the first session
+## 5. To test the recordings
+
+They are stored under `outputs/`.  
+Visualize them with `source .venv_sim/bin/activate && python gear_sonic/scripts/visualize_robot_object_trajectory.py`.  
+Options are described in `source .venv_sim/bin/activate && python gear_sonic/scripts/visualize_robot_object_trajectory.py --help`.
+
+Check some joints recording with `python gear_sonic/scripts/visualize_recording.py`.
+
+---
+
+## 6. Known risks — read before the first session
 
 The last end-to-end validation of **body motion** on the real robot was
 **2026-07-01** (tag `full-teleoperation-quest-works-on-robot`, commit `9f624c5`).
@@ -321,7 +331,7 @@ The sim launcher defaults the same way, except it also passes `--enable-crouch`.
 
 ---
 
-## 6. Potential issues
+## 7. Potential issues
 
 **1. The hand service and the deploy binary must be on the same interface.**
 `launch_robot_side.sh` starts `brainco_hand_server` with **no `-n`** unless you
@@ -348,7 +358,7 @@ docker rm -f g1-deploy-dev quest-relay
 
 ---
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|

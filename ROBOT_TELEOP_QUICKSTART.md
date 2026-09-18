@@ -126,6 +126,15 @@ MANAGER_EXTRA="--enable-crouch"  # + head-driven crouch (full motion)
 Test in sim first: `./scripts/launch_sim_setup.sh` (`--mock-quest` or
 `--replay-quest` if no headset). (Needs to install `.venv_sim` with `bash install_scripts/install_mujoco_sim.sh`)
 
+## To test the recordings
+
+They are stored under `outputs/`.  
+Visualize them with `source .venv_sim/bin/activate && python gear_sonic/scripts/visualize_robot_object_trajectory.py`.  
+Options are described in `source .venv_sim/bin/activate && python gear_sonic/scripts/visualize_robot_object_trajectory.py --help`.
+
+Check some joints recording with `python gear_sonic/scripts/visualize_recording.py`.
+
+
 ## Troubleshooting
 
 | Symptom | Fix |
