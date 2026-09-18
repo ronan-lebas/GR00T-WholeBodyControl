@@ -36,7 +36,11 @@ ROBOT_IP="${ROBOT_IP:-192.168.123.164}"       # robot addr (what you ssh to); ca
 CAMERA_PORT="${CAMERA_PORT:-5555}"
 TASK_PROMPT="${TASK_PROMPT:-pick up the box}"
 HAND_TYPE="${HAND_TYPE:-brainco}"          # recorder --hand-type: dex3 | brainco
-DATASET_NAME="${DATASET_NAME:-my_session}"
+# Empty = let the exporter name the directory after the launch timestamp, so every
+# run starts a fresh dataset (same as the sim launcher). A fixed name makes the
+# recorder *resume* that directory on the next run, silently appending episodes to
+# it — set one only when you deliberately want to continue a session.
+DATASET_NAME="${DATASET_NAME:-}"
 DATA_VENV="${DATA_VENV:-$REPO/.venv_data_collection}"
 SESSION="${SESSION:-g1_laptop}"               # tmux session name
 
@@ -102,13 +106,16 @@ run_single() {
             # --hand-type brainco: the exporter defaults to dex3, and on BrainCo the
             # hand q/action arrive normalized [0,1]; without it they are stored raw in
             # fields that are radians everywhere else.
+            recorder_args=(--task-prompt "$TASK_PROMPT"
+                           --hand-type "$HAND_TYPE"
+                           --camera-host "$ROBOT_IP" --camera-port "$CAMERA_PORT"
+                           --sonic-zmq-host "$ROBOT_IP" --sonic-zmq-port 5556
+                           --state-zmq-host "$ROBOT_IP" --state-zmq-port 5557)
+            # Omitted entirely when unset, so run_data_exporter.py applies its own
+            # timestamp default rather than being handed an empty name.
+            [ -n "$DATASET_NAME" ] && recorder_args+=(--dataset-name "$DATASET_NAME")
             run "$DATA_VENV" python "$REPO/gear_sonic/scripts/run_data_exporter.py" \
-                --task-prompt "$TASK_PROMPT" \
-                --hand-type "$HAND_TYPE" \
-                --camera-host "$ROBOT_IP" --camera-port "$CAMERA_PORT" \
-                --sonic-zmq-host "$ROBOT_IP" --sonic-zmq-port 5556 \
-                --state-zmq-host "$ROBOT_IP" --state-zmq-port 5557 \
-                --dataset-name "$DATASET_NAME"
+                "${recorder_args[@]}"
             ;;
         viewer)
             run "$DATA_VENV" python "$REPO/gear_sonic/scripts/run_camera_viewer.py" \
@@ -177,7 +184,7 @@ Relay + manager now run on the robot. Drive the manager over ssh:
 The Quest connects to the robot's WiFi AP, not the laptop.
 
 Resolved config: ROBOT_IP=$ROBOT_IP  CAMERA_PORT=$CAMERA_PORT  HAND_TYPE=$HAND_TYPE
-                 DATASET_NAME=$DATASET_NAME  SESSION=$SESSION
+                 DATASET_NAME=${DATASET_NAME:-<launch timestamp>}  SESSION=$SESSION
 Override any config via env vars (see the config block at the top of this file).
 EOF
 }

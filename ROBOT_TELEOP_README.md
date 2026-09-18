@@ -169,6 +169,9 @@ DEPLOY_TARGET=sim ./scripts/launch_robot_side.sh relay
 DEPLOY_TARGET=sim ./scripts/launch_robot_side.sh manager
 DEPLOY_TARGET=sim ./scripts/launch_robot_side.sh deploy
 source scripts/setup_env.sh && ./deploy.sh sim --input-type zmq_manager --zmq-host localhost --output-type all # in the container
+
+# laptop-side launcher in another one
+ROBOT_IP=localhost ./scripts/launch_laptop_side.sh
 ```
 
 **No headset? Two ways to drive it:**
