@@ -55,6 +55,11 @@
 #                  Long axis is +x (away from the robot); SIM_EXTRA='--object-yaw 1.5708'
 #                  lays the plate/bar left-right instead. Missing assets are generated on the
 #                  spot by gear_sonic/scripts/make_primitive_asset.py.
+#   --variant N    (--object bar) geometric variant of the bar: 0 = the plain bar (default), N>0
+#                  spawns data/objects/bar_vN (round / thick / thin / prism shafts, other caps,
+#                  lengths...). Same task prompt and 0.5 kg for all. List them:
+#                  python gear_sonic/scripts/make_primitive_asset.py bar --list-variants.
+#                  Preview: python gear_sonic/scripts/preview_chair_assets.py --variants bar
 #   --chair-asset DIR  (--task chair) staged asset dir to spawn, default data/objects/chair.
 #                  Any staged chair works — compare candidates next to the robot with
 #                  gear_sonic/scripts/preview_chair_assets.py.
@@ -81,6 +86,7 @@ IMAGE_FPS="${IMAGE_FPS:-30}"                   # ego-view image relay cap (Quest
 CAMERA_RELAY_HOST="${CAMERA_RELAY_HOST:-}"
 TASK="${TASK:-tabletop}"                       # tabletop = table + graspable object; chair = chair on the floor
 OBJECT="${OBJECT:-cube}"                       # (tabletop) cube | plate | bar | handled-box
+VARIANT="${VARIANT:-}"                         # (bar) variant index, empty = 0 = the plain bar
 CHAIR_ASSET="${CHAIR_ASSET:-$REPO/data/objects/chair}"  # staged by prepare_object_asset.py
 OBJECT_ASSET_DIR="${OBJECT_ASSET_DIR:-$REPO/data/objects}"  # where the --object assets are staged
 # Tabletop height in meters, passed to the sim only when set. Left empty for short objects so
@@ -117,7 +123,7 @@ DATA_VENV="${DATA_VENV:-$REPO/.venv_data_collection}"
 SESSION="${SESSION:-g1_sim}"                   # tmux session name
 
 # Config vars propagated into each tmux window (so exported overrides survive).
-CONFIG_VARS=(REPO CAMERA_PORT IMAGE_FPS CAMERA_RELAY_HOST TASK OBJECT TASK_PROMPT CHAIR_ASSET \
+CONFIG_VARS=(REPO CAMERA_PORT IMAGE_FPS CAMERA_RELAY_HOST TASK OBJECT VARIANT TASK_PROMPT CHAIR_ASSET \
              OBJECT_ASSET_DIR TABLE_HEIGHT RENDER_DEPTH_SEG \
              RECORD_BOX_GT BOX_GT_PORT \
              SIM_EXTRA DEPLOY_ZMQ_HOST DEPLOY_EXTRA MANAGER_EXTRA REPLAY_QUEST SIM_VENV TELEOP_VENV \
@@ -147,6 +153,8 @@ while [ $# -gt 0 ]; do
         --chair-asset=*) CHAIR_ASSET="${1#*=}" ;;
         --object) OBJECT="${2:?--object needs a value (cube|plate|bar|handled-box)}"; shift ;;
         --object=*) OBJECT="${1#*=}" ;;
+        --variant) VARIANT="${2:?--variant needs an index (see make_primitive_asset.py bar --list-variants)}"; shift ;;
+        --variant=*) VARIANT="${1#*=}" ;;
         *) POS+=("$1") ;;
     esac
     shift
@@ -158,9 +166,22 @@ if [ "$MOCK_QUEST" -eq 1 ] && [ -n "$REPLAY_QUEST" ]; then
     exit 2
 fi
 
+if [ -n "$VARIANT" ] && ! [[ "$VARIANT" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: --variant must be a non-negative integer, got '$VARIANT'." >&2
+    exit 2
+fi
+if [ -n "$VARIANT" ] && { [ "$TASK" != "tabletop" ] || [ "$OBJECT" != "bar" ]; }; then
+    echo "ERROR: --variant only applies to --task tabletop --object bar." >&2
+    exit 2
+fi
+
 # OBJECT_ASSET is set for every scene whose object is a staged mesh (everything but the cube);
-# empty means the sim spawns the primitive box instead.
+# empty means the sim spawns the primitive box instead. PRIMITIVE is the make_primitive_asset.py
+# name when the asset is generated (regenerated on every sim launch), empty for a staged chair.
+# OBJECT_LABEL is the staged dir name of a primitive (bar_vN for a bar variant).
 OBJECT_ASSET=""
+PRIMITIVE=""
+OBJECT_LABEL="$OBJECT"
 case "$TASK" in
     tabletop)
         case "$OBJECT" in
@@ -170,15 +191,18 @@ case "$TASK" in
                 ;;
             plate)
                 TASK_PROMPT="${TASK_PROMPT:-pick up the plate with both hands}"
-                OBJECT_ASSET="$OBJECT_ASSET_DIR/plate"
+                PRIMITIVE=plate
                 ;;
             bar)
                 TASK_PROMPT="${TASK_PROMPT:-pick up the bar with both hands}"
-                OBJECT_ASSET="$OBJECT_ASSET_DIR/bar"
+                PRIMITIVE=bar
+                # Variant 0 is the plain bar, staged as data/objects/bar like before.
+                [ -n "$VARIANT" ] && [ "$VARIANT" -ne 0 ] && OBJECT_LABEL="bar_v$VARIANT"
                 ;;
             handled-box|handled_box)
                 TASK_PROMPT="${TASK_PROMPT:-lift the box by its handles}"
-                OBJECT_ASSET="$OBJECT_ASSET_DIR/handled_box"
+                PRIMITIVE=handled_box
+                OBJECT_LABEL=handled_box
                 # 18 cm tall: on the standard 0.74 table its top would sit inside the robot's
                 # reset-pose hands. A 0.58 table keeps it a comfortable reach below them.
                 TABLE_HEIGHT="${TABLE_HEIGHT:-0.58}"
@@ -203,6 +227,8 @@ case "$TASK" in
         ;;
 esac
 
+[ -n "$PRIMITIVE" ] && OBJECT_ASSET="$OBJECT_ASSET_DIR/$OBJECT_LABEL"
+
 # The depth/seg export masks one box geom, so it only exists for the primitive cube. Refuse an
 # explicit 1 rather than silently letting the sim disable it mid-run.
 RENDER_DEPTH_SEG="${RENDER_DEPTH_SEG:-0}"
@@ -216,6 +242,22 @@ fi
 emit() {
     printf '%q ' "$@"; echo
     [ "$DRYRUN" -eq 1 ] || "$@"
+}
+
+# stage_object: (re)generate a primitive asset, or check that the staged chair exists. Primitives
+# are rebuilt every time (deterministic, ~1 s) so an edited variant catalog never leaves a stale
+# asset behind.
+stage_object() {
+    if [ -n "$PRIMITIVE" ]; then
+        echo "# [sim] staging $OBJECT_LABEL asset -> $OBJECT_ASSET"
+        local args=("$PRIMITIVE" --out "$OBJECT_ASSET" --force)
+        [ -n "$VARIANT" ] && args+=(--variant "$VARIANT")
+        emit "$SIM_VENV/bin/python" "$REPO/gear_sonic/scripts/make_primitive_asset.py" "${args[@]}"
+    elif [ -n "$OBJECT_ASSET" ] && [ ! -f "$OBJECT_ASSET/object.json" ]; then
+        echo "ERROR: no staged chair at $OBJECT_ASSET (missing object.json)." >&2
+        echo "  python gear_sonic/scripts/prepare_object_asset.py <ikea_assets>/<CHAIR> --out $OBJECT_ASSET" >&2
+        exit 2
+    fi
 }
 
 # env_prefix: "VAR=val VAR2=val2 ..." for the current config, shell-quoted, so a
@@ -264,18 +306,7 @@ run_single() {
         sim)
             # --detach-gantry: start with the robot released from the virtual gantry
             # (same as pressing '9' in the viewer), so it stands on the policy alone.
-            if [ -n "$OBJECT_ASSET" ] && [ ! -f "$OBJECT_ASSET/object.json" ]; then
-                if [ "$TASK" = "chair" ]; then
-                    echo "ERROR: no staged chair at $OBJECT_ASSET (missing object.json)." >&2
-                    echo "  python gear_sonic/scripts/prepare_object_asset.py <ikea_assets>/<CHAIR> --out $OBJECT_ASSET" >&2
-                    exit 2
-                fi
-                # The --object shapes are deterministic built-ins, so stage them on demand
-                # rather than making the user run a separate command first.
-                echo "# [sim] staging $OBJECT asset -> $OBJECT_ASSET"
-                emit "$SIM_VENV/bin/python" "$REPO/gear_sonic/scripts/make_primitive_asset.py" \
-                    "$(basename "$OBJECT_ASSET")" --out "$OBJECT_ASSET" --force
-            fi
+            stage_object
             if [ -n "$OBJECT_ASSET" ]; then
                 sim_args=(--object-asset "$OBJECT_ASSET")
                 [ "$TASK" = "tabletop" ] && sim_args+=(--table)
@@ -461,7 +492,7 @@ launch_tmux() {
 
 usage() {
     cat >&2 <<EOF
-Usage: $0 [all|sim|deploy|relay|manager|recorder|viewer|mock|teardown|kill] [--task tabletop|chair] [--object cube|plate|bar|handled-box] [--chair-asset DIR] [--mock-quest] [--replay-quest [npz]] [--print]
+Usage: $0 [all|sim|deploy|relay|manager|recorder|viewer|mock|teardown|kill] [--task tabletop|chair] [--object cube|plate|bar|handled-box] [--variant N] [--chair-asset DIR] [--mock-quest] [--replay-quest [npz]] [--print]
 
 Sim manipulation stack (no robot — everything on this machine):
   (no args)  start sim + deploy + relay + manager + recorder + viewer (+ teardown) as tiled panes
@@ -475,6 +506,8 @@ Sim manipulation stack (no robot — everything on this machine):
                 too large for one hand, so it forces two-hand coordination. Long axis is +x;
                 SIM_EXTRA='--object-yaw 1.5708' lays the plate/bar left-right. Assets are staged
                 on demand into $OBJECT_ASSET_DIR.
+  --variant N   (--object bar) geometric bar variant, 0 = plain bar (default); spawns bar_vN.
+                List: make_primitive_asset.py bar --list-variants
   --chair-asset DIR  staged chair asset to spawn (default $CHAIR_ASSET); preview candidates
                 with gear_sonic/scripts/preview_chair_assets.py
   --mock-quest  (with all/no-args) swap relay+manager for mock_quest_streamer
@@ -496,7 +529,7 @@ Recording writes, with RECORD_BOX_GT=1, the sim's exact object pose to object_gt
 Replay a recording with
 'python gear_sonic/scripts/visualize_robot_object_trajectory.py [--ground-truth]'.
 
-Resolved config: TASK=$TASK  OBJECT=$OBJECT  CAMERA_PORT=$CAMERA_PORT  RENDER_DEPTH_SEG=$RENDER_DEPTH_SEG  RECORD_BOX_GT=$RECORD_BOX_GT
+Resolved config: TASK=$TASK  OBJECT=$OBJECT  VARIANT='$VARIANT'  OBJECT_LABEL=$OBJECT_LABEL  CAMERA_PORT=$CAMERA_PORT  RENDER_DEPTH_SEG=$RENDER_DEPTH_SEG  RECORD_BOX_GT=$RECORD_BOX_GT
                  OBJECT_ASSET='$OBJECT_ASSET'  TABLE_HEIGHT='$TABLE_HEIGHT'  TASK_PROMPT='$TASK_PROMPT'
                  MANAGER_EXTRA='$MANAGER_EXTRA'  SIM_EXTRA='$SIM_EXTRA'  SESSION=$SESSION
 Point the Quest Unity app at THIS machine's Wi-Fi/LAN IP : 10000.
@@ -553,6 +586,8 @@ case "$MODE" in
                 esac
             done
         fi
+        # Stage up front so a bad --variant fails here, not inside the sim pane.
+        stage_object
         launch_tmux "${components[@]}"
         ;;
     *)

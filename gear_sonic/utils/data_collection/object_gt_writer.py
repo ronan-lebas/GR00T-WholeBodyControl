@@ -39,7 +39,9 @@ zero-velocity jump. All are sampled from the same physics step as the poses. See
 The writer also ensures the shared object mesh exists (under ``foundation_pose_data/``, where the
 visualizer looks for it) so ground-truth-only runs still have a mesh to render: a synthesized
 colored ``box.obj`` for the primitive cube, or a copy of the staged asset (``object.obj`` plus its
-convex hulls as ``object_collision_*.stl``) when the sim ran with a mesh object (``--object-asset``).
+convex hulls as ``object_collision_*.stl`` and its ``object.json``, which carries the variant id and
+generating spec for make_primitive_asset.py objects) when the sim ran with a mesh object
+(``--object-asset``).
 """
 
 import json
@@ -123,13 +125,13 @@ class ObjectGtWriter:
             }
         )
         # Write the shared object mesh once (needed for ground-truth-only replay).
-        self._check_identity(object_name, box_half_extents)
+        self._check_identity(object_name, box_half_extents, object_mesh_dir)
         if object_mesh_dir:
             self._ensure_asset_mesh(object_mesh_dir)
         elif box_half_extents is not None and len(box_half_extents) == 3:
             self._ensure_box_mesh(box_half_extents)
 
-    def _check_identity(self, object_name, box_half_extents) -> None:
+    def _check_identity(self, object_name, box_half_extents, object_mesh_dir=None) -> None:
         """Record which object this dataset holds, and warn if it ever changes.
 
         The mesh writers below skip when their output already exists, so recording a *different*
@@ -145,6 +147,11 @@ class ObjectGtWriter:
             "name": str(object_name),
             "box_half_extents": [float(v) for v in (box_half_extents or [])],
         }
+        asset_meta_path = Path(object_mesh_dir) / "object.json" if object_mesh_dir else None
+        if asset_meta_path is not None and asset_meta_path.exists():
+            variant = json.loads(asset_meta_path.read_text()).get("variant")
+            if variant is not None:
+                meta["variant"] = int(variant)
         if path.exists():
             previous = json.loads(path.read_text()).get("name")
             if previous != meta["name"]:
@@ -182,6 +189,7 @@ class ObjectGtWriter:
         meta = json.loads(meta_path.read_text())
         out.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(src / meta["visual_mesh"], out)
+        shutil.copyfile(meta_path, out.parent / "object.json")
         for i, fname in enumerate(meta.get("collision_meshes", [])):
             shutil.copyfile(src / fname, out.parent / f"object_collision_{i:03d}.stl")
 

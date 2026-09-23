@@ -89,6 +89,7 @@ def build_mesh_object_config(config: "ArgsConfig") -> dict:
         raise FileNotFoundError(
             f"{meta_path} not found — stage the asset first, e.g.\n"
             "  python gear_sonic/scripts/make_primitive_asset.py handled_box\n"
+            "  python gear_sonic/scripts/make_primitive_asset.py bar --variant 3\n"
             "  python gear_sonic/scripts/prepare_object_asset.py "
             "<IKEA_interface>/ikea_assets/SANDSBERG_10605424 --out data/objects/chair"
         )
