@@ -40,6 +40,7 @@ BOX_GT_REFERENCE_BODY = "right_ankle_roll_link"
 # Name of the injected manipulable object body, whatever its shape (primitive box or a
 # staged mesh asset). Everything downstream (reset, ground-truth publish) resolves it by name.
 OBJECT_BODY_NAME = "object"
+FIXTURE_BODY_NAME = "fixture"
 
 # Geom group used for a mesh object's convex collision hulls. Hidden from every renderer
 # (see DefaultEnv.scene_option) so the hulls don't draw on top of the visual mesh.
@@ -107,6 +108,8 @@ class DefaultEnv:
         # Identity of the manipulated object, shipped with the GT stream so a recording can
         # be checked against the mesh sitting next to it.
         self.object_name = None
+        # Static fixture world pose (pos + wxyz quat), None without one; recorded once per dataset.
+        self.fixture_pose = None
         self._gt_box_body_id = None
         self._gt_ref_body_id = None
         # Lazily built in get_gt_state(): maps MuJoCo joint-velocity dof addresses to the
@@ -369,6 +372,26 @@ class DefaultEnv:
             visual.set("mass", "0")
             visual.set("rgba", object_config.get("rgba", "0.75 0.6 0.4 1"))
 
+    @staticmethod
+    def _append_fixture(worldbody: ET.Element, asset: ET.Element, fixture: dict) -> None:
+        """Append a task's static fixture (no joint): each part is one convex mesh that both
+        collides and renders, so unlike the object it needs no hidden hull group."""
+        asset_dir = Path(fixture["asset_dir"])
+        pos, quat = fixture["pos"], fixture["quat"]
+        body = ET.SubElement(worldbody, "body")
+        body.set("name", FIXTURE_BODY_NAME)
+        body.set("pos", f"{pos[0]} {pos[1]} {pos[2]}")
+        body.set("quat", f"{quat[0]} {quat[1]} {quat[2]} {quat[3]}")
+        for i, part in enumerate(fixture["parts"]):
+            name = f"{FIXTURE_BODY_NAME}_{i}"
+            m = ET.SubElement(asset, "mesh")
+            m.set("name", name)
+            m.set("file", str((asset_dir / part["mesh"]).resolve()))
+            geom = ET.SubElement(body, "geom")
+            geom.set("type", "mesh")
+            geom.set("mesh", name)
+            geom.set("rgba", part.get("rgba", "0.6 0.6 0.6 1"))
+
     def _inject_scene_objects(
         self, xml_path: str, object_config: dict | None, table_config: dict | None
     ) -> str:
@@ -385,6 +408,8 @@ class DefaultEnv:
                 if asset is None:
                     asset = ET.SubElement(root, "asset")
                 self._append_mesh_object(worldbody, asset, object_config)
+                if object_config.get("fixture"):
+                    self._append_fixture(worldbody, asset, object_config["fixture"])
             else:
                 self._append_box(worldbody, object_config)
 
@@ -430,6 +455,9 @@ class DefaultEnv:
                 self.box_half_extents = ((hi - lo) / 2.0).tolist()
                 self.object_mesh_dir = str(Path(object_config["asset_dir"]).resolve())
                 self.object_name = object_config.get("name")
+                fixture = object_config.get("fixture")
+                if fixture:
+                    self.fixture_pose = [float(v) for v in (*fixture["pos"], *fixture["quat"])]
             else:
                 self.box_half_extents = [float(s) for s in object_config["size"]]
                 self.object_name = "held_box" if object_config.get("held") else "box"
@@ -754,22 +782,26 @@ class DefaultEnv:
         if not object_config or object_config.get("held"):
             return
         mujoco.mj_forward(self.mj_model, self.mj_data)
-        obj_body = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, OBJECT_BODY_NAME)
-        hits = set()
-        for c in self.mj_data.contact[: self.mj_data.ncon]:
-            bodies = [self.mj_model.geom_bodyid[c.geom1], self.mj_model.geom_bodyid[c.geom2]]
-            if obj_body not in bodies:
+        scene = (None, "world", "table", OBJECT_BODY_NAME, FIXTURE_BODY_NAME)
+        for body_name in (OBJECT_BODY_NAME, FIXTURE_BODY_NAME):
+            body = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+            if body < 0:
                 continue
-            other = bodies[1] if bodies[0] == obj_body else bodies[0]
-            name = mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, other)
-            if name not in (None, "world", "table"):
-                hits.add(name)
-        if hits:
-            print(
-                f"[Sim] WARNING: the object spawns in contact with the robot ({sorted(hits)}). "
-                "It will be pushed off its spawn pose on the first step — move it with "
-                "--object-pos, or lower the surface with --table-height."
-            )
+            hits = set()
+            for c in self.mj_data.contact[: self.mj_data.ncon]:
+                bodies = [self.mj_model.geom_bodyid[c.geom1], self.mj_model.geom_bodyid[c.geom2]]
+                if body not in bodies:
+                    continue
+                other = bodies[1] if bodies[0] == body else bodies[0]
+                name = mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, other)
+                if name not in scene:
+                    hits.add(name)
+            if hits:
+                print(
+                    f"[Sim] WARNING: the {body_name} spawns in contact with the robot "
+                    f"({sorted(hits)}). Move it with --object-pos, or lower the surface with "
+                    "--table-height."
+                )
 
     def reset_object(self):
         """Teleport the free object back to its spawn pose (robot state untouched)."""
@@ -1486,6 +1518,7 @@ class BaseSimulator:
             # recorder to copy the real mesh instead of synthesizing a cube for replay.
             "object_mesh_dir": self.sim_env.object_mesh_dir,
             "object_name": self.sim_env.object_name,
+            "fixture_in_world": self.sim_env.fixture_pose,  # (7,) pos + wxyz quat, or None
             "timestamp": time.time(),
         }
         try:

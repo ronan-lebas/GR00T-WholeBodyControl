@@ -88,6 +88,7 @@ class ObjectGtWriter:
         base_vel=None,
         object_vel=None,
         joint_vel=None,
+        fixture_in_world=None,
     ) -> None:
         """Buffer one ground-truth frame.
 
@@ -125,13 +126,15 @@ class ObjectGtWriter:
             }
         )
         # Write the shared object mesh once (needed for ground-truth-only replay).
-        self._check_identity(object_name, box_half_extents, object_mesh_dir)
+        self._check_identity(object_name, box_half_extents, object_mesh_dir, fixture_in_world)
         if object_mesh_dir:
             self._ensure_asset_mesh(object_mesh_dir)
         elif box_half_extents is not None and len(box_half_extents) == 3:
             self._ensure_box_mesh(box_half_extents)
 
-    def _check_identity(self, object_name, box_half_extents, object_mesh_dir=None) -> None:
+    def _check_identity(
+        self, object_name, box_half_extents, object_mesh_dir=None, fixture_in_world=None
+    ) -> None:
         """Record which object this dataset holds, and warn if it ever changes.
 
         The mesh writers below skip when their output already exists, so recording a *different*
@@ -152,6 +155,9 @@ class ObjectGtWriter:
             variant = json.loads(asset_meta_path.read_text()).get("variant")
             if variant is not None:
                 meta["variant"] = int(variant)
+        if fixture_in_world is not None:
+            # Same sim world as ob_in_world; static, so one pose covers every episode.
+            meta["fixture_in_world"] = [float(v) for v in fixture_in_world]
         if path.exists():
             previous = json.loads(path.read_text()).get("name")
             if previous != meta["name"]:
@@ -192,6 +198,8 @@ class ObjectGtWriter:
         shutil.copyfile(meta_path, out.parent / "object.json")
         for i, fname in enumerate(meta.get("collision_meshes", [])):
             shutil.copyfile(src / fname, out.parent / f"object_collision_{i:03d}.stl")
+        for part in (meta.get("fixture") or {}).get("parts", []):
+            shutil.copyfile(src / part["mesh"], out.parent / part["mesh"])
 
     def discard_episode(self) -> None:
         """Drop the current (partial) episode without writing it."""

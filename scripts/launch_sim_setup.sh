@@ -55,6 +55,16 @@
 #                  Long axis is +x (away from the robot); SIM_EXTRA='--object-yaw 1.5708'
 #                  lays the plate/bar left-right instead. Missing assets are generated on the
 #                  spot by gear_sonic/scripts/make_primitive_asset.py.
+#                  Task objects (object + static goal fixture, one task prompt each):
+#                    laptop   turn the open laptop around           (no fixture)
+#                    hammer   pick up the hammer, hit the nail      (nail block)
+#                    carton   lift a handle-less box with both palms (no fixture, 0.58 table)
+#                    pitcher  grab the handle, pour into the bowl    (bowl)
+#                    bottle   stand the lying bottle upright         (no fixture)
+#                    peg      put the lying peg in the hole          (hole block)
+#                    pan      move the pan onto the stove            (stove)
+#                    book     put the flat book upright on the shelf (bookshelf)
+#                    drill    pick up the drill, aim at the target   (target board)
 #   --variant N    (--object bar) geometric variant of the bar: 0 = the plain bar (default), N>0
 #                  spawns data/objects/bar_vN (round / thick / thin / prism shafts, other caps,
 #                  lengths...). Same task prompt and 0.5 kg for all. List them:
@@ -85,7 +95,7 @@ IMAGE_FPS="${IMAGE_FPS:-30}"                   # ego-view image relay cap (Quest
 # detected from this host's primary IP when empty; override if auto-detection is wrong.
 CAMERA_RELAY_HOST="${CAMERA_RELAY_HOST:-}"
 TASK="${TASK:-tabletop}"                       # tabletop = table + graspable object; chair = chair on the floor
-OBJECT="${OBJECT:-cube}"                       # (tabletop) cube | plate | bar | handled-box
+OBJECT="${OBJECT:-cube}"                       # (tabletop) cube | plate | bar | handled-box | a task object
 VARIANT="${VARIANT:-}"                         # (bar) variant index, empty = 0 = the plain bar
 CHAIR_ASSET="${CHAIR_ASSET:-$REPO/data/objects/chair}"  # staged by prepare_object_asset.py
 OBJECT_ASSET_DIR="${OBJECT_ASSET_DIR:-$REPO/data/objects}"  # where the --object assets are staged
@@ -151,7 +161,7 @@ while [ $# -gt 0 ]; do
         --task=*) TASK="${1#*=}" ;;
         --chair-asset) CHAIR_ASSET="${2:?--chair-asset needs a staged asset dir}"; shift ;;
         --chair-asset=*) CHAIR_ASSET="${1#*=}" ;;
-        --object) OBJECT="${2:?--object needs a value (cube|plate|bar|handled-box)}"; shift ;;
+        --object) OBJECT="${2:?--object needs a value (cube|plate|bar|handled-box|laptop|hammer|...)}"; shift ;;
         --object=*) OBJECT="${1#*=}" ;;
         --variant) VARIANT="${2:?--variant needs an index (see make_primitive_asset.py bar --list-variants)}"; shift ;;
         --variant=*) VARIANT="${1#*=}" ;;
@@ -207,8 +217,48 @@ case "$TASK" in
                 # reset-pose hands. A 0.58 table keeps it a comfortable reach below them.
                 TABLE_HEIGHT="${TABLE_HEIGHT:-0.58}"
                 ;;
+            # Task objects: the scene layout (spawn offset, static fixture) lives in the asset's
+            # object.json, see LAYOUTS in make_primitive_asset.py.
+            laptop)
+                TASK_PROMPT="${TASK_PROMPT:-turn the laptop around}"
+                PRIMITIVE=laptop
+                ;;
+            hammer)
+                TASK_PROMPT="${TASK_PROMPT:-pick up the hammer and hit the nail}"
+                PRIMITIVE=hammer
+                ;;
+            carton)
+                TASK_PROMPT="${TASK_PROMPT:-pick up the cardboard box with both hands}"
+                PRIMITIVE=carton
+                TABLE_HEIGHT="${TABLE_HEIGHT:-0.58}"
+                ;;
+            pitcher)
+                TASK_PROMPT="${TASK_PROMPT:-pick up the pitcher by its handle and pour into the bowl}"
+                PRIMITIVE=pitcher
+                ;;
+            bottle)
+                TASK_PROMPT="${TASK_PROMPT:-stand the bottle upright}"
+                PRIMITIVE=bottle
+                ;;
+            peg)
+                TASK_PROMPT="${TASK_PROMPT:-put the peg in the hole}"
+                PRIMITIVE=peg
+                ;;
+            pan)
+                TASK_PROMPT="${TASK_PROMPT:-move the pan onto the stove}"
+                PRIMITIVE=pan
+                ;;
+            book)
+                TASK_PROMPT="${TASK_PROMPT:-put the book upright on the shelf}"
+                PRIMITIVE=book
+                ;;
+            drill)
+                TASK_PROMPT="${TASK_PROMPT:-pick up the drill and point it at the target}"
+                PRIMITIVE=drill
+                ;;
             *)
-                echo "ERROR: unknown --object '$OBJECT' (expected cube, plate, bar or handled-box)." >&2
+                echo "ERROR: unknown --object '$OBJECT' (expected cube, plate, bar, handled-box or a task" >&2
+                echo "  object: laptop hammer carton pitcher bottle peg pan book drill)." >&2
                 exit 2
                 ;;
         esac
@@ -492,7 +542,7 @@ launch_tmux() {
 
 usage() {
     cat >&2 <<EOF
-Usage: $0 [all|sim|deploy|relay|manager|recorder|viewer|mock|teardown|kill] [--task tabletop|chair] [--object cube|plate|bar|handled-box] [--variant N] [--chair-asset DIR] [--mock-quest] [--replay-quest [npz]] [--print]
+Usage: $0 [all|sim|deploy|relay|manager|recorder|viewer|mock|teardown|kill] [--task tabletop|chair] [--object cube|plate|bar|handled-box|laptop|hammer|carton|pitcher|bottle|peg|pan|book|drill] [--variant N] [--chair-asset DIR] [--mock-quest] [--replay-quest [npz]] [--print]
 
 Sim manipulation stack (no robot — everything on this machine):
   (no args)  start sim + deploy + relay + manager + recorder + viewer (+ teardown) as tiled panes
@@ -506,6 +556,8 @@ Sim manipulation stack (no robot — everything on this machine):
                 too large for one hand, so it forces two-hand coordination. Long axis is +x;
                 SIM_EXTRA='--object-yaw 1.5708' lays the plate/bar left-right. Assets are staged
                 on demand into $OBJECT_ASSET_DIR.
+                Task objects (each with its own prompt, most with a static goal fixture):
+                laptop hammer carton pitcher bottle peg pan book drill.
   --variant N   (--object bar) geometric bar variant, 0 = plain bar (default); spawns bar_vN.
                 List: make_primitive_asset.py bar --list-variants
   --chair-asset DIR  staged chair asset to spawn (default $CHAIR_ASSET); preview candidates

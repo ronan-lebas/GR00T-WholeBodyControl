@@ -79,6 +79,13 @@ def assert_fits_on_table(config: "ArgsConfig", pos, half_extents) -> None:
     ), f"object footprint at {tuple(pos)} does not fit on the tabletop"
 
 
+def _yawed_footprint(bbox_min, bbox_max, yaw: float) -> tuple[float, float]:
+    """(x, y) half-extents of a bbox after a yaw; a quarter turn swaps them."""
+    hx = (float(bbox_max[0]) - float(bbox_min[0])) / 2.0
+    hy = (float(bbox_max[1]) - float(bbox_min[1])) / 2.0
+    return (hy, hx) if abs(math.cos(yaw)) < abs(math.sin(yaw)) else (hx, hy)
+
+
 def build_mesh_object_config(config: "ArgsConfig") -> dict:
     """Build the mesh ``object_config`` for --object-asset from the staged asset dir."""
     asset_dir = Path(config.object_asset)
@@ -106,12 +113,8 @@ def build_mesh_object_config(config: "ArgsConfig") -> dict:
     else:
         mass = float(meta.get("spawn_mass", OBJECT_MASS))
 
-    lo = [float(v) for v in meta["bbox_min"]]
-    hi = [float(v) for v in meta["bbox_max"]]
-    half_extents = [(hi_i - lo_i) / 2.0 for lo_i, hi_i in zip(lo, hi)]
-    # The yaw only ever spins the object about z, so a quarter turn swaps its x/y footprint.
-    rotated = abs(math.cos(yaw)) < abs(math.sin(yaw))
-    footprint = (half_extents[1], half_extents[0]) if rotated else (half_extents[0], half_extents[1])
+    footprint = _yawed_footprint(meta["bbox_min"], meta["bbox_max"], yaw)
+    surface = config.table_height if config.table else 0.0
     if config.object_pos:
         pos = tuple(config.object_pos)
     elif meta.get("spawn_pos"):
@@ -119,20 +122,41 @@ def build_mesh_object_config(config: "ArgsConfig") -> dict:
     else:
         # z places the mesh's lowest collision point just above the surface, whatever the
         # asset's own origin height is.
-        surface = config.table_height if config.table else 0.0
         z = surface - float(meta["z_min"]) + OBJECT_SURFACE_CLEARANCE
+        dx, dy = meta.get("spawn_offset", (0.0, 0.0))
         if config.table:
             # Same "slightly toward the robot" spawn as the cube, but clamped so a long
             # object (the 0.5 m bar) can't be placed hanging off the table edge.
-            reach_x = config.table_pos[0] - 0.1
+            reach_x = config.table_pos[0] - 0.1 + dx
             margin = config.table_top_size[0] - footprint[0]
             x = min(max(reach_x, config.table_pos[0] - margin), config.table_pos[0] + margin)
-            pos = (x, config.table_pos[1], z)
+            pos = (x, config.table_pos[1] + dy, z)
         else:
-            pos = (OBJECT_POS_X, 0.0, z)
+            pos = (OBJECT_POS_X + dx, dy, z)
 
     if config.table:
         assert_fits_on_table(config, pos, footprint)
+
+    fixture = None
+    if meta.get("fixture"):
+        fx = meta["fixture"]
+        fyaw = float(fx.get("yaw", 0.0))
+        fpos = (pos[0] + fx["offset"][0], pos[1] + fx["offset"][1], surface)
+        if config.table:
+            assert_fits_on_table(
+                config, fpos, _yawed_footprint(fx["bbox_min"], fx["bbox_max"], fyaw)
+            )
+        fixture = {
+            "name": fx["name"],
+            "asset_dir": str(asset_dir),
+            "parts": fx["parts"],
+            "pos": fpos,
+            "quat": (math.cos(fyaw / 2.0), 0.0, 0.0, math.sin(fyaw / 2.0)),
+        }
+
+    friction = BOX_FRICTION
+    if meta.get("sliding_friction") is not None:
+        friction = f"{float(meta['sliding_friction']):g} " + BOX_FRICTION.split(" ", 1)[1]
 
     return {
         "kind": "mesh",
@@ -142,8 +166,9 @@ def build_mesh_object_config(config: "ArgsConfig") -> dict:
         "pos": pos,
         "quat": (math.cos(yaw / 2.0), 0.0, 0.0, math.sin(yaw / 2.0)),
         "mass": mass,
+        "fixture": fixture,
         # Same grip/anti-sink tuning as the graspable cube (it is generic contact tuning).
-        "friction": BOX_FRICTION,
+        "friction": friction,
         "condim": BOX_CONDIM,
         "priority": BOX_PRIORITY,
         "solref": BOX_SOLREF,
