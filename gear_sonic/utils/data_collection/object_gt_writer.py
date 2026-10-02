@@ -89,6 +89,7 @@ class ObjectGtWriter:
         object_vel=None,
         joint_vel=None,
         fixture_in_world=None,
+        table=None,
     ) -> None:
         """Buffer one ground-truth frame.
 
@@ -126,14 +127,21 @@ class ObjectGtWriter:
             }
         )
         # Write the shared object mesh once (needed for ground-truth-only replay).
-        self._check_identity(object_name, box_half_extents, object_mesh_dir, fixture_in_world)
+        self._check_identity(
+            object_name, box_half_extents, object_mesh_dir, fixture_in_world, table
+        )
         if object_mesh_dir:
             self._ensure_asset_mesh(object_mesh_dir)
         elif box_half_extents is not None and len(box_half_extents) == 3:
             self._ensure_box_mesh(box_half_extents)
 
     def _check_identity(
-        self, object_name, box_half_extents, object_mesh_dir=None, fixture_in_world=None
+        self,
+        object_name,
+        box_half_extents,
+        object_mesh_dir=None,
+        fixture_in_world=None,
+        table=None,
     ) -> None:
         """Record which object this dataset holds, and warn if it ever changes.
 
@@ -158,6 +166,8 @@ class ObjectGtWriter:
         if fixture_in_world is not None:
             # Same sim world as ob_in_world; static, so one pose covers every episode.
             meta["fixture_in_world"] = [float(v) for v in fixture_in_world]
+        if table:
+            meta["table"] = table
         if path.exists():
             previous = json.loads(path.read_text()).get("name")
             if previous != meta["name"]:

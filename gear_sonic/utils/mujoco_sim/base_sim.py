@@ -110,6 +110,8 @@ class DefaultEnv:
         self.object_name = None
         # Static fixture world pose (pos + wxyz quat), None without one; recorded once per dataset.
         self.fixture_pose = None
+        # Injected table (run_sim_loop table_config), shipped with the GT stream for replay.
+        self.table_config = None
         self._gt_box_body_id = None
         self._gt_ref_body_id = None
         # Lazily built in get_gt_state(): maps MuJoCo joint-velocity dof addresses to the
@@ -427,6 +429,7 @@ class DefaultEnv:
 
         object_config = self.config.get("object_config", None)
         table_config = self.config.get("table_config", None)
+        self.table_config = table_config
         if object_config or table_config:
             tmp_xml = self._inject_scene_objects(xml_path, object_config, table_config)
             dump_path = self.config.get("dump_scene")
@@ -1519,6 +1522,7 @@ class BaseSimulator:
             "object_mesh_dir": self.sim_env.object_mesh_dir,
             "object_name": self.sim_env.object_name,
             "fixture_in_world": self.sim_env.fixture_pose,  # (7,) pos + wxyz quat, or None
+            "table": self.sim_env.table_config,  # pos / top_size / top_thickness / height, or None
             "timestamp": time.time(),
         }
         try:

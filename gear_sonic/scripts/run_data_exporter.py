@@ -663,6 +663,7 @@ class GrootDataCollector:
             object_mesh_dir=gt.get("object_mesh_dir"),
             object_name=gt.get("object_name"),
             fixture_in_world=gt.get("fixture_in_world"),
+            table=gt.get("table"),
             # Reset-state fields (sim publisher >= this change); older publishers omit them and
             # the writer stores zeros. See new_data_collection_report.md.
             pelvis_in_world=gt.get("pelvis_in_world"),

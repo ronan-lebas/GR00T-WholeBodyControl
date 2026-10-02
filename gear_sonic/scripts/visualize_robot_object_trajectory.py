@@ -45,6 +45,11 @@ With ``--contacts`` the finger<->object contact points from the ``contacts/`` si
 object-local frame, so they ride on the box surface; pair with ``--ground-truth`` (the pose they
 were computed against) for the exact geometry.
 
+With ``--ground-truth`` the static scene is drawn too: the task fixture (``object.json["fixture"]``
+placed at ``object_meta.json["fixture_in_world"]``) and the table. Recordings made before the
+table config was recorded get the sim's default table, at the fixture's height or, failing that,
+the height the object rests at in frame 0.
+
 Controls: space = pause/resume, left/right arrows = step one frame (while paused).
 """
 
@@ -74,6 +79,12 @@ SCENE_XML = (
 # OpenCV optical frame (X-right, Y-down, Z-forward) -> MuJoCo/OpenGL camera frame
 # (X-right, Y-up, Z-back). Matches third_party/FoundationPose/Utils.py:glcam_in_cvcam.
 GL_FROM_CV = np.diag([1.0, -1.0, -1.0, 1.0])
+
+# Sim table defaults (SimLoopConfig.table_pos / table_top_size, run_sim_loop TABLE_TOP_THICKNESS),
+# for recordings that predate the recorded table config.
+DEFAULT_TABLE = {"pos": (0.50, 0.0), "top_size": (0.3, 0.5), "top_thickness": 0.02}
+# Below this an inferred "table" height means the object was on the floor (chair task).
+MIN_TABLE_HEIGHT = 0.2
 
 # GLFW key codes used by the passive viewer key callback.
 KEY_SPACE, KEY_RIGHT, KEY_LEFT = 32, 262, 263
@@ -266,6 +277,48 @@ def load_contacts(traj: Path, episode: int, n_frames: int) -> np.ndarray | None:
     return out
 
 
+def _pose7_to_mat(p) -> np.ndarray:
+    t = np.eye(4)
+    t[:3, 3] = p[:3]
+    t[:3, :3] = R.from_quat(p[3:7], scalar_first=True).as_matrix()
+    return t
+
+
+def load_scene_props(traj: Path) -> tuple[dict | None, dict | None]:
+    """(fixture, table) of a ground-truth recording, both in the sim world.
+
+    fixture: ``{"dir", "parts", "pose"}`` from the copied asset's ``object.json["fixture"]`` and the
+    recorded ``fixture_in_world``. table: the recorded table config, else the sim default with
+    ``height`` taken from the fixture (it stands on the table) or left None plus ``rest_offset``
+    (object origin height above the surface it rests on) for TrajectoryReplay to infer from frame 0.
+    """
+    fp = traj / "foundation_pose_data"
+    meta_path, asset_path = fp / "object_meta.json", fp / "object.json"
+    meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
+    asset = json.loads(asset_path.read_text()) if asset_path.is_file() else {}
+
+    fixture = None
+    if meta.get("fixture_in_world") and asset.get("fixture"):
+        fixture = {
+            "dir": fp,
+            "parts": asset["fixture"]["parts"],
+            "pose": _pose7_to_mat(meta["fixture_in_world"]),
+        }
+
+    if meta.get("table"):
+        return fixture, dict(meta["table"])
+    table = dict(DEFAULT_TABLE, height=None, rest_offset=None)
+    if fixture is not None:
+        table["height"] = float(fixture["pose"][2, 3])
+    elif "z_min" in asset:
+        table["rest_offset"] = -float(asset["z_min"])
+    elif len(meta.get("box_half_extents", [])) == 3:
+        table["rest_offset"] = float(meta["box_half_extents"][2])
+    else:
+        return fixture, None
+    return fixture, table
+
+
 def read_fps(traj: Path, default: float = 50.0) -> float:
     info = traj / "meta" / "info.json"
     if info.is_file():
@@ -281,10 +334,44 @@ def read_fps(traj: Path, default: float = 50.0) -> float:
 # --------------------------------------------------------------------------- #
 
 
+def _append_static_props(root: ET.Element, fixture: dict | None, table: dict | None) -> None:
+    """Fixture / table as visual-only mocap bodies: placed once, after the ground-truth anchor
+    that maps the sim world into the replay world is known (see TrajectoryReplay)."""
+    worldbody = root.find("worldbody")
+    if fixture is not None:
+        asset = root.find("asset")
+        if asset is None:
+            asset = ET.SubElement(root, "asset")
+        body = ET.SubElement(worldbody, "body", name="fixture", mocap="true")
+        for i, part in enumerate(fixture["parts"]):
+            name = f"fixture_{i}"
+            ET.SubElement(asset, "mesh", name=name, file=str((fixture["dir"] / part["mesh"]).resolve()))
+            ET.SubElement(
+                body, "geom", type="mesh", mesh=name, rgba=part.get("rgba", "0.6 0.6 0.6 1"),
+                contype="0", conaffinity="0",
+            )
+    if table is not None:
+        # Same geometry as base_sim._append_table; body origin on the floor under the top center.
+        hx, hy = table["top_size"]
+        ht, h = table["top_thickness"], table["height"]
+        leg = (h - 2 * ht) / 2
+        body = ET.SubElement(worldbody, "body", name="table", mocap="true")
+        ET.SubElement(
+            body, "geom", type="box", size=f"{hx} {hy} {ht}", pos=f"0 0 {h - ht}",
+            rgba="0.6 0.4 0.25 1", contype="0", conaffinity="0",
+        )
+        ET.SubElement(
+            body, "geom", type="box", size=f"0.06 0.06 {leg}", pos=f"0 0 {leg}",
+            rgba="0.5 0.35 0.2 1", contype="0", conaffinity="0",
+        )
+
+
 def build_model(
     mesh_path: Path | None,
     collidable_object: bool = False,
     object_margin: float = 0.0,
+    fixture: dict | None = None,
+    table: dict | None = None,
 ) -> mujoco.MjModel:
     """Inject the tracked object (mesh + freejoint) into the brainco scene, if a mesh is given.
 
@@ -348,6 +435,8 @@ def build_model(
             geom.set("conaffinity", "0")
             geom.set("rgba", "1 0.5 0 0.4")
 
+    _append_static_props(root, fixture, table)
+
     # Write next to the scene so the relative <include> stays valid.
     with tempfile.NamedTemporaryFile(
         mode="w", delete=False, suffix=".xml", dir=SCENE_XML.parent
@@ -399,6 +488,8 @@ class TrajectoryReplay:
         contacts_local: np.ndarray | None = None,
         pelvis_poses: np.ndarray | None = None,
         exact_base: bool = False,
+        fixture: dict | None = None,
+        table: dict | None = None,
     ):
         self.states = states
         self.obj_poses = obj_poses
@@ -431,7 +522,14 @@ class TrajectoryReplay:
         self.has_object = obj_poses is not None
         self.m = obj_poses.shape[0] if self.has_object else 0
 
-        self.model = build_model(mesh_path, collidable_object, object_margin)
+        # Static props are recorded in the sim world, so they need the ground-truth anchor.
+        if not (self.obj_gt_ref and self.ref_poses is not None):
+            fixture, table = None, None
+        self.fixture, self.table = fixture, self._resolve_table(table)
+
+        self.model = build_model(
+            mesh_path, collidable_object, object_margin, self.fixture, self.table
+        )
         self.data = mujoco.MjData(self.model)
         self.data.qpos[:] = self.model.qpos0  # fixed standing base
 
@@ -493,6 +591,31 @@ class TrajectoryReplay:
             ref0 = self._replay_ref_pose(0)  # replay reference body pose at frame 0
             sim_ref0 = self.ref_poses[self.object_index(0)]
             self.gt_anchor = ref0 @ np.linalg.inv(sim_ref0)
+
+        if self.fixture is not None:
+            self._place_static("fixture", self.fixture["pose"])
+        if self.table is not None:
+            t_table = np.eye(4)
+            t_table[:2, 3] = self.table["pos"]
+            self._place_static("table", t_table)
+
+    def _resolve_table(self, table: dict | None) -> dict | None:
+        """Fill in an unrecorded table height from the object resting on it at frame 0."""
+        if table is None or table.get("height") is not None:
+            return table
+        if not self.has_object or table.get("rest_offset") is None:
+            return None
+        height = float(self.obj_poses[self.object_index(0)][2, 3]) - table["rest_offset"]
+        if height < MIN_TABLE_HEIGHT:
+            return None
+        return {**table, "height": height}
+
+    def _place_static(self, body_name: str, t_sim: np.ndarray) -> None:
+        """Place a mocap prop from its sim-world pose via the ground-truth anchor."""
+        t = self.gt_anchor @ t_sim
+        mocap = int(self.model.body_mocapid[self.model.body(body_name).id])
+        self.data.mocap_pos[mocap] = t[:3, 3]
+        self.data.mocap_quat[mocap] = R.from_matrix(t[:3, :3]).as_quat(scalar_first=True)
 
     def _replay_ref_pose(self, i: int) -> np.ndarray:
         """World pose (4x4) of the GT reference body at frame ``i`` in the replay, feet planted.
@@ -793,11 +916,21 @@ def main() -> None:
                 f"{n_hit}/{states.shape[0]} frames with contact (red spheres)"
             )
 
+    fixture, table = load_scene_props(traj) if args.ground_truth else (None, None)
+    if not args.ground_truth and (traj / "object_gt").is_dir():
+        print("[info] scene      : fixture/table are only drawn with --ground-truth")
+
     replay = TrajectoryReplay(
         states, obj_poses, mesh, base_quats, obj_to_robot,
         obj_in_world=args.filtered, obj_gt_ref=args.ground_truth, ref_poses=ref_poses,
         contacts_local=contacts_local, pelvis_poses=pelvis_poses, exact_base=exact_base,
+        fixture=fixture, table=table,
     )
+    if replay.fixture is not None:
+        print(f"[info] fixture    : {len(replay.fixture['parts'])} parts")
+    if replay.table is not None:
+        source = "recorded" if "rest_offset" not in replay.table else "sim default footprint"
+        print(f"[info] table      : height {replay.table['height']:.3f} m ({source})")
 
     if args.check:
         for i in (0, replay.n - 1):
