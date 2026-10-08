@@ -670,6 +670,10 @@ class GrootDataCollector:
             base_vel=gt.get("base_vel"),
             object_vel=gt.get("object_vel"),
             joint_vel=gt.get("joint_vel"),
+            cap_in_world=gt.get("cap_in_world"),
+            cap_vel=gt.get("cap_vel"),
+            cap_angle=gt.get("cap_angle"),
+            cap_attached=gt.get("cap_attached"),
         )
 
     def _write_foundation_pose_frame(self) -> None:

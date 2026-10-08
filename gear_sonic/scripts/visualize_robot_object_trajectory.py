@@ -48,7 +48,8 @@ were computed against) for the exact geometry.
 With ``--ground-truth`` the static scene is drawn too: the task fixture (``object.json["fixture"]``
 placed at ``object_meta.json["fixture_in_world"]``) and the table. Recordings made before the
 table config was recorded get the sim's default table, at the fixture's height or, failing that,
-the height the object rests at in frame 0.
+the height the object rests at in frame 0. A screw-cap object (bottle) also gets its cap, at the
+recorded ``cap_in_world``.
 
 Controls: space = pause/resume, left/right arrows = step one frame (while paused).
 """
@@ -319,6 +320,19 @@ def load_scene_props(traj: Path) -> tuple[dict | None, dict | None]:
     return fixture, table
 
 
+def load_cap_gt(traj: Path, gt_parquet: Path) -> dict | None:
+    """Screw cap of a ground-truth recording (bottle): ``{"dir", "parts", "poses"}`` with the
+    recorded (M,4,4) sim-world ``cap_in_world``, or None when there is no cap."""
+    fp = traj / "foundation_pose_data"
+    asset_path = fp / "object.json"
+    asset = json.loads(asset_path.read_text()) if asset_path.is_file() else {}
+    if not asset.get("screw_cap") or "cap_in_world" not in pq.read_schema(gt_parquet).names:
+        return None
+    col = pq.read_table(gt_parquet, columns=["cap_in_world"]).column("cap_in_world")
+    poses = np.asarray(col.to_pylist(), dtype=np.float64).reshape(-1, 4, 4)
+    return {"dir": fp, "parts": asset["screw_cap"]["parts"], "poses": poses}
+
+
 def read_fps(traj: Path, default: float = 50.0) -> float:
     info = traj / "meta" / "info.json"
     if info.is_file():
@@ -334,20 +348,25 @@ def read_fps(traj: Path, default: float = 50.0) -> float:
 # --------------------------------------------------------------------------- #
 
 
-def _append_static_props(root: ET.Element, fixture: dict | None, table: dict | None) -> None:
-    """Fixture / table as visual-only mocap bodies: placed once, after the ground-truth anchor
-    that maps the sim world into the replay world is known (see TrajectoryReplay)."""
+def _append_static_props(
+    root: ET.Element, fixture: dict | None, table: dict | None, cap: dict | None = None
+) -> None:
+    """Fixture / table / screw cap as visual-only mocap bodies, placed through the ground-truth
+    anchor that maps the sim world into the replay world (see TrajectoryReplay). The fixture and
+    table are placed once; the cap every frame."""
     worldbody = root.find("worldbody")
-    if fixture is not None:
+    for name, prop in (("fixture", fixture), ("cap", cap)):
+        if prop is None:
+            continue
         asset = root.find("asset")
         if asset is None:
             asset = ET.SubElement(root, "asset")
-        body = ET.SubElement(worldbody, "body", name="fixture", mocap="true")
-        for i, part in enumerate(fixture["parts"]):
-            name = f"fixture_{i}"
-            ET.SubElement(asset, "mesh", name=name, file=str((fixture["dir"] / part["mesh"]).resolve()))
+        body = ET.SubElement(worldbody, "body", name=name, mocap="true")
+        for i, part in enumerate(prop["parts"]):
+            mesh = f"{name}_{i}"
+            ET.SubElement(asset, "mesh", name=mesh, file=str((prop["dir"] / part["mesh"]).resolve()))
             ET.SubElement(
-                body, "geom", type="mesh", mesh=name, rgba=part.get("rgba", "0.6 0.6 0.6 1"),
+                body, "geom", type="mesh", mesh=mesh, rgba=part.get("rgba", "0.6 0.6 0.6 1"),
                 contype="0", conaffinity="0",
             )
     if table is not None:
@@ -372,6 +391,7 @@ def build_model(
     object_margin: float = 0.0,
     fixture: dict | None = None,
     table: dict | None = None,
+    cap: dict | None = None,
 ) -> mujoco.MjModel:
     """Inject the tracked object (mesh + freejoint) into the brainco scene, if a mesh is given.
 
@@ -435,7 +455,7 @@ def build_model(
             geom.set("conaffinity", "0")
             geom.set("rgba", "1 0.5 0 0.4")
 
-    _append_static_props(root, fixture, table)
+    _append_static_props(root, fixture, table, cap)
 
     # Write next to the scene so the relative <include> stays valid.
     with tempfile.NamedTemporaryFile(
@@ -490,6 +510,7 @@ class TrajectoryReplay:
         exact_base: bool = False,
         fixture: dict | None = None,
         table: dict | None = None,
+        cap: dict | None = None,
     ):
         self.states = states
         self.obj_poses = obj_poses
@@ -524,11 +545,11 @@ class TrajectoryReplay:
 
         # Static props are recorded in the sim world, so they need the ground-truth anchor.
         if not (self.obj_gt_ref and self.ref_poses is not None):
-            fixture, table = None, None
-        self.fixture, self.table = fixture, self._resolve_table(table)
+            fixture, table, cap = None, None, None
+        self.fixture, self.table, self.cap = fixture, self._resolve_table(table), cap
 
         self.model = build_model(
-            mesh_path, collidable_object, object_margin, self.fixture, self.table
+            mesh_path, collidable_object, object_margin, self.fixture, self.table, self.cap
         )
         self.data = mujoco.MjData(self.model)
         self.data.qpos[:] = self.model.qpos0  # fixed standing base
@@ -733,6 +754,8 @@ class TrajectoryReplay:
         self.data.qpos[self.obj_qadr + 3 : self.obj_qadr + 7] = R.from_matrix(
             t_wo[:3, :3]
         ).as_quat(scalar_first=True)
+        if self.cap is not None:
+            self._place_static("cap", self.cap["poses"][self.object_index(i)])
         mujoco.mj_forward(self.model, self.data)
 
         # Object-local contact points -> world, using the box pose we just placed, so the red
@@ -917,6 +940,7 @@ def main() -> None:
             )
 
     fixture, table = load_scene_props(traj) if args.ground_truth else (None, None)
+    cap = load_cap_gt(traj, ob_src) if args.ground_truth and ob_src is not None else None
     if not args.ground_truth and (traj / "object_gt").is_dir():
         print("[info] scene      : fixture/table are only drawn with --ground-truth")
 
@@ -924,8 +948,10 @@ def main() -> None:
         states, obj_poses, mesh, base_quats, obj_to_robot,
         obj_in_world=args.filtered, obj_gt_ref=args.ground_truth, ref_poses=ref_poses,
         contacts_local=contacts_local, pelvis_poses=pelvis_poses, exact_base=exact_base,
-        fixture=fixture, table=table,
+        fixture=fixture, table=table, cap=cap,
     )
+    if replay.cap is not None:
+        print(f"[info] cap        : screw cap, {replay.cap['poses'].shape[0]} recorded poses")
     if replay.fixture is not None:
         print(f"[info] fixture    : {len(replay.fixture['parts'])} parts")
     if replay.table is not None:

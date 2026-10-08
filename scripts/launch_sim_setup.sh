@@ -60,7 +60,8 @@
 #                    hammer   pick up the hammer, hit the nail      (nail block)
 #                    carton   lift a handle-less box with both palms (no fixture, 0.58 table)
 #                    pitcher  grab the handle, pour into the bowl    (bowl)
-#                    bottle   stand the lying bottle upright         (no fixture)
+#                    bottle   stand the lying bottle upright         (no fixture; the cap
+#                             unscrews off after 3.5 rad of twist, 'o' re-caps it)
 #                    peg      put the lying peg in the hole          (hole block)
 #                    pan      move the pan onto the stove            (stove)
 #                    book     put the flat book upright on the shelf (bookshelf)

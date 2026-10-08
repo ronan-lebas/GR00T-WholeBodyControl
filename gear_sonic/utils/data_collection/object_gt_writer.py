@@ -16,6 +16,11 @@ For each recorded episode this produces, under ``<dataset_root>/object_gt/``::
                                      #   base_vel            : 6 floats  (freejoint qvel)
                                      #   object_vel          : 6 floats  (freejoint qvel)
                                      #   joint_vel           : N floats  (observation.state order)
+                                     # screw-cap objects only (bottle):
+                                     #   cap_in_world        : 16 floats (4x4 row-major)
+                                     #   cap_vel             : 6 floats  (freejoint qvel)
+                                     #   cap_angle           : float     (rad unscrewed)
+                                     #   cap_attached        : bool      (False once it came off)
 
 ``ob_in_world`` is the box's absolute pose in the MuJoCo world frame; ``ref_in_world`` is
 the pose of the ground-truth reference body (``right_ankle_roll_link``) in that same world,
@@ -90,6 +95,10 @@ class ObjectGtWriter:
         joint_vel=None,
         fixture_in_world=None,
         table=None,
+        cap_in_world=None,
+        cap_vel=None,
+        cap_angle=None,
+        cap_attached=None,
     ) -> None:
         """Buffer one ground-truth frame.
 
@@ -124,6 +133,16 @@ class ObjectGtWriter:
                     else np.asarray(object_vel, dtype=np.float64).reshape(-1)
                 ),
                 "joint_vel": jvel,
+                "cap_in_world": (
+                    None
+                    if cap_in_world is None
+                    else np.asarray(cap_in_world, dtype=np.float64).reshape(16)
+                ),
+                "cap_vel": (
+                    None if cap_vel is None else np.asarray(cap_vel, dtype=np.float64).reshape(6)
+                ),
+                "cap_angle": cap_angle,
+                "cap_attached": cap_attached,
             }
         )
         # Write the shared object mesh once (needed for ground-truth-only replay).
@@ -210,6 +229,9 @@ class ObjectGtWriter:
             shutil.copyfile(src / fname, out.parent / f"object_collision_{i:03d}.stl")
         for part in (meta.get("fixture") or {}).get("parts", []):
             shutil.copyfile(src / part["mesh"], out.parent / part["mesh"])
+        for part in (meta.get("screw_cap") or {}).get("parts", []):
+            shutil.copyfile(src / part["mesh"], out.parent / part["mesh"])
+            shutil.copyfile(src / part["collision"], out.parent / part["collision"])
 
     def discard_episode(self) -> None:
         """Drop the current (partial) episode without writing it."""
@@ -235,24 +257,35 @@ class ObjectGtWriter:
                     (r[key].tolist() if r[key] is not None else zeros) for r in self._rows
                 ]
 
-            table = pa.table(
-                {
-                    "proprio_frame_index": pa.array(
-                        [r["proprio_frame_index"] for r in self._rows], pa.int64()
-                    ),
-                    "timestamp": pa.array([r["timestamp"] for r in self._rows], pa.float64()),
-                    "ob_in_world": pa.array(_flat("ob_in_world", 16), pa.list_(pa.float64(), 16)),
-                    "ref_in_world": pa.array(_flat("ref_in_world", 16), pa.list_(pa.float64(), 16)),
-                    "pelvis_in_world": pa.array(
-                        _flat("pelvis_in_world", 16), pa.list_(pa.float64(), 16)
-                    ),
-                    "base_vel": pa.array(_flat("base_vel", 6), pa.list_(pa.float64(), 6)),
-                    "object_vel": pa.array(_flat("object_vel", 6), pa.list_(pa.float64(), 6)),
-                    "joint_vel": pa.array(
-                        _flat("joint_vel", n_joints), pa.list_(pa.float64(), n_joints)
-                    ),
-                }
+            columns = {
+                "proprio_frame_index": pa.array(
+                    [r["proprio_frame_index"] for r in self._rows], pa.int64()
+                ),
+                "timestamp": pa.array([r["timestamp"] for r in self._rows], pa.float64()),
+                "ob_in_world": pa.array(_flat("ob_in_world", 16), pa.list_(pa.float64(), 16)),
+                "ref_in_world": pa.array(_flat("ref_in_world", 16), pa.list_(pa.float64(), 16)),
+                "pelvis_in_world": pa.array(
+                    _flat("pelvis_in_world", 16), pa.list_(pa.float64(), 16)
+                ),
+                "base_vel": pa.array(_flat("base_vel", 6), pa.list_(pa.float64(), 6)),
+                "object_vel": pa.array(_flat("object_vel", 6), pa.list_(pa.float64(), 6)),
+                "joint_vel": pa.array(
+                    _flat("joint_vel", n_joints), pa.list_(pa.float64(), n_joints)
+                ),
+            }
+            if any(r["cap_in_world"] is not None for r in self._rows):
+                columns["cap_in_world"] = pa.array(
+                    _flat("cap_in_world", 16), pa.list_(pa.float64(), 16)
+                )
+                columns["cap_vel"] = pa.array(_flat("cap_vel", 6), pa.list_(pa.float64(), 6))
+                columns["cap_angle"] = pa.array(
+                    [float(r["cap_angle"] or 0.0) for r in self._rows], pa.float64()
+                )
+                columns["cap_attached"] = pa.array(
+                    [bool(r["cap_attached"]) for r in self._rows], pa.bool_()
+                )
+            pq.write_table(
+                pa.table(columns), self.base / f"episode_{self._episode_index:06d}.parquet"
             )
-            pq.write_table(table, self.base / f"episode_{self._episode_index:06d}.parquet")
         self._episode_index = None
         self._rows = []

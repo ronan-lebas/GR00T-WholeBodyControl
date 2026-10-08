@@ -355,20 +355,28 @@ def fixture_bowl():
     ]
 
 
-def spec_bottle(radius=0.0375, body_len=0.19, sections=16):
+def spec_bottle(radius=0.0375, body_len=0.19, sections=16, cap_r=0.019, cap_len=0.022,
+                cap_gap=0.0015):
     """Bottle lying on its side (cap +x). The label ring is the lowest hull, so it rests on the
-    label; the faceted section keeps it from rolling away on its own."""
+    label; the faceted section keeps it from rolling away on its own.
+
+    The cap is a separate screw-cap body (``"body": "cap"``, see ``LAYOUTS["bottle"]``). It sits
+    ``cap_gap`` off the neck tip so the two hulls never touch while it is screwed on."""
     glass = (0.20, 0.50, 0.35, 1.0)
     label_r = radius + 0.0008
     z = _inradius(label_r, sections)
     x0 = -body_len / 2
+    neck_end = x0 + body_len + 0.075
+    cap = _cylinder(cap_r, cap_len, "x", (neck_end + cap_gap + cap_len / 2, 0, z),
+                    (0.80, 0.10, 0.10, 1.0), sections=12)
+    cap["body"] = "cap"
     return [
         _cylinder(radius, body_len, "x", (0, 0, z), glass, sections=sections, flat_down=True),
         _cylinder(label_r, 0.09, "x", (x0 + 0.08, 0, z), (0.95, 0.90, 0.75, 1.0),
                   sections=sections, flat_down=True),
         _cylinder(0.029, 0.025, "x", (x0 + body_len + 0.0125, 0, z), glass),
         _cylinder(0.016, 0.05, "x", (x0 + body_len + 0.05, 0, z), glass),
-        _cylinder(0.018, 0.018, "x", (x0 + body_len + 0.084, 0, z), (0.80, 0.10, 0.10, 1.0)),
+        cap,
     ]
 
 
@@ -493,11 +501,18 @@ SPECS = {
 # spawn (x, y); ``fixture`` is (spec, (dx, dy) from the object's spawn position in world axes);
 # ``sliding_friction`` replaces the sim's grip-tuned 2.0 (the object's contact params win against
 # both the fingers and the table, so a lower value is what makes sliding on the table possible).
+# ``screw_cap`` turns the spec's ``"body": "cap"`` parts into a separate cap body (_stage_cap).
 LAYOUTS = {
     "laptop": dict(spawn_offset=(0.06, 0.0), sliding_friction=0.8),
     "hammer": dict(spawn_offset=(0.0, -0.12), fixture=(fixture_nail_block, (0.06, 0.26))),
     "pitcher": dict(spawn_offset=(0.12, -0.10), fixture=(fixture_bowl, (0.0, 0.25))),
-    "bottle": dict(spawn_yaw=float(np.pi / 2)),
+    "bottle": dict(spawn_yaw=float(np.pi / 2), screw_cap=dict(
+        mass=0.02,
+        release_angle=3.5,  # rad of unscrewing (cap +x rotation) before the threads let go
+        lead=0.004,  # m of axial travel per turn
+        friction_torque=0.04,  # N.m Coulomb, so the cap stays put between regrasps
+        damping=0.001,  # N.m.s/rad
+    )),
     "peg": dict(spawn_offset=(0.0, -0.10), fixture=(fixture_hole_block, (0.05, 0.24))),
     "pan": dict(spawn_offset=(0.02, -0.12), fixture=(fixture_stove, (0.09, 0.30))),
     "book": dict(spawn_offset=(-0.06, -0.10), fixture=(fixture_bookshelf, (0.08, 0.28))),
@@ -665,6 +680,13 @@ def make(
         kwargs = {**variant_kwargs, **{k: v for k, v in kwargs.items() if v is not None}}
     spec_kwargs = {k: v for k, v in kwargs.items() if v is not None}
     parts = _recenter(spec_fn(**spec_kwargs))
+    # bbox (spawn placement) covers the capped object; everything else is the main body only.
+    lo, hi = trimesh.util.concatenate([_part_mesh(p) for p in parts]).bounds
+    layout = LAYOUTS.get(name, {})
+    cap_parts = [p for p in parts if p.get("body") == "cap"]
+    if cap_parts and "screw_cap" not in layout:
+        raise ValueError(f"'{name}' has cap parts but no LAYOUTS screw_cap entry")
+    parts = [p for p in parts if p.get("body") != "cap"]
     meshes = [_part_mesh(p) for p in parts]
 
     out.mkdir(parents=True, exist_ok=True)
@@ -677,9 +699,7 @@ def make(
         collision_names.append(col)
         visual_parts.append({"mesh": vis, "rgba": " ".join(f"{v:g}" for v in part["rgba"])})
 
-    combined = trimesh.util.concatenate(meshes)
-    combined.export(out / "visual.obj")
-    lo, hi = combined.bounds
+    trimesh.util.concatenate(meshes).export(out / "visual.obj")
     unit_mass, com, fullinertia = _rigid_body_properties(parts)
 
     label = name if variant is None else variant_name(name, variant)
@@ -711,12 +731,13 @@ def make(
         meta["variant"] = variant
         meta["variant_desc"] = variant_desc
         meta["spec"] = {**defaults, **spec_kwargs}
-    layout = LAYOUTS.get(name, {})
     for key in ("spawn_yaw", "spawn_offset", "sliding_friction"):
         if key in layout:
             meta[key] = layout[key]
     if "fixture" in layout:
         meta["fixture"] = _stage_fixture(out, *layout["fixture"])
+    if cap_parts:
+        meta["screw_cap"] = _stage_cap(out, cap_parts, layout["screw_cap"])
     (out / "object.json").write_text(json.dumps(meta, indent=2) + "\n")
 
     print(f"[make_primitive_asset] {label} -> {out}")
@@ -727,7 +748,42 @@ def make(
     if "fixture" in meta:
         fx = meta["fixture"]
         print(f"  fixture '{fx['name']}': {len(fx['parts'])} parts at offset {fx['offset']} m")
+    if "screw_cap" in meta:
+        sc = meta["screw_cap"]
+        print(f"  screw cap: {len(sc['parts'])} parts, releases after {sc['release_angle']} rad")
     return out
+
+
+def _stage_cap(out: Path, cap_parts, params: dict) -> dict:
+    """Export the screw cap in its own frame (same axes as the object, origin at the cap bbox
+    center) and return its ``object.json["screw_cap"]`` entry. ``axis`` (object frame) points out
+    of the bottle; unscrewing is a positive rotation about it."""
+    lo, hi = trimesh.util.concatenate([_part_mesh(p) for p in cap_parts]).bounds
+    center = (lo + hi) / 2.0
+    for p in cap_parts:
+        p["pos"] = tuple(np.asarray(p["pos"], dtype=float) - center)
+    entries = []
+    for i, part in enumerate(cap_parts):
+        mesh = _part_mesh(part)
+        vis, col = f"cap_part_{i:03d}.obj", f"cap_collision_{i:03d}.stl"
+        mesh.export(out / vis)
+        mesh.export(out / col)
+        entries.append(
+            {"mesh": vis, "collision": col, "rgba": " ".join(f"{v:g}" for v in part["rgba"])}
+        )
+    unit_mass, com, fullinertia = _rigid_body_properties(cap_parts)
+    axis = {"x": [1.0, 0.0, 0.0], "y": [0.0, 1.0, 0.0], "z": [0.0, 0.0, 1.0]}[
+        cap_parts[0]["axis"]
+    ]
+    return {
+        "parts": entries,
+        "pos": [float(v) for v in center],
+        "axis": axis,
+        "unit_mass": float(unit_mass),
+        "com": [float(v) for v in com],
+        "fullinertia": [float(v) for v in fullinertia],
+        **{k: float(v) for k, v in params.items()},
+    }
 
 
 def _stage_fixture(out: Path, spec_fn, offset) -> dict:
@@ -741,6 +797,8 @@ def _stage_fixture(out: Path, spec_fn, offset) -> dict:
         fname = f"fixture_{i:03d}.obj"
         mesh.export(out / fname)
         entries.append({"mesh": fname, "rgba": " ".join(f"{v:g}" for v in part["rgba"])})
+        if not part.get("collide", True):
+            entries[-1]["collide"] = False
     lo, hi = trimesh.util.concatenate(meshes).bounds
     return {
         "name": spec_fn.__name__.removeprefix("fixture_"),

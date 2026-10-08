@@ -24,6 +24,7 @@ from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 
 from gear_sonic.utils.box_appearance import box_face_slabs
 from gear_sonic.utils.mujoco_sim.metric_utils import check_contact, check_height
+from gear_sonic.utils.mujoco_sim.screw_cap import CAP_BODY_NAME, ScrewCap, append_screw_cap
 from gear_sonic.utils.mujoco_sim.sim_utils import get_subtree_body_names
 from gear_sonic.utils.mujoco_sim.unitree_sdk2py_bridge import ElasticBand, UnitreeSdk2Bridge
 from gear_sonic.utils.mujoco_sim.robot import Robot
@@ -300,7 +301,9 @@ class DefaultEnv:
             slab.set("mass", "0")
 
     @staticmethod
-    def _append_mesh_object(worldbody: ET.Element, asset: ET.Element, object_config: dict) -> None:
+    def _append_mesh_object(
+        worldbody: ET.Element, asset: ET.Element, object_config: dict
+    ) -> ET.Element:
         """Append a free mesh object (staged asset dir) to the worldbody.
 
         The asset dir is what ``prepare_object_asset.py`` writes: one visual mesh plus a set of
@@ -373,11 +376,13 @@ class DefaultEnv:
             visual.set("conaffinity", "0")
             visual.set("mass", "0")
             visual.set("rgba", object_config.get("rgba", "0.75 0.6 0.4 1"))
+        return body
 
     @staticmethod
     def _append_fixture(worldbody: ET.Element, asset: ET.Element, fixture: dict) -> None:
         """Append a task's static fixture (no joint): each part is one convex mesh that both
-        collides and renders, so unlike the object it needs no hidden hull group."""
+        collides (unless ``collide: false``, e.g. a decal) and renders, so unlike the object it
+        needs no hidden hull group."""
         asset_dir = Path(fixture["asset_dir"])
         pos, quat = fixture["pos"], fixture["quat"]
         body = ET.SubElement(worldbody, "body")
@@ -393,6 +398,9 @@ class DefaultEnv:
             geom.set("type", "mesh")
             geom.set("mesh", name)
             geom.set("rgba", part.get("rgba", "0.6 0.6 0.6 1"))
+            if not part.get("collide", True):
+                geom.set("contype", "0")
+                geom.set("conaffinity", "0")
 
     def _inject_scene_objects(
         self, xml_path: str, object_config: dict | None, table_config: dict | None
@@ -409,7 +417,9 @@ class DefaultEnv:
                 asset = root.find("asset")
                 if asset is None:
                     asset = ET.SubElement(root, "asset")
-                self._append_mesh_object(worldbody, asset, object_config)
+                body = self._append_mesh_object(worldbody, asset, object_config)
+                if object_config["meta"].get("screw_cap"):
+                    append_screw_cap(root, body, object_config, COLLISION_GEOM_GROUP)
                 if object_config.get("fixture"):
                     self._append_fixture(worldbody, asset, object_config["fixture"])
             else:
@@ -470,6 +480,10 @@ class DefaultEnv:
 
         self._setup_held_box(object_config)
         self._setup_object_reset(object_config)
+        self.screw_cap = None
+        if object_config and object_config.get("kind") == "mesh":
+            if object_config["meta"].get("screw_cap"):
+                self.screw_cap = ScrewCap(self.mj_model, self.mj_data, object_config)
         self._warn_on_spawn_overlap(object_config)
 
         self.joint_class_map = self._get_dof_indices_by_class()
@@ -785,7 +799,7 @@ class DefaultEnv:
         if not object_config or object_config.get("held"):
             return
         mujoco.mj_forward(self.mj_model, self.mj_data)
-        scene = (None, "world", "table", OBJECT_BODY_NAME, FIXTURE_BODY_NAME)
+        scene = (None, "world", "table", OBJECT_BODY_NAME, FIXTURE_BODY_NAME, CAP_BODY_NAME)
         for body_name in (OBJECT_BODY_NAME, FIXTURE_BODY_NAME):
             body = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
             if body < 0:
@@ -814,6 +828,8 @@ class DefaultEnv:
         qadr = self.box_qadr
         self.mj_data.qpos[qadr : qadr + 7] = self.box_spawn_pose
         self.mj_data.qvel[self.box_dofadr : self.box_dofadr + 6] = 0.0
+        if self.screw_cap is not None:
+            self.screw_cap.reset(self.box_spawn_pose)
         # Propagate so same-frame renders/observations see the reset pose.
         mujoco.mj_forward(self.mj_model, self.mj_data)
         print("[Sim] object reset to spawn pose")
@@ -952,6 +968,8 @@ class DefaultEnv:
           - ``object_vel``       : (6,) box freejoint qvel, same convention (world lin / local ang)
           - ``joint_vel``        : (num_joints,) joint velocities in whole_q / observation.state
                                    ordering (see _ensure_gt_jointvel_map)
+          - ``cap``              : None, or for a screw-cap object ``cap_in_world`` (4x4),
+                                   ``cap_vel`` (6,), ``cap_angle`` (rad unscrewed), ``cap_attached``
         """
         poses = self.get_box_gt_poses()
         if poses is None:
@@ -981,6 +999,19 @@ class DefaultEnv:
         for dofadr, didx in self._gt_jointvel_map:
             joint_vel[didx] = self.mj_data.qvel[dofadr]
 
+        cap = None
+        if self.screw_cap is not None:
+            cap_in_world = np.eye(4)
+            bid = self.screw_cap.body_id
+            cap_in_world[:3, :3] = self.mj_data.xmat[bid].reshape(3, 3)
+            cap_in_world[:3, 3] = self.mj_data.xpos[bid]
+            cap = {
+                "cap_in_world": cap_in_world,
+                "cap_vel": self.screw_cap.cap_vel,
+                "cap_angle": self.screw_cap.angle,
+                "cap_attached": self.screw_cap.attached,
+            }
+
         return {
             "ob_in_world": box_in_world,
             "ref_in_world": ref_in_world,
@@ -988,6 +1019,7 @@ class DefaultEnv:
             "base_vel": base_vel,
             "object_vel": object_vel,
             "joint_vel": joint_vel,
+            "cap": cap,
         }
 
     def get_root_vel(self) -> np.ndarray:
@@ -1202,6 +1234,8 @@ class DefaultEnv:
             self.mj_data.ctrl = self.torques
         mujoco.mj_step(self.mj_model, self.mj_data)
 
+        if self.screw_cap is not None:
+            self.screw_cap.update()
         if self.held_box:
             self._update_held_box()
 
@@ -1327,6 +1361,8 @@ class DefaultEnv:
 
     def reset(self):
         mujoco.mj_resetData(self.mj_model, self.mj_data)
+        if self.screw_cap is not None:
+            self.screw_cap.reset(self.box_spawn_pose)
         # mj_resetData zeroes derived quantities (xpos/xquat/sensordata); recompute
         # them so the same-frame elastic band / observations don't see zero quaternions.
         mujoco.mj_forward(self.mj_model, self.mj_data)
@@ -1525,6 +1561,12 @@ class BaseSimulator:
             "table": self.sim_env.table_config,  # pos / top_size / top_thickness / height, or None
             "timestamp": time.time(),
         }
+        if gt["cap"] is not None:
+            cap = gt["cap"]
+            msg["cap_in_world"] = cap["cap_in_world"].reshape(-1).tolist()
+            msg["cap_vel"] = cap["cap_vel"].tolist()
+            msg["cap_angle"] = cap["cap_angle"]
+            msg["cap_attached"] = cap["cap_attached"]
         try:
             self._box_gt_socket.send(msgpack.packb(msg, use_bin_type=True), flags=zmq.NOBLOCK)
         except Exception:
