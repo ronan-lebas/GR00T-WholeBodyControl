@@ -421,6 +421,11 @@ class SimLoopConfig(BaseConfig):
     is per-asset — e.g. pi/2 turns the shipped SANDSBERG chair's backrest toward the robot,
     and lays the plate/bar left-right instead of front-back."""
 
+    object_pitch: Optional[float] = None
+    """Mesh-object spawn pitch in radians about +y, applied before --object-yaw (default 0: the
+    asset's own up). Tips the object over, e.g. -1.5708 stands the lying bottle upright (its +x
+    cap axis points up); the tabletop spawn height follows the tipped bbox."""
+
     object_mass: Optional[float] = None
     """Mesh-object mass in kg. Default: the asset's ``spawn_mass`` in object.json, else
     OBJECT_MASS in run_sim_loop.py. Deliberately light — the recordings don't need a physical

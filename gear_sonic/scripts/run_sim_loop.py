@@ -113,7 +113,24 @@ def build_mesh_object_config(config: "ArgsConfig") -> dict:
     else:
         mass = float(meta.get("spawn_mass", OBJECT_MASS))
 
-    footprint = _yawed_footprint(meta["bbox_min"], meta["bbox_max"], yaw)
+    bbox_min, bbox_max, z_min = meta["bbox_min"], meta["bbox_max"], float(meta["z_min"])
+    pitch = config.object_pitch or 0.0
+    if pitch:
+        # Pitch (about +y, applied before the yaw) tips the asset over, e.g. -pi/2 stands the
+        # lying bottle on its base, cap up. Re-derive the bbox and lowest point in the tipped
+        # frame from the asset bbox (z_min from object.json only holds for the asset's own up).
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        corners = [
+            (x * cp + z * sp, y, -x * sp + z * cp)
+            for x in (bbox_min[0], bbox_max[0])
+            for y in (bbox_min[1], bbox_max[1])
+            for z in (bbox_min[2], bbox_max[2])
+        ]
+        bbox_min = [min(c[i] for c in corners) for i in range(3)]
+        bbox_max = [max(c[i] for c in corners) for i in range(3)]
+        z_min = bbox_min[2]
+
+    footprint = _yawed_footprint(bbox_min, bbox_max, yaw)
     surface = config.table_height if config.table else 0.0
     if config.object_pos:
         pos = tuple(config.object_pos)
@@ -122,7 +139,7 @@ def build_mesh_object_config(config: "ArgsConfig") -> dict:
     else:
         # z places the mesh's lowest collision point just above the surface, whatever the
         # asset's own origin height is.
-        z = surface - float(meta["z_min"]) + OBJECT_SURFACE_CLEARANCE
+        z = surface - z_min + OBJECT_SURFACE_CLEARANCE
         dx, dy = meta.get("spawn_offset", (0.0, 0.0))
         if config.table:
             # Same "slightly toward the robot" spawn as the cube, but clamped so a long
@@ -164,7 +181,13 @@ def build_mesh_object_config(config: "ArgsConfig") -> dict:
         "asset_dir": str(asset_dir),
         "meta": meta,
         "pos": pos,
-        "quat": (math.cos(yaw / 2.0), 0.0, 0.0, math.sin(yaw / 2.0)),
+        # Rz(yaw) * Ry(pitch), (w, x, y, z); pitch 0 is the plain yaw quaternion.
+        "quat": (
+            math.cos(yaw / 2.0) * math.cos(pitch / 2.0),
+            -math.sin(yaw / 2.0) * math.sin(pitch / 2.0),
+            math.cos(yaw / 2.0) * math.sin(pitch / 2.0),
+            math.sin(yaw / 2.0) * math.cos(pitch / 2.0),
+        ),
         "mass": mass,
         "fixture": fixture,
         # Same grip/anti-sink tuning as the graspable cube (it is generic contact tuning).
