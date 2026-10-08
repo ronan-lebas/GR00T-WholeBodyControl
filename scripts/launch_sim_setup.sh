@@ -62,10 +62,20 @@
 #                    pitcher  grab the handle, pour into the bowl    (bowl)
 #                    bottle   stand the lying bottle upright         (no fixture; the cap
 #                             unscrews off after 3.5 rad of twist, 'o' re-caps it)
+#                    soda     pick the bottle up right hand, hand it (no fixture; standing,
+#                             over, put it down on the left           ~65 mm wide, fixed cap)
 #                    peg      put the lying peg in the hole          (hole block)
 #                    pan      move the pan onto the stove            (stove)
 #                    book     put the flat book upright on the shelf (bookshelf)
 #                    drill    pick up the drill, aim at the target   (target board)
+#                    mug      hang the mug by its handle             (mug tree)
+#                    ring     put the flat ring over the post        (post)
+#                    lid      put the lid on the pot                 (pot)
+#                    can      hand the can over right -> left hand   (coaster, on the left)
+#                    puck     push the slippery puck into the goal   (goal)
+#                    sponge   wipe the stain                         (stain decal, no collision)
+#                    bowl     flip the upside-down bowl onto the mat (placemat)
+#                    knife    put the knife blade-down in the block  (knife block)
 #   --variant N    (--object bar) geometric variant of the bar: 0 = the plain bar (default), N>0
 #                  spawns data/objects/bar_vN (round / thick / thin / prism shafts, other caps,
 #                  lengths...). Same task prompt and 0.5 kg for all. List them:
@@ -241,6 +251,10 @@ case "$TASK" in
                 TASK_PROMPT="${TASK_PROMPT:-stand the bottle upright}"
                 PRIMITIVE=bottle
                 ;;
+            soda)
+                TASK_PROMPT="${TASK_PROMPT:-pick up the bottle with the right hand, pass it to the left hand and put it down on the left}"
+                PRIMITIVE=soda
+                ;;
             peg)
                 TASK_PROMPT="${TASK_PROMPT:-put the peg in the hole}"
                 PRIMITIVE=peg
@@ -257,9 +271,42 @@ case "$TASK" in
                 TASK_PROMPT="${TASK_PROMPT:-pick up the drill and point it at the target}"
                 PRIMITIVE=drill
                 ;;
+            mug)
+                TASK_PROMPT="${TASK_PROMPT:-hang the mug on the mug tree}"
+                PRIMITIVE=mug
+                ;;
+            ring)
+                TASK_PROMPT="${TASK_PROMPT:-put the ring on the post}"
+                PRIMITIVE=ring
+                ;;
+            lid)
+                TASK_PROMPT="${TASK_PROMPT:-put the lid on the pot}"
+                PRIMITIVE=lid
+                ;;
+            can)
+                TASK_PROMPT="${TASK_PROMPT:-pass the can to the left hand and put it on the coaster}"
+                PRIMITIVE=can
+                ;;
+            puck)
+                TASK_PROMPT="${TASK_PROMPT:-slide the puck into the goal}"
+                PRIMITIVE=puck
+                ;;
+            sponge)
+                TASK_PROMPT="${TASK_PROMPT:-wipe the stain with the sponge}"
+                PRIMITIVE=sponge
+                ;;
+            bowl)
+                TASK_PROMPT="${TASK_PROMPT:-turn the bowl upright and put it on the placemat}"
+                PRIMITIVE=bowl
+                ;;
+            knife)
+                TASK_PROMPT="${TASK_PROMPT:-put the knife in the knife block}"
+                PRIMITIVE=knife
+                ;;
             *)
                 echo "ERROR: unknown --object '$OBJECT' (expected cube, plate, bar, handled-box or a task" >&2
-                echo "  object: laptop hammer carton pitcher bottle peg pan book drill)." >&2
+                echo "  object: laptop hammer carton pitcher bottle soda peg pan book drill mug ring lid" >&2
+                echo "  can puck sponge bowl knife)." >&2
                 exit 2
                 ;;
         esac
@@ -543,7 +590,7 @@ launch_tmux() {
 
 usage() {
     cat >&2 <<EOF
-Usage: $0 [all|sim|deploy|relay|manager|recorder|viewer|mock|teardown|kill] [--task tabletop|chair] [--object cube|plate|bar|handled-box|laptop|hammer|carton|pitcher|bottle|peg|pan|book|drill] [--variant N] [--chair-asset DIR] [--mock-quest] [--replay-quest [npz]] [--print]
+Usage: $0 [all|sim|deploy|relay|manager|recorder|viewer|mock|teardown|kill] [--task tabletop|chair] [--object cube|plate|bar|handled-box|laptop|hammer|carton|pitcher|bottle|soda|peg|pan|book|drill|mug|ring|lid|can|puck|sponge|bowl|knife] [--variant N] [--chair-asset DIR] [--mock-quest] [--replay-quest [npz]] [--print]
 
 Sim manipulation stack (no robot — everything on this machine):
   (no args)  start sim + deploy + relay + manager + recorder + viewer (+ teardown) as tiled panes
@@ -558,7 +605,8 @@ Sim manipulation stack (no robot — everything on this machine):
                 SIM_EXTRA='--object-yaw 1.5708' lays the plate/bar left-right. Assets are staged
                 on demand into $OBJECT_ASSET_DIR.
                 Task objects (each with its own prompt, most with a static goal fixture):
-                laptop hammer carton pitcher bottle peg pan book drill.
+                laptop hammer carton pitcher bottle soda peg pan book drill mug ring lid can
+                puck sponge bowl knife.
   --variant N   (--object bar) geometric bar variant, 0 = plain bar (default); spawns bar_vN.
                 List: make_primitive_asset.py bar --list-variants
   --chair-asset DIR  staged chair asset to spawn (default $CHAIR_ASSET); preview candidates

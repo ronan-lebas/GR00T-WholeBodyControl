@@ -11,10 +11,11 @@ visualizer and ``process_contacts.py`` all consume these objects unchanged::
     <out>/object.json
 
 plate / bar / handled_box force *bimanual* manipulation: each is too long or too wide for one
-hand to control. The task objects (laptop, hammer, carton, pitcher, bottle, peg, pan, book,
-drill) come with a scene layout (``LAYOUTS``): a spawn offset on the table and, for most, a static
-fixture that defines the goal (nail block, bowl, hole block, stove, bookshelf, target). Only the
-object is tracked; the fixture never moves.
+hand to control. The task objects (laptop, hammer, carton, pitcher, bottle, soda, peg, pan, book,
+drill, mug, ring, lid, can, puck, sponge, bowl, knife) come with a scene layout (``LAYOUTS``): a
+spawn offset on the table and, for most, a static fixture that defines the goal (nail block, bowl,
+hole block, stove, bookshelf, target, mug tree, post, pot, coaster, goal, stain, placemat, knife
+block). Only the object is tracked; the fixture never moves.
 
 The bar also has a catalog of geometric variants (``VARIANTS``) for collecting the same task
 on different shapes. Variant 0 is the plain ``bar``; variant N is staged as ``bar_vN``.
@@ -90,7 +91,7 @@ def _staves(r_bottom, height, flare, n, thickness, z0, rgba, center=(0.0, 0.0)):
     starting at ``r_bottom`` on z = ``z0``: a revolved wall is not convex, so it is built from
     convex pieces like every other part."""
     r_top = r_bottom + height * np.tan(flare)
-    width = 2 * np.pi * r_top / n * 1.05
+    width = 2 * np.pi * max(r_bottom, r_top) / n * 1.05
     r_mid = r_bottom + 0.5 * height * np.tan(flare) + thickness / 2
     half = (thickness / 2, width / 2, height / np.cos(flare) / 2)
     parts = []
@@ -380,6 +381,24 @@ def spec_bottle(radius=0.0375, body_len=0.19, sections=16, cap_r=0.019, cap_len=
     ]
 
 
+def spec_soda_bottle(radius=0.0325, body_len=0.13):
+    """0.5 L PET soda bottle (~65 mm wide, ~20 cm tall) standing on its base, cap up. Unlike
+    ``spec_bottle`` the cap is part of the bottle: there is nothing to unscrew. Dimensions are
+    generic, not measured."""
+    pet = (0.25, 0.12, 0.08, 1.0)
+    red = (0.80, 0.08, 0.10, 1.0)
+    shoulder_len, neck_len, cap_len = 0.03, 0.025, 0.018
+    neck_z0 = body_len + shoulder_len
+    return [
+        _cylinder(radius, body_len, "z", (0, 0, body_len / 2), pet),
+        _cylinder(radius + 0.0008, 0.06, "z", (0, 0, 0.07), red),
+        _cylinder(0.025, shoulder_len, "z", (0, 0, body_len + shoulder_len / 2), pet),
+        _cylinder(0.0135, neck_len, "z", (0, 0, neck_z0 + neck_len / 2), pet),
+        _cylinder(0.015, cap_len, "z", (0, 0, neck_z0 + neck_len + cap_len / 2), red,
+                  sections=12),
+    ]
+
+
 def spec_peg(radius=0.02, length=0.12, knob=0.06):
     """Round peg lying on its side with a cube knob at +x. The knob is wider than the hole, so it
     is the insertion stop, and it holds the shaft ~1 cm off the table."""
@@ -482,6 +501,212 @@ def fixture_target():
     return parts
 
 
+def spec_mug(radius=0.04, height=0.10, handle_gap=0.028, handle_h=0.07):
+    """Standing mug, handle on -y. The loop opening (``handle_gap`` x ~4 cm) is a real hole, wide
+    enough to thread over a mug-tree peg."""
+    glaze = (0.20, 0.55, 0.60, 1.0)
+    bar = 0.014
+    zc = height / 2 + 0.005
+    inner, outer = radius - 0.005, radius + handle_gap + bar
+    parts = [
+        _cylinder(radius, height, "z", (0, 0, height / 2), glaze),
+        _cylinder(radius - 0.004, 0.001, "z", (0, 0, height + 0.0005), (0.25, 0.14, 0.07, 1.0)),
+        _box((0.008, bar / 2, handle_h / 2), (0, -(outer - bar / 2), zc), glaze),
+    ]
+    for sz in (+1, -1):
+        parts.append(
+            _box((0.008, (outer - inner) / 2, bar / 2),
+                 (0, -(inner + outer) / 2, zc + sz * (handle_h - bar) / 2), glaze)
+        )
+    return parts
+
+
+def fixture_mug_tree(pole_h=0.25, peg_len=0.09, peg_tilt=0.5):
+    """Pole on a round base with two upward-tilted pegs, one toward the robot (-x), one to its
+    right (-y), each with an end knob."""
+    peg_c = (0.45, 0.30, 0.18, 1.0)
+    parts = [
+        _cylinder(0.07, 0.012, "z", (0, 0, 0.006), WOOD),
+        _cylinder(0.012, pole_h, "z", (0, 0, 0.012 + pole_h / 2), WOOD),
+    ]
+    c, s = np.cos(peg_tilt), np.sin(peg_tilt)
+    for z0, d, axis, rpy in (
+        (0.16, np.array([-c, 0.0, s]), "x", (0, peg_tilt, 0)),
+        (0.21, np.array([0.0, -c, s]), "y", (-peg_tilt, 0, 0)),
+    ):
+        root = np.array([0.0, 0.0, z0])
+        parts += [
+            _cylinder(0.007, peg_len, axis, tuple(root + d * peg_len / 2), peg_c, rpy=rpy),
+            _cylinder(0.011, 0.01, axis, tuple(root + d * peg_len), peg_c, rpy=rpy),
+        ]
+    return parts
+
+
+def spec_ring(inner=0.035, band=0.018, height=0.022, n=12):
+    """Flat ring lying on the table, a ``n``-gon of box segments. The 7 cm hole takes a finger, so
+    it can be pinched across the band."""
+    orange = (0.95, 0.45, 0.10, 1.0)
+    outer = inner + band
+    half_w = outer * np.tan(np.pi / n)  # outer corners meet; inner ends overlap the neighbors
+    r_mid = inner + band / 2
+    parts = []
+    for i in range(n):
+        th = 2 * np.pi * i / n
+        pos = (r_mid * np.cos(th), r_mid * np.sin(th), height / 2)
+        parts.append(_box((band / 2, half_w, height / 2), pos, orange, rpy=(0, 0, th)))
+    return parts
+
+
+def fixture_post(radius=0.02, height=0.13):
+    """Vertical post on a square base; 15 mm radial clearance inside the ring."""
+    return [
+        _box((0.06, 0.06, 0.0075), (0, 0, 0.0075), WOOD),
+        _cylinder(radius, height, "z", (0, 0, 0.015 + height / 2), (0.25, 0.30, 0.35, 1.0)),
+        _cylinder(radius - 0.004, 0.006, "z", (0, 0, 0.015 + height + 0.003), (0.25, 0.30, 0.35, 1.0)),
+    ]
+
+
+def spec_lid(radius=0.098, thickness=0.006, lip_r=0.074, lip_h=0.012):
+    """Pot lid with a knob. The locating lip underneath fits inside the pot's rim and, on the table,
+    holds the glass ~1 cm up so a fingertip can get under its edge."""
+    glass = (0.60, 0.75, 0.80, 1.0)
+    top = lip_h + thickness
+    return [
+        *_staves(lip_r, lip_h, 0.0, 16, 0.005, 0.0, STEEL),
+        _cylinder(radius, thickness, "z", (0, 0, lip_h + thickness / 2), glass),
+        _cylinder(0.007, 0.02, "z", (0, 0, top + 0.01), BLACK),
+        _cylinder(0.018, 0.014, "z", (0, 0, top + 0.027), BLACK),
+    ]
+
+
+def fixture_pot(radius=0.085, height=0.10, wall=0.006):
+    """Stock pot (hollow, ``radius`` inside) with two side handles."""
+    parts = [
+        _cylinder(radius + wall, 0.006, "z", (0, 0, 0.003), STEEL),
+        *_staves(radius, height, 0.0, 20, wall, 0.006, STEEL),
+    ]
+    for sy in (+1, -1):
+        parts.append(_box((0.02, 0.022, 0.006), (0, sy * (radius + wall + 0.02), height - 0.01), BLACK))
+    return parts
+
+
+def spec_can(radius=0.033, height=0.122):
+    """Standing soda can. It spawns on the robot's right and the coaster sits on its left, beyond
+    a comfortable right-hand reach: the task is a hand-to-hand handover."""
+    rim = 0.006
+    return [
+        _cylinder(radius - 0.004, rim, "z", (0, 0, rim / 2), STEEL),
+        _cylinder(radius, height - 2 * rim, "z", (0, 0, height / 2), (0.80, 0.08, 0.10, 1.0)),
+        _cylinder(radius - 0.004, rim, "z", (0, 0, height - rim / 2), STEEL),
+        _cylinder(radius + 0.0008, 0.04, "z", (0, 0, height / 2), (0.95, 0.95, 0.95, 1.0),
+                  sections=12),
+    ]
+
+
+def fixture_coaster():
+    return [
+        _cylinder(0.05, 0.005, "z", (0, 0, 0.0025), (0.70, 0.55, 0.38, 1.0)),
+        _cylinder(0.03, 0.0005, "z", (0, 0, 0.00525), (0.20, 0.35, 0.55, 1.0)),
+    ]
+
+
+def spec_puck(radius=0.05, height=0.022):
+    """Shuffleboard puck: wide, flush with the table and slippery (LAYOUTS), so it is pushed
+    rather than grasped."""
+    return [
+        _cylinder(radius, height, "z", (0, 0, height / 2), (0.75, 0.10, 0.12, 1.0)),
+        _cylinder(radius * 0.6, 0.001, "z", (0, 0, height + 0.0005), (0.95, 0.95, 0.95, 1.0)),
+    ]
+
+
+def fixture_goal(inner_w=0.15, depth=0.11, wall=0.012, height=0.035):
+    """Three low walls, open toward the robot (-x), with a corner flag. Origin is the center of
+    the goal area."""
+    green = (0.15, 0.55, 0.25, 1.0)
+    hz = height / 2
+    bx, fy = depth / 2 + wall / 2, inner_w / 2 + wall / 2
+    return [
+        _box((wall / 2, inner_w / 2 + wall, hz), (bx, 0, hz), green),
+        _box((depth / 2, wall / 2, hz), (0, +fy, hz), green),
+        _box((depth / 2, wall / 2, hz), (0, -fy, hz), green),
+        _cylinder(0.004, 0.12, "z", (bx, fy, height + 0.06), (0.9, 0.9, 0.9, 1.0)),
+        _box((0.001, 0.03, 0.02), (bx, fy - 0.034, height + 0.10), (0.95, 0.80, 0.10, 1.0)),
+    ]
+
+
+def spec_sponge(length=0.11, width=0.07, foam=0.03, scrub=0.008):
+    """Kitchen sponge, scrub pad up."""
+    return [
+        _box((length / 2, width / 2, foam / 2), (0, 0, foam / 2), (0.95, 0.85, 0.25, 1.0)),
+        _box((length / 2, width / 2, scrub / 2), (0, 0, foam + scrub / 2), (0.10, 0.50, 0.25, 1.0)),
+    ]
+
+
+def fixture_stain():
+    """Coffee spill decal, 0.1 mm proud of the table (the rest is buried in the tabletop). Visual
+    only: as colliders its rims dragged a sliding sponge to half its travel."""
+    brown = (0.35, 0.20, 0.08, 1.0)
+    blobs = ((0, 0, 0.045), (0.035, 0.03, 0.03), (-0.03, 0.035, 0.025), (0.02, -0.04, 0.028),
+             (-0.04, -0.02, 0.022), (0.06, -0.005, 0.015))
+    return [
+        {**_cylinder(r, 0.0006, "z", (x, y, -0.0002), brown), "collide": False}
+        for x, y, r in blobs
+    ]
+
+
+def spec_bowl(rim=0.09, depth=0.06, flare=0.45, wall=0.006):
+    """Bowl lying upside down, rim on the table. Same 16-slab wall as the pitcher's bowl fixture,
+    leaning in instead of out. The tan foot ring only shows while it is upside down."""
+    ceramic = (0.93, 0.91, 0.86, 1.0)
+    r_top = rim - depth * np.tan(flare)
+    return [
+        *_staves(rim, depth, -flare, 16, wall, 0.0, ceramic),
+        _cylinder(r_top + 0.004, 0.008, "z", (0, 0, depth + 0.004), ceramic),
+        _cylinder(0.04, 0.008, "z", (0, 0, depth + 0.012), (0.80, 0.65, 0.45, 1.0)),
+    ]
+
+
+def fixture_placemat():
+    return [
+        _box((0.13, 0.13, 0.0015), (0, 0, 0.0015), (0.55, 0.35, 0.50, 1.0)),
+        _cylinder(0.065, 0.0005, "z", (0, 0, 0.00325), (0.90, 0.85, 0.75, 1.0)),
+    ]
+
+
+def spec_knife(handle_len=0.11, blade_len=0.14, blade_w=0.03, blade_t=0.002, steel_density=2.5):
+    """Chef's knife lying flat, blade +x. The handle and the full-height bolster hold the blade
+    ~1 cm off the table. ``steel_density`` must keep the COM over the handle/bolster footprint,
+    or the knife tips onto its point."""
+    hz = 0.011
+    x0 = 0.006
+    return [
+        _box((handle_len / 2, 0.012, hz), (-x0 - handle_len / 2, 0, hz), BLACK),
+        _box((x0, 0.012, hz), (0, 0, hz), STEEL, density=steel_density),
+        _box((blade_len / 2, blade_w / 2, blade_t / 2), (x0 + blade_len / 2, 0, hz), STEEL,
+             density=steel_density),
+        _box((0.0175, 0.009, blade_t / 2), (x0 + blade_len + 0.0175, 0.006, hz), STEEL,
+             density=steel_density),
+    ]
+
+
+def fixture_knife_block(slot=0.008, slot_len=0.05, width=0.10, depth=0.11, height=0.16):
+    """Wooden block with one vertical slot (``slot`` x ``slot_len``, along x) down to the base
+    plate: the knife goes in blade-down, so it must be rolled 90 deg from how it lies."""
+    z = 0.012 + height / 2
+    side = (width - slot) / 4
+    cap = (depth - slot_len) / 4
+    parts = [
+        _box((depth / 2, width / 2, 0.006), (0, 0, 0.006), WOOD),
+        _box((slot_len / 2, slot / 2, 0.0005), (0, 0, 0.0125), BLACK),
+    ]
+    for s in (+1, -1):
+        parts += [
+            _box((depth / 2, side, height / 2), (0, s * (slot / 2 + side), z), WOOD),
+            _box((cap, slot / 2, height / 2), (s * (slot_len / 2 + cap), 0, z), WOOD),
+        ]
+    return parts
+
+
 SPECS = {
     "plate": (spec_plate, 0.4),
     "bar": (spec_bar, 0.5),
@@ -491,10 +716,19 @@ SPECS = {
     "carton": (spec_carton, 0.5),
     "pitcher": (spec_pitcher, 0.35),
     "bottle": (spec_bottle, 0.35),
+    "soda": (spec_soda_bottle, 0.35),
     "peg": (spec_peg, 0.2),
     "pan": (spec_pan, 0.45),
     "book": (spec_book, 0.5),
     "drill": (spec_drill, 0.6),
+    "mug": (spec_mug, 0.3),
+    "ring": (spec_ring, 0.15),
+    "lid": (spec_lid, 0.35),
+    "can": (spec_can, 0.35),
+    "puck": (spec_puck, 0.4),
+    "sponge": (spec_sponge, 0.08),
+    "bowl": (spec_bowl, 0.35),
+    "knife": (spec_knife, 0.2),
 }
 
 # Per-object scene layout, written into object.json. ``spawn_offset`` shifts the default tabletop
@@ -513,10 +747,22 @@ LAYOUTS = {
         friction_torque=0.04,  # N.m Coulomb, so the cap stays put between regrasps
         damping=0.001,  # N.m.s/rad
     )),
+    # Right of the robot, for the right hand to pick; it ends up on the left after the handover.
+    "soda": dict(spawn_offset=(0.08, -0.15)),
     "peg": dict(spawn_offset=(0.0, -0.10), fixture=(fixture_hole_block, (0.05, 0.24))),
     "pan": dict(spawn_offset=(0.02, -0.12), fixture=(fixture_stove, (0.09, 0.30))),
     "book": dict(spawn_offset=(-0.06, -0.10), fixture=(fixture_bookshelf, (0.08, 0.28))),
     "drill": dict(spawn_offset=(-0.02, 0.0), fixture=(fixture_target, (0.28, 0.22))),
+    "mug": dict(spawn_offset=(0.08, -0.12), fixture=(fixture_mug_tree, (0.12, 0.30))),
+    "ring": dict(spawn_offset=(0.0, -0.10), fixture=(fixture_post, (0.16, 0.26))),
+    "lid": dict(spawn_offset=(0.02, -0.12), fixture=(fixture_pot, (0.12, 0.28))),
+    "can": dict(spawn_offset=(0.08, -0.18), fixture=(fixture_coaster, (0.0, 0.40))),
+    "puck": dict(spawn_offset=(-0.06, -0.12), sliding_friction=0.35,
+                 fixture=(fixture_goal, (0.30, 0.20))),
+    "sponge": dict(spawn_offset=(0.0, -0.12), sliding_friction=0.8,
+                   fixture=(fixture_stain, (0.10, 0.24))),
+    "bowl": dict(spawn_offset=(0.04, -0.12), fixture=(fixture_placemat, (0.04, 0.30))),
+    "knife": dict(spawn_offset=(0.0, -0.14), fixture=(fixture_knife_block, (0.18, 0.30))),
 }
 
 # (description, spec kwargs). Index = variant id, 0 = the plain object. Keep every bar within the
