@@ -163,32 +163,33 @@ class G1SupplementalInfo(RobotSupplementalInfo):
         }
 
         if hand_type == "brainco":
-            # Limits taken directly from the MJCF joint range attributes.
+            # Must equal the MJCF joint ranges: the sim normalizes hand state with those and the
+            # recorder de-normalizes with these.
             # *_distal joints are passive (driven by their proximal counterpart via mimic).
             joint_limits.update({
-                "left_thumb_metacarpal_joint":  [0.0, 1.5184],
-                "left_thumb_proximal_joint":    [0.0, 1.0472],
-                "left_thumb_distal_joint":      [0.0, 1.0472],
-                "left_index_proximal_joint":    [0.0, 1.4661],
-                "left_index_distal_joint":      [0.0, 1.693],
-                "left_middle_proximal_joint":   [0.0, 1.4661],
-                "left_middle_distal_joint":     [0.0, 1.693],
-                "left_ring_proximal_joint":     [0.0, 1.4661],
-                "left_ring_distal_joint":       [0.0, 1.693],
-                "left_pinky_proximal_joint":    [0.0, 1.4661],
-                "left_pinky_distal_joint":      [0.0, 1.693],
+                "left_thumb_metacarpal_joint":  [0.0, 1.55334],
+                "left_thumb_proximal_joint":    [0.0, 1.15889],
+                "left_thumb_distal_joint":      [0.0, 1.26841],
+                "left_index_proximal_joint":    [0.0, 1.41],
+                "left_index_distal_joint":      [0.0, 1.59471],
+                "left_middle_proximal_joint":   [0.0, 1.41],
+                "left_middle_distal_joint":     [0.0, 1.78647],
+                "left_ring_proximal_joint":     [0.0, 1.41],
+                "left_ring_distal_joint":       [0.0, 1.76532],
+                "left_pinky_proximal_joint":    [0.0, 1.41],
+                "left_pinky_distal_joint":      [0.0, 1.79211],
 
-                "right_thumb_metacarpal_joint": [0.0, 1.5184],
-                "right_thumb_proximal_joint":   [0.0, 1.0472],
-                "right_thumb_distal_joint":     [0.0, 1.0472],
-                "right_index_proximal_joint":   [0.0, 1.4661],
-                "right_index_distal_joint":     [0.0, 1.693],
-                "right_middle_proximal_joint":  [0.0, 1.4661],
-                "right_middle_distal_joint":    [0.0, 1.693],
-                "right_ring_proximal_joint":    [0.0, 1.4661],
-                "right_ring_distal_joint":      [0.0, 1.693],
-                "right_pinky_proximal_joint":   [0.0, 1.4661],
-                "right_pinky_distal_joint":     [0.0, 1.693],
+                "right_thumb_metacarpal_joint": [0.0, 1.55334],
+                "right_thumb_proximal_joint":   [0.0, 1.15889],
+                "right_thumb_distal_joint":     [0.0, 1.26841],
+                "right_index_proximal_joint":   [0.0, 1.41],
+                "right_index_distal_joint":     [0.0, 1.59471],
+                "right_middle_proximal_joint":  [0.0, 1.41],
+                "right_middle_distal_joint":    [0.0, 1.78647],
+                "right_ring_proximal_joint":    [0.0, 1.41],
+                "right_ring_distal_joint":      [0.0, 1.76532],
+                "right_pinky_proximal_joint":   [0.0, 1.41],
+                "right_pinky_distal_joint":     [0.0, 1.79211],
             })
         else:
             joint_limits.update({

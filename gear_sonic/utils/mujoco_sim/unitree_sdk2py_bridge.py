@@ -97,7 +97,7 @@ class UnitreeSdk2Bridge:
             # DefaultEnv overrides them per hand from the loaded MuJoCo model via
             # set_brainco_limits() (the bridge itself has no model access).
             default_upper = np.array(
-                [1.5184, 1.0472, 1.4661, 1.4661, 1.4661, 1.4661][: self.num_hand_motor]
+                [1.55334, 1.15889, 1.41, 1.41, 1.41, 1.41][: self.num_hand_motor]
             )
             self.brainco_lower_limits_left = np.zeros(self.num_hand_motor)
             self.brainco_upper_limits_left = default_upper.copy()
