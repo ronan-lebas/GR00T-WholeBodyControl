@@ -14,7 +14,7 @@ plate / bar / handled_box force *bimanual* manipulation: each is too long or too
 hand to control. The task objects (laptop, hammer, carton, pitcher, bottle, soda, peg, pan, book,
 drill, mug, ring, lid, can, puck, sponge, bowl, knife) come with a scene layout (``LAYOUTS``): a
 spawn offset on the table and, for most, a static fixture that defines the goal (nail block, bowl,
-hole block, stove, bookshelf, target, mug tree, post, pot, coaster, goal, stain, placemat, knife
+hole block, stove, bookshelf, target, mug tree, post, pot, goal, stain, placemat, knife
 block). Only the object is tracked; the fixture never moves.
 
 The bar also has a catalog of geometric variants (``VARIANTS``) for collecting the same task
@@ -591,7 +591,7 @@ def fixture_pot(radius=0.085, height=0.10, wall=0.006):
 
 
 def spec_can(radius=0.033, height=0.122):
-    """Standing soda can. It spawns on the robot's right and the coaster sits on its left, beyond
+    """Standing soda can. It spawns on the robot's right and is to be put down on its left, beyond
     a comfortable right-hand reach: the task is a hand-to-hand handover."""
     rim = 0.006
     return [
@@ -600,13 +600,6 @@ def spec_can(radius=0.033, height=0.122):
         _cylinder(radius - 0.004, rim, "z", (0, 0, height - rim / 2), STEEL),
         _cylinder(radius + 0.0008, 0.04, "z", (0, 0, height / 2), (0.95, 0.95, 0.95, 1.0),
                   sections=12),
-    ]
-
-
-def fixture_coaster():
-    return [
-        _cylinder(0.05, 0.005, "z", (0, 0, 0.0025), (0.70, 0.55, 0.38, 1.0)),
-        _cylinder(0.03, 0.0005, "z", (0, 0, 0.00525), (0.20, 0.35, 0.55, 1.0)),
     ]
 
 
@@ -754,9 +747,9 @@ LAYOUTS = {
     "book": dict(spawn_offset=(-0.06, -0.10), fixture=(fixture_bookshelf, (0.08, 0.28))),
     "drill": dict(spawn_offset=(-0.02, 0.0), fixture=(fixture_target, (0.28, 0.22))),
     "mug": dict(spawn_offset=(0.08, -0.12), fixture=(fixture_mug_tree, (0.12, 0.30))),
-    "ring": dict(spawn_offset=(0.0, -0.10), fixture=(fixture_post, (0.16, 0.26))),
+    "ring": dict(spawn_offset=(0.0, -0.10), fixture=(fixture_post, (0.06, 0.26))),
     "lid": dict(spawn_offset=(0.02, -0.12), fixture=(fixture_pot, (0.12, 0.28))),
-    "can": dict(spawn_offset=(0.08, -0.18), fixture=(fixture_coaster, (0.0, 0.40))),
+    "can": dict(spawn_offset=(0.08, -0.18)),
     "puck": dict(spawn_offset=(-0.06, -0.12), sliding_friction=0.35,
                  fixture=(fixture_goal, (0.30, 0.20))),
     "sponge": dict(spawn_offset=(0.0, -0.12), sliding_friction=0.8,

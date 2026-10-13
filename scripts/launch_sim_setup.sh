@@ -71,7 +71,7 @@
 #                    mug      hang the mug by its handle             (mug tree)
 #                    ring     put the flat ring over the post        (post)
 #                    lid      put the lid on the pot                 (pot)
-#                    can      hand the can over right -> left hand   (coaster, on the left)
+#                    can      hand the can over right -> left hand   (no fixture; put it down on the left)
 #                    puck     push the slippery puck into the goal   (goal)
 #                    sponge   wipe the stain                         (stain decal, no collision)
 #                    bowl     flip the upside-down bowl onto the mat (placemat)
@@ -286,7 +286,7 @@ case "$TASK" in
                 PRIMITIVE=lid
                 ;;
             can)
-                TASK_PROMPT="${TASK_PROMPT:-pass the can to the left hand and put it on the coaster}"
+                TASK_PROMPT="${TASK_PROMPT:-pass the can to the left hand and put it down on the left}"
                 PRIMITIVE=can
                 ;;
             puck)
