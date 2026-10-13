@@ -431,6 +431,11 @@ class SimLoopConfig(BaseConfig):
     OBJECT_MASS in run_sim_loop.py. Deliberately light — the recordings don't need a physical
     mass, and IKEA's API reports a bogus constant anyway."""
 
+    noslip_iterations: int = 10
+    """MuJoCo noslip solver iterations (applies to every contact, feet included). Soft contacts
+    let a held object creep out of a steady grasp regardless of friction (a 0.3 kg pinched
+    object sags ~22 mm in 3 s without it, ~0 with 10). 0 disables it (MuJoCo default)."""
+
     dump_scene: Optional[str] = None
     """Write the fully injected scene XML to this path at startup (debugging aid; open it with
     open_mj_scene.py). The sim continues to run normally."""

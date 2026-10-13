@@ -221,6 +221,7 @@ def main(config: ArgsConfig):
 
     # Start with the elastic-band gantry detached (same effect as pressing '9').
     wbc_config["detach_gantry"] = config.detach_gantry
+    wbc_config["noslip_iterations"] = config.noslip_iterations
 
     if config.dump_scene:
         wbc_config["dump_scene"] = config.dump_scene

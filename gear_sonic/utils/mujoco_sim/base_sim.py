@@ -455,6 +455,9 @@ class DefaultEnv:
 
         self.mj_data = mujoco.MjData(self.mj_model)
         self.mj_model.opt.timestep = self.sim_dt
+        # Noslip post-pass: removes the slow creep of soft friction contacts, so grasped objects
+        # don't slide out of a steady pinch. Only touches friction forces (no extra penetration).
+        self.mj_model.opt.noslip_iterations = self.config.get("noslip_iterations", 0)
         self.torso_index = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
         self.root_body = "pelvis"
         self.root_body_id = self.mj_model.body(self.root_body).id
