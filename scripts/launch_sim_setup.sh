@@ -81,6 +81,8 @@
 #                  lengths...). Same task prompt and 0.5 kg for all. List them:
 #                  python gear_sonic/scripts/make_primitive_asset.py bar --list-variants.
 #                  Preview: python gear_sonic/scripts/preview_chair_assets.py --variants bar
+#   Preview every --object at once (n/p cycle, a = row/single, [ ] spin):
+#                  python gear_sonic/scripts/preview_chair_assets.py --objects
 #   --chair-asset DIR  (--task chair) staged asset dir to spawn, default data/objects/chair.
 #                  Any staged chair works — compare candidates next to the robot with
 #                  gear_sonic/scripts/preview_chair_assets.py.

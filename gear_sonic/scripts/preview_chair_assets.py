@@ -7,6 +7,7 @@ any staged asset — IKEA chairs and the make_primitive_asset.py bimanual object
 
     python gear_sonic/scripts/preview_chair_assets.py                    # everything staged
     python gear_sonic/scripts/preview_chair_assets.py /scratch/rlebas1/IKEA_interface/ikea_assets
+    python gear_sonic/scripts/preview_chair_assets.py --objects          # every --object on its table, in a row
     python gear_sonic/scripts/preview_chair_assets.py --variants bar     # whole bar catalog, in a row
     python gear_sonic/scripts/preview_chair_assets.py --variants bar --only 0 3 7   # a subset
 
@@ -42,9 +43,16 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 
-from gear_sonic.scripts.make_primitive_asset import VARIANTS, make, variant_name
+from gear_sonic.scripts.make_primitive_asset import SPECS, VARIANTS, make, variant_name
 from gear_sonic.scripts.prepare_object_asset import prepare
-from gear_sonic.scripts.run_sim_loop import OBJECT_POS_X, OBJECT_SURFACE_CLEARANCE, OBJECT_YAW
+from gear_sonic.scripts.run_sim_loop import (
+    OBJECT_POS_X,
+    OBJECT_SURFACE_CLEARANCE,
+    OBJECT_YAW,
+    TABLE_TOP_THICKNESS,
+    ArgsConfig,
+    build_mesh_object_config,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SCENE = REPO_ROOT / "gear_sonic/data/robot_model/model_data/g1/with_brainco/scene_41dof.xml"
@@ -54,6 +62,9 @@ ROW_WIDTH = 6.0  # row mode shows as many assets as fit in this width (at least 
 ROW_MIN = 8
 LABEL_LIFT = 0.08  # label height above an asset's top, meters
 YAW_STEP = math.radians(15.0)
+# launch_sim_setup.sh lowers the table for these objects (too tall for the 0.74 default).
+TABLE_HEIGHTS = {"handled_box": 0.58, "carton": 0.58}
+TABLE_RGBA = ("0.6 0.4 0.25 1", "0.5 0.35 0.2 1")  # top, leg (as base_sim._append_table)
 DEFAULT_RGBA = (0.75, 0.6, 0.4, 1.0)
 SELECTED_RGBA = (0.9, 0.45, 0.15, 1.0)
 
@@ -130,12 +141,30 @@ def stage_variants(name: str, only: list[int] | None = None) -> list[Path]:
     ]
 
 
+def stage_objects() -> list[Path]:
+    """(Re)generate every make_primitive_asset.py object (variant 0): all tabletop --object choices."""
+    return [make(name, STAGE_DIR / name, force=True) for name in SPECS]
+
+
 def short_label(meta: dict) -> str:
     return f"v{meta['variant']}" if "variant" in meta else meta["name"]
 
 
-def spawn_pose(meta: dict) -> tuple[tuple[float, float, float], float]:
-    """The (pos, yaw) run_sim_loop.py would use on the floor for this asset."""
+def table_height_for(meta: dict) -> float:
+    return TABLE_HEIGHTS.get(meta["name"], ArgsConfig.table_height)
+
+
+def spawn_pose(
+    meta: dict, adir: Path | None = None, tabletop: bool = False
+) -> tuple[tuple[float, float, float], float]:
+    """The (pos, yaw) run_sim_loop.py would use for this asset: on the floor, or on the table
+    (``tabletop``, the real tabletop spawn including its clamping and per-asset offset)."""
+    if tabletop:
+        cfg = build_mesh_object_config(
+            ArgsConfig(object_asset=str(adir), table=True, table_height=table_height_for(meta))
+        )
+        w, _, _, z = cfg["quat"]
+        return tuple(float(v) for v in cfg["pos"]), 2 * math.atan2(z, w)
     pos = meta.get("spawn_pos") or (
         OBJECT_POS_X,
         0.0,
@@ -145,7 +174,9 @@ def spawn_pose(meta: dict) -> tuple[tuple[float, float, float], float]:
     return tuple(float(v) for v in pos), float(yaw)
 
 
-def build_scene(scene_path: Path, assets: list[Path], metas: list[dict]) -> str:
+def build_scene(
+    scene_path: Path, assets: list[Path], metas: list[dict], tabletop: bool = False
+) -> str:
     """Inject one static, visual-only body per asset; returns a temp XML path.
 
     Assets with ``visual_parts`` (make_primitive_asset.py) get one geom per part in its own color,
@@ -159,7 +190,7 @@ def build_scene(scene_path: Path, assets: list[Path], metas: list[dict]) -> str:
         asset_el = ET.SubElement(root, "asset")
 
     for i, (adir, meta) in enumerate(zip(assets, metas)):
-        pos, yaw = spawn_pose(meta)
+        pos, yaw = spawn_pose(meta, adir, tabletop)
         body = ET.SubElement(worldbody, "body")
         body.set("name", f"preview_{i}")
         body.set("pos", f"{pos[0]} {pos[1]} {pos[2]}")
@@ -181,6 +212,58 @@ def build_scene(scene_path: Path, assets: list[Path], metas: list[dict]) -> str:
             geom.set("mass", "0")
             geom.set("rgba", part["rgba"])
 
+        # Goal fixture (static prop, e.g. the nail block): placed at its world offset from the
+        # spawn pose, expressed in the body frame so it follows the asset when spun. Its origin
+        # is on the table surface, which is the object's z_min plane.
+        # Surface height in the body frame: the table top (tabletop) or the floor.
+        surface_z = (table_height_for(meta) if tabletop else 0.0) - pos[2]
+        c, s_ = math.cos(-yaw), math.sin(-yaw)
+
+        def world_xy(dx, dy):  # world-axes offset from the spawn pose -> body frame
+            return c * dx - s_ * dy, s_ * dx + c * dy
+
+        if tabletop:
+            cfg = ArgsConfig()
+            hx, hy = cfg.table_top_size
+            ht = TABLE_TOP_THICKNESS
+            top_z = table_height_for(meta)
+            tx, ty = world_xy(cfg.table_pos[0] - pos[0], cfg.table_pos[1] - pos[1])
+            leg_half = (top_z - 2 * ht) / 2
+            for name, size, z, rgba in (
+                ("table_top", (hx, hy, ht), surface_z - ht, TABLE_RGBA[0]),
+                ("table_leg", (0.06, 0.06, leg_half), surface_z - top_z + leg_half, TABLE_RGBA[1]),
+            ):
+                geom = ET.SubElement(body, "geom")
+                geom.set("name", f"preview_{i}_{name}")
+                geom.set("type", "box")
+                geom.set("size", " ".join(str(v) for v in size))
+                geom.set("pos", f"{tx} {ty} {z}")
+                geom.set("quat", f"{math.cos(-yaw / 2)} 0 0 {math.sin(-yaw / 2)}")
+                geom.set("contype", "0")
+                geom.set("conaffinity", "0")
+                geom.set("mass", "0")
+                geom.set("rgba", rgba)
+
+        fixture = meta.get("fixture")
+        if fixture:
+            dx, dy = fixture["offset"]
+            fyaw = fixture.get("yaw", 0.0) - yaw
+            for k, part in enumerate(fixture["parts"]):
+                mesh = ET.SubElement(asset_el, "mesh")
+                mesh.set("name", f"preview_{i}_fx{k}")
+                mesh.set("file", str((adir / part["mesh"]).resolve()))
+                geom = ET.SubElement(body, "geom")
+                geom.set("name", f"preview_{i}_fixture_{k}")
+                geom.set("type", "mesh")
+                geom.set("mesh", f"preview_{i}_fx{k}")
+                fx, fy = world_xy(dx, dy)
+                geom.set("pos", f"{fx} {fy} {surface_z}")
+                geom.set("quat", f"{math.cos(fyaw / 2)} 0 0 {math.sin(fyaw / 2)}")
+                geom.set("contype", "0")
+                geom.set("conaffinity", "0")
+                geom.set("mass", "0")
+                geom.set("rgba", part["rgba"])
+
     # Written next to the original so its relative <include>/meshdir paths still resolve.
     fd, tmp = tempfile.mkstemp(suffix=".xml", dir=str(scene_path.parent))
     os.close(fd)
@@ -189,11 +272,18 @@ def build_scene(scene_path: Path, assets: list[Path], metas: list[dict]) -> str:
 
 
 class Previewer:
-    def __init__(self, assets: list[Path], row_mode: bool = False, labels: bool = True):
+    def __init__(
+        self,
+        assets: list[Path],
+        row_mode: bool = False,
+        labels: bool = True,
+        tabletop: bool = False,
+    ):
+        self.tabletop = tabletop
         self.assets = assets
         self.labels = labels
         self.metas = [json.loads((a / "object.json").read_text()) for a in assets]
-        poses = [spawn_pose(m) for m in self.metas]
+        poses = [spawn_pose(m, a, tabletop) for m, a in zip(self.metas, assets)]
         self.positions = [p for p, _ in poses]
         self.yaws = [y for _, y in poses]
         self.index = 0
@@ -205,11 +295,18 @@ class Previewer:
         widths = []
         for meta, yaw in zip(self.metas, self.yaws):
             ex, ey = np.asarray(meta["bbox_max"][:2]) - np.asarray(meta["bbox_min"][:2])
-            widths.append(abs(math.sin(yaw)) * ex + abs(math.cos(yaw)) * ey)
+            width = abs(math.sin(yaw)) * ex + abs(math.cos(yaw)) * ey
+            fx = meta.get("fixture")
+            if fx:  # keep neighbouring fixtures from overlapping: y span about the object center
+                dy = fx["offset"][1]
+                width = max(width, 2 * max(abs(dy + fx["bbox_min"][1]), abs(dy + fx["bbox_max"][1])))
+            if tabletop:  # neighbouring tables must not overlap
+                width = max(width, 2 * ArgsConfig().table_top_size[1])
+            widths.append(width)
         self.row_spacing = max(widths) + ROW_GAP
         self.row_max = max(ROW_MIN, int(ROW_WIDTH // self.row_spacing) + 1)
 
-        tmp = build_scene(DEFAULT_SCENE, assets, self.metas)
+        tmp = build_scene(DEFAULT_SCENE, assets, self.metas, tabletop)
         try:
             self.model = mujoco.MjModel.from_xml_path(tmp)
         finally:
@@ -287,6 +384,8 @@ class Previewer:
         if "variant" in meta:
             obj = meta["source"].split()[1].replace("_", "-")
             cmd = f"./scripts/launch_sim_setup.sh --object {obj} --variant {meta['variant']}"
+        elif self.tabletop:
+            cmd = f"./scripts/launch_sim_setup.sh --object {meta['name'].replace('_', '-')}"
         else:
             cmd = f"CHAIR_ASSET={rel} ./scripts/launch_sim_setup.sh --task chair"
         print(
@@ -352,7 +451,7 @@ class Previewer:
                 viewer.cam.azimuth = 180
                 viewer.cam.elevation = -35
                 viewer.cam.distance = 0.6 * len(self.row_window()) * self.row_spacing + 1.0
-                viewer.cam.lookat[:] = (OBJECT_POS_X, 0.0, 0.1)
+                viewer.cam.lookat[:] = (OBJECT_POS_X, 0.0, 0.5 if self.tabletop else 0.1)
             while viewer.is_running():
                 with viewer.lock():
                     self.draw_labels(viewer.user_scn)
@@ -380,6 +479,12 @@ def main():
         f"(have: {sorted(VARIANTS)}); replaces the positional paths",
     )
     p.add_argument(
+        "--objects",
+        action="store_true",
+        help="(re)stage every primitive --object and preview them in a row, each on its table "
+        "with its goal fixture, as spawned by --task tabletop; replaces the positional paths",
+    )
+    p.add_argument(
         "--only",
         type=int,
         nargs="+",
@@ -399,7 +504,11 @@ def main():
     args = p.parse_args()
     if args.only and not args.variants:
         p.error("--only picks from a catalog: use it with --variants NAME")
-    if args.variants:
+    if args.objects and args.variants:
+        p.error("--objects and --variants are mutually exclusive")
+    if args.objects:
+        assets = stage_objects()
+    elif args.variants:
         assets = stage_variants(args.variants, args.only)
     else:
         assets = sorted(resolve_assets(args.paths), key=_natural_key)
@@ -410,7 +519,12 @@ def main():
             rel = a.relative_to(REPO_ROOT) if a.is_relative_to(REPO_ROOT) else a
             print(f"{rel}  {ext[0]:.3f} x {ext[1]:.3f} x {ext[2]:.3f} m  {meta['name']}")
         return
-    Previewer(assets, row_mode=args.row or bool(args.variants), labels=not args.no_labels).run()
+    Previewer(
+        assets,
+        row_mode=args.row or args.objects or bool(args.variants),
+        labels=not args.no_labels,
+        tabletop=args.objects,
+    ).run()
 
 
 if __name__ == "__main__":
